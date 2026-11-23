@@ -1,0 +1,21 @@
+# Rust build outputs
+/target/
+**/*.rs.bk
+*.pdb
+
+# Platform binaries & third-party drivers
+*.exe
+*.dll
+
+# Local runtime state, secrets & logs
+*.log
+*.pem
+*.key
+data.json
+config.json
+
+# OS / IDE artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

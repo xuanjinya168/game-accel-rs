@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GameAccel 管理后台</title>
+<style>
+  :root {
+    --bg: #FAF9F5;
+    --sidebar: #F3F1EA;
+    --card: #FFFFFF;
+    --card-alt: #F6F4EE;
+    --border: #E8E5DC;
+    --border-strong: #D3CEC2;
+    --text: #1E1D1B;
+    --text-2: #4D4B46;
+    --muted: #807C73;
+    --accent: #D97757;
+    --accent-soft: #F8EAE3;
+    --accent-text: #B34D2E;
+    --ok-soft: #E7F4EE;
+    --ok-text: #1D6B4A;
+    --warn-soft: #FEF3DB;
+    --warn-text: #A16207;
+    --danger-soft: #FCEBEA;
+    --danger-text: #A82C29;
+    --shadow: 0 2px 10px rgba(0,0,0,0.04);
+  }
+  [data-theme="dark"] {
+    --bg: #262624;
+    --sidebar: #1F1E1D;
+    --card: #2F2E2B;
+    --card-alt: #373632;
+    --border: #413F3A;
+    --border-strong: #5A5750;
+    --text: #F2F0E9;
+    --text-2: #CECAC1;
+    --muted: #A29E95;
+    --accent: #D97757;
+    --accent-soft: #4A3027;
+    --accent-text: #F2A58A;
+    --ok-soft: #203E31;
+    --ok-text: #86E0B8;
+    --warn-soft: #443519;
+    --warn-text: #FACC64;
+    --danger-soft: #4C2424;
+    --danger-text: #F69E9B;
+    --shadow: none;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+  .hidden { display: none !important; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 7px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--card); color: var(--text); font-size: 13px; cursor: pointer;
+    transition: all .15s ease; font-weight: 500;
+  }
+  .btn:hover { background: var(--card-alt); border-color: var(--border-strong); }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn-primary:hover { filter: brightness(0.95); background: var(--accent); border-color: var(--accent); }
+  .btn-sm { padding: 4px 10px; font-size: 12px; border-radius: 7px; }
+  .btn-danger { color: var(--danger-text); }
+  .btn-danger:hover { background: var(--danger-soft); border-color: var(--danger-text); }
+
+  input, select {
+    width: 100%; padding: 8px 11px; border-radius: 8px;
+    border: 1px solid var(--border-strong); background: var(--card);
+    color: var(--text); font-size: 13.5px; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+
+  /* Login */
+  .login-wrap {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .login-card {
+    width: 100%; max-width: 380px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; padding: 28px; box-shadow: var(--shadow);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
+  .brand-icon {
+    width: 34px; height: 34px; border-radius: 9px; background: var(--accent);
+    display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700;
+  }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12.5px; color: var(--text-2); margin-bottom: 5px; }
+
+  /* App layout */
+  .layout { max-width: 1040px; margin: 0 auto; padding: 24px 20px 60px; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; gap: 12px; flex-wrap: wrap;
+  }
+  .topbar-left { display: flex; align-items: center; gap: 10px; }
+  .topbar-right { display: flex; align-items: center; gap: 8px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px;
+    border-radius: 999px; font-size: 11.5px; font-weight: 600;
+  }
+  .badge-ok { background: var(--ok-soft); color: var(--ok-text); }
+  .badge-warn { background: var(--warn-soft); color: var(--warn-text); }
+  .badge-danger { background: var(--danger-soft); color: var(--danger-text); }
+  .badge-muted { background: var(--card-alt); color: var(--muted); }
+  .badge-accent { background: var(--accent-soft); color: var(--accent-text); }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 16px 18px; box-shadow: var(--shadow);
+  }
+  .kpi-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .kpi-val { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+  .kpi-sub { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+
+  .section-head {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; gap: 10px; flex-wrap: wrap;
+  }
+  .section-title { font-size: 15.5px; font-weight: 600; }
+  .link-list { display: flex; flex-direction: column; gap: 10px; }
+  .link-item {
+    background: var(--card-alt); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  }
+  .link-meta { min-width: 240px; flex: 1; }
+  .link-title-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+  .link-name { font-size: 14.5px; font-weight: 600; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .link-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .progress { height: 5px; background: var(--border); border-radius: 99px; overflow: hidden; margin-top: 6px; max-width: 260px; }
+  .progress-bar { height: 100%; background: var(--accent); border-radius: 99px; }
+
+  .tabs { display: inline-flex; gap: 4px; background: var(--card-alt); padding: 4px; border-radius: 10px; border: 1px solid var(--border); margin-bottom: 16px; }
+  .tab { padding: 6px 14px; border-radius: 7px; font-size: 13px; cursor: pointer; color: var(--muted); border: none; background: transparent; font-weight: 500; }
+  .tab.active { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+
+  .filter-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .filter-bar select, .filter-bar input { width: auto; min-width: 140px; padding: 6px 10px; font-size: 12.5px; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; padding: 9px 12px; background: var(--card-alt); color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .domain-main { font-weight: 600; color: var(--text); }
+  .domain-sub { font-size: 11px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+  /* Modal */
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.38); display: flex;
+    align-items: center; justify-content: center; padding: 16px; z-index: 50;
+  }
+  .modal {
+    width: 100%; max-width: 430px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; padding: 22px; box-shadow: 0 12px 40px rgba(0,0,0,0.18);
+  }
+  .modal-title { font-size: 16px; font-weight: 600; margin-bottom: 14px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+  .toast {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: var(--bg); padding: 9px 18px; border-radius: 999px;
+    font-size: 13px; font-weight: 500; z-index: 100; box-shadow: 0 6px 20px rgba(0,0,0,0.18);
+  }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); margin: 10px 0; }
+  .checkbox-row input { width: auto; }
+</style>
+</head>
+<body>
+<div id="toast" class="toast hidden"></div>
+
+<!-- Login View -->
+<div id="loginView" class="login-wrap hidden">
+  <div class="login-card">
+    <div class="brand">
+      <div class="brand-icon">⚡</div>
+      <div>
+        <div style="font-size:17px;font-weight:700">GameAccel 管理后台</div>
+        <div style="font-size:12px;color:var(--muted)">QUIC / UDP 极简加速服务端</div>
+      </div>
+    </div>
+    <div class="field">
+      <label>管理员账号</label>
+      <input id="loginUser" value="admin" autocomplete="username" />
+    </div>
+    <div class="field">
+      <label>密码</label>
+      <input id="loginPass" type="password" placeholder="请输入面板密码" autocomplete="current-password" />
+    </div>
+    <button class="btn btn-primary" style="width:100%;padding:10px" onclick="doLogin()">登录后台</button>
+    <div id="loginErr" style="color:var(--danger-text);font-size:12.5px;margin-top:10px"></div>
+  </div>
+</div>
+
+<!-- Main Panel View -->
+<div id="appView" class="layout hidden">
+  <div class="topbar">
+    <div class="topbar-left">
+      <div class="brand-icon">⚡</div>
+      <div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:17px;font-weight:700">GameAccel</span>
+          <span class="badge badge-ok">● 运行中</span>
+        </div>
+        <div id="subHeader" class="mono" style="margin-top:1px">--</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <button class="btn btn-sm" onclick="toggleTheme()" id="themeBtn">深色</button>
+      <button class="btn btn-sm" onclick="refreshAll()">刷新</button>
+      <button class="btn btn-sm btn-danger" onclick="doLogout()">退出登录</button>
+    </div>
+  </div>
+
+  <!-- Overview KPIs -->
+  <div class="kpis">
+    <div class="card">
+      <div class="kpi-label">QUIC 监听节点</div>
+      <div class="kpi-val" id="kpiEndpoint">--</div>
+      <div class="kpi-sub" id="kpiSni">SNI: --</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">当前在线连接</div>
+      <div class="kpi-val" id="kpiOnline">0</div>
+      <div class="kpi-sub" id="kpiUptime">已运行 --</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">累计总流量</div>
+      <div class="kpi-val" id="kpiTraffic">0 B</div>
+      <div class="kpi-sub" id="kpiTrafficDetail">↑ 0 B · ↓ 0 B</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">分享链接数</div>
+      <div class="kpi-val" id="kpiLinks">0 / 0</div>
+      <div class="kpi-sub">启用 / 总数（热生效）</div>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" id="tabLinks" onclick="switchTab('links')">分享链接与用户</button>
+    <button class="tab" id="tabLogs" onclick="switchTab('logs')">访问日志</button>
+    <button class="tab" id="tabSettings" onclick="switchTab('settings')">节点与安全设置</button>
+  </div>
+
+  <!-- Tab 1: Links -->
+  <div id="panelLinks" class="card">
+    <div class="section-head">
+      <div>
+        <div class="section-title">多用户分享链接管理</div>
+        <div style="font-size:12px;color:var(--muted)">新建、禁用、重置 Token 均毫秒级热生效，无需重启服务</div>
+      </div>
+      <button class="btn btn-primary" onclick="openCreateModal()">+ 新建分享链接</button>
+    </div>
+    <div id="linkList" class="link-list"></div>
+  </div>
+
+  <!-- Tab 2: Access Logs -->
+  <div id="panelLogs" class="card hidden">
+    <div class="section-head">
+      <div>
+        <div class="section-title">主域名访问日志</div>
+        <div style="font-size:12px;color:var(--muted)">自动嗅探 HTTPS SNI 与 HTTP Host 还原主域名（含 TUN 模式），落盘 10MB 自动轮转防爆盘</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="btn btn-sm" id="logToggleBtn" onclick="toggleAccessLogs()">记录中 ●</button>
+        <button class="btn btn-sm btn-danger" onclick="clearAccessLogs()">清空日志</button>
+      </div>
+    </div>
+    <div class="filter-bar">
+      <select id="logLinkFilter" onchange="refreshLogs()">
+        <option value="">全部用户链接</option>
+      </select>
+      <select id="logProtoFilter" onchange="refreshLogs()">
+        <option value="">全部协议</option>
+        <option value="HTTPS">HTTPS</option>
+        <option value="HTTP">HTTP</option>
+        <option value="UDP">UDP</option>
+        <option value="TCP">TCP</option>
+        <option value="PANEL">后台审计</option>
+        <option value="AUTH">鉴权拦截</option>
+      </select>
+      <input id="logSearch" placeholder="搜索主域名 / 目标 / IP..." oninput="refreshLogs()" style="flex:1;min-width:180px" />
+      <span id="logCountHint" class="mono"></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>用户链接</th>
+            <th>协议</th>
+            <th>主域名 / 目标</th>
+            <th>来源 IP</th>
+            <th>流量 (↑/↓)</th>
+            <th>耗时</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody id="logTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Tab 3: Settings -->
+  <div id="panelSettings" class="grid-2 hidden">
+    <div class="card">
+      <div class="section-title" style="margin-bottom:12px">对外节点信息（用于生成 gacl:// 与订阅）</div>
+      <div class="field">
+        <label>公网 IP 或域名</label>
+        <input id="setHost" placeholder="203.0.113.10" />
+      </div>
+      <div class="field">
+        <label>QUIC UDP 端口</label>
+        <input id="setPort" type="number" />
+      </div>
+      <div class="field">
+        <label>TLS 域名 (SNI)</label>
+        <input id="setSni" placeholder="node.example.com" />
+      </div>
+      <label class="checkbox-row">
+        <input type="checkbox" id="setInsecure" /> 允许客户端跳过证书校验（仅自签测试时勾选）
+      </label>
+      <button class="btn btn-primary" onclick="saveNodeSettings()">保存节点设置</button>
+    </div>
+
+    <div class="card">
+      <div class="section-title" style="margin-bottom:12px">修改管理后台密码</div>
+      <div class="field">
+        <label>原密码</label>
+        <input id="oldPass" type="password" />
+      </div>
+      <div class="field">
+        <label>新密码（至少 6 位）</label>
+        <input id="newPass" type="password" />
+      </div>
+      <button class="btn btn-primary" onclick="changePassword()">更新密码</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create / Edit Link Modal -->
+<div id="linkModal" class="modal-bg hidden">
+  <div class="modal">
+    <div class="modal-title" id="modalTitle">新建分享链接</div>
+    <div class="field">
+      <label>备注名称（例如：朋友A / 办公室电脑）</label>
+      <input id="mName" placeholder="请输入名称" />
+    </div>
+    <div class="field">
+      <label>流量上限 GB（留空或填 0 表示不限流量）</label>
+      <input id="mLimit" type="number" step="0.5" min="0" placeholder="例如：100" />
+    </div>
+    <div class="field">
+      <label>到期日期 YYYY-MM-DD（留空表示永不过期）</label>
+      <input id="mExpire" type="date" />
+    </div>
+    <label class="checkbox-row">
+      <input type="checkbox" id="mGameDup" checked /> 默认开启游戏模式小包双发抗丢包
+    </label>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="submitLinkModal()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let editingId = null;
+let linksCache = [];
+let pollTimer = null;
+let currentTab = 'links';
+let accessLogEnabled = true;
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.add('hidden'), 2800);
+}
+
+function fmtBytes(b) {
+  if (!b) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(2)) + ' ' + u[i];
+}
+
+function fmtUptime(s) {
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return d > 0 ? `${d}天 ${h}小时` : h > 0 ? `${h}小时 ${m}分` : `${m}分钟`;
+}
+
+function copyText(text, label) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => toast('已复制 ' + label));
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('已复制 ' + label);
+  }
+}
+
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', cur);
+  localStorage.setItem('gacl_theme', cur);
+  document.getElementById('themeBtn').textContent = cur === 'dark' ? '浅色' : '深色';
+}
+
+(function initTheme() {
+  const saved = localStorage.getItem('gacl_theme') || 'light';
+  document.documentElement.setAttribute('data-theme', saved);
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.textContent = saved === 'dark' ? '浅色' : '深色';
+})();
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    ...opts,
+  });
+  if (res.status === 401) {
+    showLogin();
+    throw new Error('未登录');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('请求失败 ' + res.status));
+  return data;
+}
+
+function showLogin() {
+  clearInterval(pollTimer);
+  document.getElementById('appView').classList.add('hidden');
+  document.getElementById('loginView').classList.remove('hidden');
+}
+
+function showApp() {
+  document.getElementById('loginView').classList.add('hidden');
+  document.getElementById('appView').classList.remove('hidden');
+  refreshAll();
+  clearInterval(pollTimer);
+  pollTimer = setInterval(refreshAll, 5000);
+}
+
+async function doLogin() {
+  const username = document.getElementById('loginUser').value.trim();
+  const password = document.getElementById('loginPass').value;
+  document.getElementById('loginErr').textContent = '';
+  try {
+    await api('/api/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+    document.getElementById('loginPass').value = '';
+    showApp();
+  } catch (e) {
+    document.getElementById('loginErr').textContent = e.message;
+  }
+}
+
+document.getElementById('loginPass').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+
+async function doLogout() {
+  await fetch('/api/logout', { method: 'POST' });
+  showLogin();
+}
+
+function switchTab(t) {
+  currentTab = t;
+  document.getElementById('tabLinks').classList.toggle('active', t === 'links');
+  document.getElementById('tabLogs').classList.toggle('active', t === 'logs');
+  document.getElementById('tabSettings').classList.toggle('active', t === 'settings');
+  document.getElementById('panelLinks').classList.toggle('hidden', t !== 'links');
+  document.getElementById('panelLogs').classList.toggle('hidden', t !== 'logs');
+  document.getElementById('panelSettings').classList.toggle('hidden', t !== 'settings');
+  if (t === 'logs') refreshLogs();
+}
+
+async function refreshAll() {
+  try {
+    const [ov, links] = await Promise.all([api('/api/overview'), api('/api/links')]);
+    renderOverview(ov);
+    linksCache = links;
+    renderLinks(links);
+    syncLogLinkOptions(links);
+    if (currentTab === 'logs') await refreshLogs();
+  } catch (e) {}
+}
+
+function syncLogLinkOptions(links) {
+  const sel = document.getElementById('logLinkFilter');
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">全部用户链接</option>' +
+    links.map(l => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join('');
+  sel.value = prev;
+}
+
+async function refreshLogs() {
+  try {
+    const lid = encodeURIComponent(document.getElementById('logLinkFilter').value);
+    const pr = encodeURIComponent(document.getElementById('logProtoFilter').value);
+    const q = encodeURIComponent(document.getElementById('logSearch').value.trim());
+    const data = await api(`/api/logs?link_id=${lid}&proto=${pr}&q=${q}`);
+    accessLogEnabled = !!data.enabled;
+    const btn = document.getElementById('logToggleBtn');
+    btn.textContent = accessLogEnabled ? '记录中 ●（点击暂停）' : '已暂停 ○（点击开启）';
+    btn.className = 'btn btn-sm ' + (accessLogEnabled ? 'btn-primary' : '');
+    document.getElementById('logCountHint').textContent = `显示 ${data.logs.length} / 缓存 ${data.total_buffered} 条`;
+    renderLogs(data.logs);
+  } catch (e) {}
+}
+
+function renderLogs(logs) {
+  const tbody = document.getElementById('logTableBody');
+  if (!logs.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">暂无匹配的访问记录</td></tr>';
+    return;
+  }
+  tbody.innerHTML = logs.map(r => {
+    const pClass = r.proto === 'HTTPS' ? 'badge-ok'
+      : r.proto === 'UDP' ? 'badge-accent'
+      : r.proto === 'PANEL' || r.proto === 'AUTH' ? 'badge-warn'
+      : 'badge-muted';
+    const sBadge = r.status === 'ok'
+      ? '<span class="badge badge-ok">正常</span>'
+      : r.status === 'denied'
+      ? '<span class="badge badge-danger">拒绝</span>'
+      : '<span class="badge badge-warn">失败</span>';
+    const dur = r.duration_ms >= 1000 ? (r.duration_ms / 1000).toFixed(1) + 's' : r.duration_ms + 'ms';
+    return `
+      <tr>
+        <td class="mono" style="white-space:nowrap">${esc(r.time.slice(5))}</td>
+        <td>${esc(r.link_name)}</td>
+        <td><span class="badge ${pClass}">${esc(r.proto)}</span></td>
+        <td>
+          <div class="domain-main">${esc(r.root_domain)}</div>
+          <div class="domain-sub">${esc(r.target)}</div>
+        </td>
+        <td class="mono">${esc(r.client_ip)}</td>
+        <td class="mono" style="white-space:nowrap">↑ ${fmtBytes(r.tx_bytes)} / ↓ ${fmtBytes(r.rx_bytes)}</td>
+        <td class="mono">${dur}</td>
+        <td>${sBadge}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+async function toggleAccessLogs() {
+  try {
+    const res = await api('/api/logs/toggle', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled: !accessLogEnabled }),
+    });
+    accessLogEnabled = res.enabled;
+    toast(accessLogEnabled ? '已开启主域名访问日志' : '已暂停记录访问日志');
+    refreshLogs();
+  } catch (e) { toast(e.message); }
+}
+
+async function clearAccessLogs() {
+  if (!confirm('确定清空内存和磁盘中的全部访问日志？')) return;
+  try {
+    await api('/api/logs/clear', { method: 'POST' });
+    toast('访问日志已清空');
+    refreshLogs();
+  } catch (e) { toast(e.message); }
+}
+
+function renderOverview(ov) {
+  document.getElementById('subHeader').textContent = `${ov.public_host}:${ov.udp_port} · SNI ${ov.sni}`;
+  document.getElementById('kpiEndpoint').textContent = `UDP :${ov.udp_port}`;
+  document.getElementById('kpiSni').textContent = `${ov.public_host} · SNI: ${ov.sni}`;
+  document.getElementById('kpiOnline').textContent = ov.total_online_conns;
+  document.getElementById('kpiUptime').textContent = '已运行 ' + fmtUptime(ov.uptime_secs);
+  document.getElementById('kpiTraffic').textContent = fmtBytes(ov.total_tx_bytes + ov.total_rx_bytes);
+  document.getElementById('kpiTrafficDetail').textContent = `↑ ${fmtBytes(ov.total_tx_bytes)} · ↓ ${fmtBytes(ov.total_rx_bytes)}`;
+  document.getElementById('kpiLinks').textContent = `${ov.active_links} / ${ov.total_links}`;
+
+  if (document.activeElement?.id !== 'setHost') document.getElementById('setHost').value = ov.public_host;
+  if (document.activeElement?.id !== 'setPort') document.getElementById('setPort').value = ov.udp_port;
+  if (document.activeElement?.id !== 'setSni') document.getElementById('setSni').value = ov.sni;
+  document.getElementById('setInsecure').checked = !!ov.insecure;
+}
+
+function statusBadge(st) {
+  if (st === 'active') return '<span class="badge badge-ok">启用中</span>';
+  if (st === 'disabled') return '<span class="badge badge-muted">已禁用</span>';
+  if (st === 'expired') return '<span class="badge badge-warn">已过期</span>';
+  return '<span class="badge badge-danger">流量超额</span>';
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderLinks(links) {
+  const el = document.getElementById('linkList');
+  if (!links.length) {
+    el.innerHTML = '<div style="text-align:center;color:var(--muted);padding:26px">暂无分享链接，点击右上角「+ 新建分享链接」创建</div>';
+    return;
+  }
+  const base = window.location.origin;
+  el.innerHTML = links.map(l => {
+    const used = l.tx_bytes + l.rx_bytes;
+    const limitBytes = l.traffic_limit_gb ? l.traffic_limit_gb * 1024 * 1024 * 1024 : 0;
+    const pct = limitBytes > 0 ? Math.min(100, Math.round(used * 100 / limitBytes)) : 0;
+    const subUrl = `${base}/sub/${encodeURIComponent(l.token)}`;
+    return `
+      <div class="link-item">
+        <div class="link-meta">
+          <div class="link-title-row">
+            <span class="link-name">${esc(l.name)}</span>
+            ${statusBadge(l.status)}
+            ${l.game_dup ? '<span class="badge badge-accent">游戏双发</span>' : ''}
+            ${l.online_conns > 0 ? `<span class="badge badge-ok">在线 ${l.online_conns}</span>` : ''}
+          </div>
+          <div class="mono">
+            流量: ${fmtBytes(used)}${l.traffic_limit_gb ? ` / ${l.traffic_limit_gb} GB` : ' / 不限'}
+            (↑ ${fmtBytes(l.tx_bytes)} · ↓ ${fmtBytes(l.rx_bytes)})
+            · 到期: ${l.expire_at ? esc(l.expire_at) : '永不过期'}
+          </div>
+          ${limitBytes > 0 ? `<div class="progress"><div class="progress-bar" style="width:${pct}%"></div></div>` : ''}
+        </div>
+        <div class="link-actions">
+          <button class="btn btn-sm btn-primary" onclick='copyText(${JSON.stringify(l.share_uri)}, "gacl:// 分享链接")'>复制 gacl://</button>
+          <button class="btn btn-sm" onclick='copyText(${JSON.stringify(subUrl)}, "订阅 URL")'>复制订阅</button>
+          <button class="btn btn-sm" onclick="toggleEnable('${l.id}', ${!l.enabled})">${l.enabled ? '禁用' : '启用'}</button>
+          <button class="btn btn-sm" onclick="openEditModal('${l.id}')">编辑</button>
+          <button class="btn btn-sm" onclick="resetToken('${l.id}')">重置密钥</button>
+          <button class="btn btn-sm" onclick="resetTraffic('${l.id}')">清零流量</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteLink('${l.id}', '${esc(l.name)}')">删除</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function openCreateModal() {
+  editingId = null;
+  document.getElementById('modalTitle').textContent = '新建分享链接';
+  document.getElementById('mName').value = '';
+  document.getElementById('mLimit').value = '';
+  document.getElementById('mExpire').value = '';
+  document.getElementById('mGameDup').checked = true;
+  document.getElementById('linkModal').classList.remove('hidden');
+}
+
+function openEditModal(id) {
+  const l = linksCache.find(x => x.id === id);
+  if (!l) return;
+  editingId = id;
+  document.getElementById('modalTitle').textContent = '编辑分享链接';
+  document.getElementById('mName').value = l.name;
+  document.getElementById('mLimit').value = l.traffic_limit_gb || '';
+  document.getElementById('mExpire').value = l.expire_at || '';
+  document.getElementById('mGameDup').checked = l.game_dup;
+  document.getElementById('linkModal').classList.remove('hidden');
+}
+
+function closeModal() {
+  document.getElementById('linkModal').classList.add('hidden');
+}
+
+async function submitLinkModal() {
+  const name = document.getElementById('mName').value.trim();
+  const limitRaw = parseFloat(document.getElementById('mLimit').value);
+  const traffic_limit_gb = isNaN(limitRaw) || limitRaw <= 0 ? null : limitRaw;
+  const expire_at = document.getElementById('mExpire').value.trim() || null;
+  const game_dup = document.getElementById('mGameDup').checked;
+  if (!name) return toast('请填写备注名称');
+
+  try {
+    if (editingId) {
+      await api('/api/links/' + editingId, {
+        method: 'PUT',
+        body: JSON.stringify({ name, game_dup, traffic_limit_gb, expire_at }),
+      });
+      toast('链接已更新');
+    } else {
+      await api('/api/links', {
+        method: 'POST',
+        body: JSON.stringify({ name, game_dup, traffic_limit_gb, expire_at }),
+      });
+      toast('新链接已创建');
+    }
+    closeModal();
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function toggleEnable(id, enabled) {
+  try {
+    await api('/api/links/' + id, { method: 'PUT', body: JSON.stringify({ enabled }) });
+    toast(enabled ? '已启用该链接' : '已禁用并断开该链接活跃会话');
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function resetToken(id) {
+  if (!confirm('重置后旧的 gacl:// 和订阅链接将立即失效，确定重置？')) return;
+  try {
+    await api('/api/links/' + id + '/reset-token', { method: 'POST' });
+    toast('Token 已重置，请重新复制分享链接');
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function resetTraffic(id) {
+  try {
+    await api('/api/links/' + id + '/reset-traffic', { method: 'POST' });
+    toast('已清零流量统计');
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function deleteLink(id, name) {
+  if (!confirm(`确定删除链接「${name}」？删除后使用该链接的客户端将立即断线。`)) return;
+  try {
+    await api('/api/links/' + id, { method: 'DELETE' });
+    toast('已删除');
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function saveNodeSettings() {
+  try {
+    await api('/api/settings/node', {
+      method: 'PUT',
+      body: JSON.stringify({
+        public_host: document.getElementById('setHost').value.trim(),
+        udp_port: parseInt(document.getElementById('setPort').value, 10) || 8443,
+        sni: document.getElementById('setSni').value.trim(),
+        insecure: document.getElementById('setInsecure').checked,
+      }),
+    });
+    toast('节点信息已保存');
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function changePassword() {
+  try {
+    await api('/api/settings/password', {
+      method: 'PUT',
+      body: JSON.stringify({
+        old_password: document.getElementById('oldPass').value,
+        new_password: document.getElementById('newPass').value,
+      }),
+    });
+    document.getElementById('oldPass').value = '';
+    document.getElementById('newPass').value = '';
+    toast('密码已更新，请重新登录');
+    showLogin();
+  } catch (e) { toast(e.message); }
+}
+
+// Boot
+(async function boot() {
+  try {
+    await api('/api/overview');
+    showApp();
+  } catch (_) {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>
