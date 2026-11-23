@@ -613,12 +613,10 @@ function renderLinks(links) {
     el.innerHTML = '<div style="text-align:center;color:var(--muted);padding:26px">暂无分享链接，点击右上角「+ 新建分享链接」创建</div>';
     return;
   }
-  const base = window.location.origin;
   el.innerHTML = links.map(l => {
     const used = l.tx_bytes + l.rx_bytes;
     const limitBytes = l.traffic_limit_gb ? l.traffic_limit_gb * 1024 * 1024 * 1024 : 0;
     const pct = limitBytes > 0 ? Math.min(100, Math.round(used * 100 / limitBytes)) : 0;
-    const subUrl = `${base}/sub/${encodeURIComponent(l.token)}`;
     return `
       <div class="link-item">
         <div class="link-meta">
@@ -635,19 +633,53 @@ function renderLinks(links) {
           </div>
           ${limitBytes > 0 ? `<div class="progress"><div class="progress-bar" style="width:${pct}%"></div></div>` : ''}
         </div>
-        <div class="link-actions">
-          <button class="btn btn-sm btn-primary" onclick='copyText(${JSON.stringify(l.share_uri)}, "gacl:// 分享链接")'>复制 gacl://</button>
-          <button class="btn btn-sm" onclick='copyText(${JSON.stringify(subUrl)}, "订阅 URL")'>复制订阅</button>
-          <button class="btn btn-sm" onclick="toggleEnable('${l.id}', ${!l.enabled})">${l.enabled ? '禁用' : '启用'}</button>
-          <button class="btn btn-sm" onclick="openEditModal('${l.id}')">编辑</button>
-          <button class="btn btn-sm" onclick="resetToken('${l.id}')">重置密钥</button>
-          <button class="btn btn-sm" onclick="resetTraffic('${l.id}')">清零流量</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteLink('${l.id}', '${esc(l.name)}')">删除</button>
+        <div class="link-actions" data-id="${esc(l.id)}">
+          <button class="btn btn-sm btn-primary" data-act="copy-share">复制 gacl://</button>
+          <button class="btn btn-sm" data-act="copy-sub">复制订阅</button>
+          <button class="btn btn-sm" data-act="toggle">${l.enabled ? '禁用' : '启用'}</button>
+          <button class="btn btn-sm" data-act="edit">编辑</button>
+          <button class="btn btn-sm" data-act="reset-token">重置密钥</button>
+          <button class="btn btn-sm" data-act="reset-traffic">清零流量</button>
+          <button class="btn btn-sm btn-danger" data-act="delete">删除</button>
         </div>
       </div>
     `;
   }).join('');
 }
+
+// Delegated handler: never interpolate user-controlled strings into inline JS handlers,
+// and resolve share/token data from linksCache instead of embedding it in HTML attributes.
+document.getElementById('linkList').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const box = btn.closest('.link-actions');
+  if (!box) return;
+  const id = box.dataset.id;
+  const l = linksCache.find(x => x.id === id);
+  switch (btn.dataset.act) {
+    case 'copy-share':
+      if (l) copyText(l.share_uri, 'gacl:// 分享链接');
+      break;
+    case 'copy-sub':
+      if (l) copyText(`${window.location.origin}/sub/${encodeURIComponent(l.token)}`, '订阅 URL');
+      break;
+    case 'toggle':
+      if (l) toggleEnable(id, !l.enabled);
+      break;
+    case 'edit':
+      openEditModal(id);
+      break;
+    case 'reset-token':
+      resetToken(id);
+      break;
+    case 'reset-traffic':
+      resetTraffic(id);
+      break;
+    case 'delete':
+      deleteLink(id, l ? l.name : '');
+      break;
+  }
+});
 
 function openCreateModal() {
   editingId = null;

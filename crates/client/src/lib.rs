@@ -36,7 +36,7 @@ pub async fn run_client_with_shutdown(
     opts: ClientOptions,
     stats: Arc<ClientStats>,
     log_tx: Option<mpsc::UnboundedSender<String>>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    mut ext_shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let emit = |msg: String| {
         info!("{}", msg);
@@ -44,6 +44,24 @@ pub async fn run_client_with_shutdown(
             let _ = tx.send(msg);
         }
     };
+
+    // Internal shutdown flag raised by the caller's signal or by the QUIC connection dying,
+    // so every data-plane task observes one consistent stop condition.
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *ext_shutdown_rx.borrow() {
+                    break;
+                }
+                if ext_shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            let _ = tx.send(true);
+        });
+    }
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client_config = build_client_config(opts.insecure)?;
@@ -142,6 +160,15 @@ pub async fn run_client_with_shutdown(
         conn.rtt().as_millis()
     ));
 
+    // Watchdog: idle timeout / server restart / network change must tear the tunnel down
+    // instead of leaving a dead connection reported as healthy.
+    let watchdog_tx = shutdown_tx.clone();
+    let watchdog_conn = conn.clone();
+    tokio::spawn(async move {
+        watchdog_conn.closed().await;
+        let _ = watchdog_tx.send(true);
+    });
+
     // Periodic RTT updater
     let rtt_conn = conn.clone();
     let rtt_stats = stats.clone();
@@ -191,8 +218,9 @@ pub async fn run_client_with_shutdown(
         let tun_log_tx = log_tx.clone();
         let tun_shutdown = shutdown_rx.clone();
         let game_dup = opts.game_dup;
+        let tun_err_tx = log_tx.clone();
         Some(tokio::spawn(async move {
-            tun_mode::run_tun_mode(
+            let res = tun_mode::run_tun_mode(
                 server_ip,
                 tun_conn,
                 tun_pacer,
@@ -202,7 +230,15 @@ pub async fn run_client_with_shutdown(
                 tun_log_tx,
                 tun_shutdown,
             )
-            .await
+            .await;
+            // Report right away: this handle is only joined when the whole session ends.
+            if let Err(e) = &res {
+                info!("TUN 模式异常: {e:#}");
+                if let Some(tx) = &tun_err_tx {
+                    let _ = tx.send(format!("TUN 模式异常: {e:#}"));
+                }
+            }
+            res
         }))
     } else {
         None
@@ -220,10 +256,13 @@ pub async fn run_client_with_shutdown(
     )
     .await;
 
+    // Listener bind failure or shutdown: also stop TUN before awaiting its handle,
+    // otherwise a failed mixed-proxy bind would block here forever.
+    let _ = shutdown_tx.send(true);
+
+    // Errors were already reported by the TUN task itself; this only awaits cleanup.
     if let Some(handle) = tun_handle {
-        if let Ok(Err(e)) = handle.await {
-            emit(format!("TUN 模式异常: {e:#}"));
-        }
+        let _ = handle.await;
     }
 
     rtt_task.abort();
@@ -341,5 +380,42 @@ impl ServerCertVerifier for SkipServerVerification {
             SignatureScheme::ED25519,
             SignatureScheme::RSA_PSS_SHA256,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_during_handshake_returns_without_blocking_sender() {
+        let stats = Arc::new(ClientStats::default());
+        let (tx, rx) = watch::channel(false);
+        let opts = ClientOptions {
+            server: "127.0.0.1:9".parse().unwrap(),
+            server_name: "localhost".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            token: "t".to_string(),
+            game_dup: false,
+            enable_tun: false,
+            insecure: true,
+        };
+        let client = tokio::spawn(run_client_with_shutdown(opts, stats, None, rx));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // An external shutdown during handshake must unblock the client promptly
+        // (regression guard for the stop path: sender never blocks, client exits).
+        let sent = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || tx.send(true)),
+        )
+        .await;
+        assert!(sent.expect("send(true) blocked").is_ok(), "no receiver left");
+
+        let exited = tokio::time::timeout(Duration::from_secs(3), client).await;
+        assert!(
+            matches!(exited, Ok(Ok(Ok(())))),
+            "client did not exit after shutdown: {exited:?}"
+        );
     }
 }

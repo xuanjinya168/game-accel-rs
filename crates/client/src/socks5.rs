@@ -108,13 +108,22 @@ pub async fn run_mixed_proxy_server(
 
     loop {
         tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
                     break;
                 }
             }
             accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
+                // A transient accept failure (peer RST before accept, EMFILE, ...) must not
+                // tear down the whole tunnel: log, back off briefly, keep serving.
+                let (stream, peer) = match accepted {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("local proxy accept error: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
                 let conn = conn.clone();
                 let pacer = pacer.clone();
                 let dispatch = udp_dispatch.clone();

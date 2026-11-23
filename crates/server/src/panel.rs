@@ -111,12 +111,39 @@ async fn login_handler(
     Json(req): Json<LoginReq>,
 ) -> Response {
     let ip = addr.ip().to_string();
+    if let Err(remaining) = state.check_login_throttle(addr.ip()) {
+        state.record_access_log(
+            "",
+            "管理后台",
+            &ip,
+            "PANEL",
+            "login".to_string(),
+            format!(
+                "POST /api/login 已被限流 (user={})，剩余 {} 秒",
+                req.username,
+                remaining.as_secs() + 1
+            ),
+            0,
+            0,
+            0,
+            "denied",
+        );
+        return json_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "登录失败次数过多，请 {} 秒后重试",
+                remaining.as_secs() + 1
+            ),
+        );
+    }
     let is_https = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.eq_ignore_ascii_case("https"))
         .unwrap_or(false);
-    if let Some(sid) = state.verify_login(&req.username, &req.password) {
+    let login = state.verify_login(&req.username, &req.password);
+    state.record_login_result(addr.ip(), login.is_some());
+    if let Some(sid) = login {
         state.record_access_log(
             "",
             "管理后台",

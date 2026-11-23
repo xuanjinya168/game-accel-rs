@@ -102,8 +102,6 @@ impl RouteGuard {
     fn install(server_ip: IpAddr, tun_if_index: u32) -> Result<Self> {
         let phys_gw = detect_physical_gateway()?;
         let gw_str = phys_gw.to_string();
-        let tun_gw_str = TUN_GW.to_string();
-        let if_str = tun_if_index.to_string();
 
         // 1. Pin VPS server IP via physical gateway so QUIC never loops back into TUN
         let server_v4 = match server_ip {
@@ -146,7 +144,23 @@ impl RouteGuard {
             ],
         );
 
-        // 3. Install 0.0.0.0/1 + 128.0.0.0/1 onto TUN (safer than replacing 0.0.0.0/0)
+        // 3. Install 0.0.0.0/1 + 128.0.0.0/1 onto TUN (safer than replacing 0.0.0.0/0).
+        // Build the guard first so a partial failure runs Drop and removes the routes
+        // that did get added; otherwise half the internet stays routed to a dead TUN.
+        let guard = Self { server_v4 };
+        if let Err(e) = guard.install_half_default_routes(tun_if_index) {
+            drop(guard);
+            return Err(e);
+        }
+
+        Ok(guard)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn install_half_default_routes(&self, tun_if_index: u32) -> Result<()> {
+        let tun_gw_str = TUN_GW.to_string();
+        let if_str = tun_if_index.to_string();
+
         run_hidden(
             "route",
             &[
@@ -178,8 +192,7 @@ impl RouteGuard {
             ],
         )
         .context("添加 TUN 路由 128.0.0.0/1 失败")?;
-
-        Ok(Self { server_v4 })
+        Ok(())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -192,8 +205,17 @@ impl Drop for RouteGuard {
     fn drop(&mut self) {
         #[cfg(target_os = "windows")]
         {
-            let _ = run_hidden("route", &["delete", "0.0.0.0", "mask", "128.0.0.0"]);
-            let _ = run_hidden("route", &["delete", "128.0.0.0", "mask", "128.0.0.0"]);
+            // Scope the deletes to our TUN gateway so a half-default route that belongs
+            // to another VPN/proxy tool is never removed.
+            let tun_gw_str = TUN_GW.to_string();
+            let _ = run_hidden(
+                "route",
+                &["delete", "0.0.0.0", "mask", "128.0.0.0", &tun_gw_str],
+            );
+            let _ = run_hidden(
+                "route",
+                &["delete", "128.0.0.0", "mask", "128.0.0.0", &tun_gw_str],
+            );
             if let Some(v4) = self.server_v4 {
                 let ip_str = v4.to_string();
                 let _ = run_hidden("route", &["delete", &ip_str, "mask", "255.255.255.255"]);

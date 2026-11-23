@@ -529,6 +529,14 @@ impl GameAccelApp {
             self.state = ConnState::Connected;
         }
 
+        // The tunnel can die without the client returning an error (idle timeout, server
+        // restart, network switch). stats.connected is cleared by the client on exit.
+        if self.state == ConnState::Connected && !self.stats.connected.load(Ordering::Relaxed) {
+            self.push_log("隧道连接已断开，已自动停止加速");
+            self.show_toast("连接已断开：隧道已失效");
+            self.stop_connect();
+        }
+
         let elapsed = self.last_sample_at.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64();

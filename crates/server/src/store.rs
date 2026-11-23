@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use protocol::share::{NodeProfile, SubscriptionPayload};
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,6 +24,9 @@ const MAX_ACCESS_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB rotation
 const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 const SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
 const PBKDF2_ITERS: u32 = 100_000;
+const LOGIN_MAX_FAILURES: u32 = 10;
+const LOGIN_WINDOW: Duration = Duration::from_secs(5 * 60);
+const LOGIN_FAILURES_CAP: usize = 4096;
 const PBKDF2_PREFIX: &str = "pbkdf2$";
 
 pub fn generate_random_str(len: usize) -> String {
@@ -265,8 +270,20 @@ pub struct UpdateLinkInput {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub game_dup: Option<bool>,
+    // Double Option: absent key => None (keep), explicit null => Some(None) (clear),
+    // value => Some(Some(v)). Plain serde would map null to the outer None.
+    #[serde(default, deserialize_with = "deserialize_some")]
     pub traffic_limit_gb: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
     pub expire_at: Option<Option<String>>,
+}
+
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,6 +300,7 @@ pub struct AppState {
     pub config: RwLock<PanelConfig>,
     pub live: DashMap<String, Arc<LiveCounters>>,
     sessions: DashMap<String, Instant>,
+    login_failures: DashMap<IpAddr, (u32, Instant)>,
     next_conn_id: AtomicU64,
     next_log_id: AtomicU64,
     access_log_enabled: AtomicBool,
@@ -374,6 +392,7 @@ impl AppState {
             config: RwLock::new(cfg),
             live,
             sessions: DashMap::new(),
+            login_failures: DashMap::new(),
             next_conn_id: AtomicU64::new(1),
             next_log_id: AtomicU64::new(1),
             access_log_enabled: AtomicBool::new(access_log_enabled),
@@ -561,6 +580,7 @@ impl AppState {
         if constant_time_eq(user.trim(), &cfg.admin_user) && verify_password(pass, &cfg.admin_pass)
         {
             let sid = generate_random_str(32);
+            self.sessions.retain(|_, ts| ts.elapsed() < SESSION_TTL);
             self.sessions.insert(sid.clone(), Instant::now());
             Some(sid)
         } else {
@@ -576,6 +596,51 @@ impl AppState {
         }
         self.sessions.remove(sid);
         false
+    }
+
+    /// Err(remaining lock time) once an IP has too many failed logins inside the window.
+    pub fn check_login_throttle(&self, ip: IpAddr) -> std::result::Result<(), Duration> {
+        let snapshot = self.login_failures.get(&ip).map(|e| *e.value());
+        if let Some((count, first)) = snapshot {
+            let elapsed = first.elapsed();
+            if elapsed >= LOGIN_WINDOW {
+                self.login_failures.remove(&ip);
+            } else if count >= LOGIN_MAX_FAILURES {
+                return Err(LOGIN_WINDOW - elapsed);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_login_result(&self, ip: IpAddr, success: bool) {
+        if success {
+            self.login_failures.remove(&ip);
+            return;
+        }
+        match self.login_failures.entry(ip) {
+            Entry::Occupied(mut o) => {
+                let (count, first) = o.get_mut();
+                if first.elapsed() >= LOGIN_WINDOW {
+                    *count = 1;
+                    *first = Instant::now();
+                } else {
+                    *count += 1;
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert((1, Instant::now()));
+            }
+        }
+        if self.login_failures.len() > LOGIN_FAILURES_CAP {
+            self.login_failures
+                .retain(|_, (_, first)| first.elapsed() < LOGIN_WINDOW);
+        }
+    }
+
+    /// Current (sni, public_host), read live so panel setting changes apply without restart.
+    pub fn panel_aliases(&self) -> (String, String) {
+        let cfg = self.config.read().expect("config read lock");
+        (cfg.sni.clone(), cfg.public_host.clone())
     }
 
     pub fn revoke_session(&self, sid: &str) {
@@ -1093,6 +1158,58 @@ mod tests {
             .rx_bytes
             .store(2 * 1024 * 1024 * 1024, Ordering::Relaxed);
         assert!(state.authenticate_token("seed-tok-123456").is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_link_input_distinguishes_null_from_absent() {
+        let cleared: UpdateLinkInput =
+            serde_json::from_str(r#"{"traffic_limit_gb":null,"expire_at":null}"#).unwrap();
+        assert_eq!(cleared.traffic_limit_gb, Some(None));
+        assert_eq!(cleared.expire_at, Some(None));
+
+        let untouched: UpdateLinkInput = serde_json::from_str("{}").unwrap();
+        assert_eq!(untouched.traffic_limit_gb, None);
+        assert_eq!(untouched.expire_at, None);
+        assert!(untouched.name.is_none() && untouched.enabled.is_none());
+
+        let set: UpdateLinkInput =
+            serde_json::from_str(r#"{"traffic_limit_gb":5.5,"expire_at":"2099-01-01"}"#).unwrap();
+        assert_eq!(set.traffic_limit_gb, Some(Some(5.5)));
+        assert_eq!(set.expire_at, Some(Some("2099-01-01".to_string())));
+    }
+
+    #[test]
+    fn login_throttle_locks_after_failures_and_clears_on_success() {
+        let path = temp_data_path("throttle");
+        let (state, _) = AppState::load_or_init(InitParams {
+            data_path: path.clone(),
+            public_host: "1.2.3.4".to_string(),
+            udp_port: 8443,
+            sni: "example.com".to_string(),
+            insecure: false,
+            seed_token: "seed-tok-throttle".to_string(),
+            initial_panel_pass: None,
+        })
+        .unwrap();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let other: IpAddr = "203.0.113.10".parse().unwrap();
+
+        for _ in 0..LOGIN_MAX_FAILURES - 1 {
+            state.record_login_result(ip, false);
+            assert!(state.check_login_throttle(ip).is_ok());
+        }
+        state.record_login_result(ip, false);
+        let remaining = state.check_login_throttle(ip).unwrap_err();
+        assert!(remaining > Duration::ZERO && remaining <= LOGIN_WINDOW);
+        assert!(
+            state.check_login_throttle(other).is_ok(),
+            "other IPs must not be locked"
+        );
+
+        state.record_login_result(ip, true);
+        assert!(state.check_login_throttle(ip).is_ok());
 
         let _ = std::fs::remove_file(&path);
     }

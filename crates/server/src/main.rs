@@ -9,7 +9,7 @@ use crate::store::{AppState, InitParams, LiveCounters};
 use anyhow::{Context, Result};
 use clap::Parser;
 use protocol::auth::{AUTH_ERR, AUTH_OK, read_auth_request};
-use protocol::frame::TargetAddr;
+use protocol::frame::{TargetAddr, UdpFrame};
 use protocol::pacer::UdpDupPacer;
 use protocol::{ALPN_PROTOCOL, DEFAULT_INITIAL_MTU};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -79,11 +79,10 @@ const INTERNAL_PANEL_TUN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
 /// Maps authenticated tunnel-only panel aliases (`panel.gacl.local`, `198.18.0.1`,
 /// or `public_host:panel_port` / `sni:panel_port`) to the loopback Web Admin Panel
 /// so port 9090 never needs to be exposed on the public internet.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PanelRoute {
     local_addr: SocketAddr,
-    public_host: String,
-    sni: String,
+    state: Arc<AppState>,
 }
 
 impl PanelRoute {
@@ -96,11 +95,11 @@ impl PanelRoute {
                 {
                     return Some(self.local_addr);
                 }
-                if *port == panel_port
-                    && (host.eq_ignore_ascii_case(&self.sni)
-                        || host.eq_ignore_ascii_case(&self.public_host))
-                {
-                    return Some(self.local_addr);
+                if *port == panel_port {
+                    let (sni, public_host) = self.state.panel_aliases();
+                    if host.eq_ignore_ascii_case(&sni) || host.eq_ignore_ascii_case(&public_host) {
+                        return Some(self.local_addr);
+                    }
                 }
                 None
             }
@@ -110,7 +109,9 @@ impl PanelRoute {
                 {
                     return Some(self.local_addr);
                 }
-                if addr.port() == panel_port && addr.ip().to_string() == self.public_host {
+                if addr.port() == panel_port
+                    && self.state.panel_aliases().1 == addr.ip().to_string()
+                {
                     return Some(self.local_addr);
                 }
                 None
@@ -181,14 +182,12 @@ async fn main() -> Result<()> {
                 error!("web panel server error: {:#}", e);
             }
         });
-        let ov = state.overview();
         info!(
             "tunnel-only panel aliases enabled: http://{INTERNAL_PANEL_HOST} and http://{INTERNAL_PANEL_TUN_IP} -> {panel_addr}"
         );
         Some(Arc::new(PanelRoute {
             local_addr: panel_addr,
-            public_host: ov.public_host,
-            sni: ov.sni,
+            state: state.clone(),
         }))
     } else {
         None
@@ -342,11 +341,29 @@ async fn handle_connection(
         client_ip.clone(),
     ));
     let dgram_conn = conn.clone();
+    // Domain targets may block on DNS; they are moved off the receive loop so one slow
+    // lookup cannot stall every IP-targeted (game) flow, with bounded concurrency.
+    let resolve_slots = Arc::new(tokio::sync::Semaphore::new(32));
     let dgram_task = tokio::spawn(async move {
         loop {
             match dgram_conn.read_datagram().await {
                 Ok(data) => {
-                    if let Err(e) = nat.handle_datagram(data).await {
+                    let needs_resolve = matches!(
+                        UdpFrame::decode(data.clone()).map(|f| f.addr),
+                        Ok(TargetAddr::Domain(..))
+                    );
+                    if needs_resolve {
+                        let Ok(permit) = resolve_slots.clone().acquire_owned().await else {
+                            break;
+                        };
+                        let nat = nat.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(e) = nat.handle_datagram(data).await {
+                                warn!("udp datagram error: {:#}", e);
+                            }
+                        });
+                    } else if let Err(e) = nat.handle_datagram(data).await {
                         warn!("udp datagram error: {:#}", e);
                     }
                 }
@@ -723,10 +740,23 @@ mod tests {
     #[test]
     fn panel_route_resolves_only_allowed_aliases() {
         let local: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        let data_path = std::env::temp_dir().join(format!(
+            "game-accel-panelroute-{}.json",
+            store::generate_random_str(8)
+        ));
+        let (state, _) = AppState::load_or_init(InitParams {
+            data_path: data_path.clone(),
+            seed_token: "test-tok-route".to_string(),
+            public_host: "203.0.113.10".to_string(),
+            udp_port: 8443,
+            sni: "node.example.com".to_string(),
+            insecure: true,
+            initial_panel_pass: None,
+        })
+        .unwrap();
         let route = PanelRoute {
             local_addr: local,
-            public_host: "203.0.113.10".to_string(),
-            sni: "node.example.com".to_string(),
+            state: state.clone(),
         };
 
         assert_eq!(
@@ -763,5 +793,30 @@ mod tests {
             route.resolve_target(&TargetAddr::Ip("198.18.0.1:22".parse().unwrap())),
             None
         );
+
+        // Aliases follow panel setting changes without a server restart
+        state
+            .update_node_settings(crate::store::UpdateNodeSettingsInput {
+                public_host: "198.51.100.7".to_string(),
+                udp_port: 8443,
+                sni: "new.example.com".to_string(),
+                insecure: true,
+            })
+            .unwrap();
+        assert_eq!(
+            route.resolve_target(&TargetAddr::Domain("new.example.com".into(), 9090)),
+            Some(local)
+        );
+        assert_eq!(
+            route.resolve_target(&TargetAddr::Ip("198.51.100.7:9090".parse().unwrap())),
+            Some(local)
+        );
+        assert_eq!(
+            route.resolve_target(&TargetAddr::Domain("node.example.com".into(), 9090)),
+            None,
+            "stale sni must no longer be routed to the panel"
+        );
+
+        let _ = std::fs::remove_file(&data_path);
     }
 }
