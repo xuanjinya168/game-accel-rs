@@ -32,6 +32,11 @@ pub struct ClientOptions {
     pub insecure: bool,
 }
 
+/// Markers inside connect error messages that mean retrying cannot help.
+/// Callers (GUI reconnect policy) match on these instead of duplicating the wording.
+pub const ERR_AUTH_REJECTED: &str = "服务端拒绝鉴权";
+pub const ERR_PORT_IN_USE: &str = "被占用，无法监听";
+
 pub async fn run_client_with_shutdown(
     opts: ClientOptions,
     stats: Arc<ClientStats>,
@@ -104,7 +109,7 @@ pub async fn run_client_with_shutdown(
             let resp = auth_recv.read_u8().await.context("读取鉴权响应失败")?;
             if resp != AUTH_OK {
                 conn.close(0u32.into(), b"auth_failed");
-                bail!("服务端拒绝鉴权 (code={resp})");
+                bail!("{ERR_AUTH_REJECTED} (code={resp})");
             }
             Ok::<quinn::Connection, anyhow::Error>(conn)
         };
@@ -125,7 +130,7 @@ pub async fn run_client_with_shutdown(
             Ok(Err(e)) => {
                 let msg = format!("{e:#}");
                 // Do not retry explicit server auth rejection
-                if msg.contains("服务端拒绝鉴权") {
+                if msg.contains(ERR_AUTH_REJECTED) {
                     endpoint.close(0u32.into(), b"auth_failed");
                     return Err(e);
                 }

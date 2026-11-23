@@ -1,3 +1,4 @@
+use crate::ERR_PORT_IN_USE;
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -98,7 +99,7 @@ pub async fn run_mixed_proxy_server(
 ) -> Result<()> {
     let listener = TcpListener::bind(listen_addr)
         .await
-        .with_context(|| format!("本地端口 {listen_addr} 被占用，无法监听聚合代理"))?;
+        .with_context(|| format!("本地端口 {listen_addr} {ERR_PORT_IN_USE}聚合代理"))?;
     let next_flow_id = Arc::new(AtomicU16::new(SOCKS_FLOW_MIN));
     let msg = format!("本地聚合代理 (HTTP + SOCKS5) 已监听 {listen_addr}");
     info!("{}", msg);

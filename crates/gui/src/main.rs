@@ -2,6 +2,7 @@
 
 mod icons;
 mod logger;
+mod reconnect;
 mod storage;
 mod sys_proxy;
 mod theme;
@@ -14,6 +15,7 @@ use client::socks5::ClientStats;
 use client::{ClientOptions, probe_node_rtt, run_client_with_shutdown};
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Stroke, Vec2};
 use protocol::share::{NodeProfile, parse_import_text};
+use reconnect::{ReconnectPolicy, is_retryable_connect_error};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +66,8 @@ pub(crate) enum ProbeState {
 enum AsyncEvent {
     Log(String),
     ConnError(String),
+    /// The client session ended without an error (tunnel dropped or user stop).
+    ConnEnded,
     Tray(TrayCmd),
     ProbeResult {
         node_id: String,
@@ -130,6 +134,7 @@ pub(crate) struct GameAccelApp {
     pub(crate) is_admin: bool,
     pub(crate) last_error: Option<String>,
     pub(crate) toast: Option<(String, Instant)>,
+    reconnect: ReconnectPolicy,
 
     // Speed & RTT history
     last_sample_at: Instant,
@@ -209,6 +214,7 @@ impl GameAccelApp {
             is_admin,
             last_error: None,
             toast: None,
+            reconnect: ReconnectPolicy::default(),
             last_sample_at: Instant::now(),
             last_tx_bytes: 0,
             last_rx_bytes: 0,
@@ -257,12 +263,23 @@ impl GameAccelApp {
     }
 
     pub(crate) fn start_connect(&mut self) {
+        self.connect(false);
+    }
+
+    /// (attempt, seconds until it fires) while a reconnect is pending or in flight.
+    pub(crate) fn reconnect_status(&self) -> Option<(u32, u64)> {
+        self.reconnect
+            .in_progress()
+            .then(|| (self.reconnect.attempt(), self.reconnect.countdown(Instant::now())))
+    }
+
+    fn connect(&mut self, reconnect: bool) -> bool {
         self.last_error = None;
         let Some(node) = self.cfg.active_node().cloned() else {
             let err = "请先在「节点与订阅」中添加至少一个节点".to_string();
             self.last_error = Some(err.clone());
             self.push_log(err);
-            return;
+            return false;
         };
 
         let server: SocketAddr = match node.server.trim().parse() {
@@ -271,7 +288,7 @@ impl GameAccelApp {
                 let err = format!("节点地址格式无效：{}（应为 IP:端口）", node.server);
                 self.last_error = Some(err.clone());
                 self.push_log(err);
-                return;
+                return false;
             }
         };
         let listen: SocketAddr = match self.cfg.listen_addr.trim().parse() {
@@ -280,7 +297,7 @@ impl GameAccelApp {
                 let err = format!("本地端口格式无效：{}", self.cfg.listen_addr);
                 self.last_error = Some(err.clone());
                 self.push_log(err);
-                return;
+                return false;
             }
         };
 
@@ -288,10 +305,12 @@ impl GameAccelApp {
             let err = "TUN 模式需要管理员权限，请点击「以管理员身份重启」".to_string();
             self.last_error = Some(err.clone());
             self.push_log(err);
-            return;
+            return false;
         }
 
-        save_config(&self.cfg);
+        if !reconnect {
+            save_config(&self.cfg);
+        }
         self.stats.reset();
         self.rtt_history.clear();
         self.speed_history.clear();
@@ -304,8 +323,9 @@ impl GameAccelApp {
         if self.cfg.proxy_mode == ProxyMode::SystemProxy {
             match sys_proxy::enable_system_proxy(&listen.to_string()) {
                 Ok(()) => {
-                    self.sys_proxy_flag.store(true, Ordering::SeqCst);
-                    self.push_log(format!("已开启 Windows 系统代理: {listen}"));
+                    if !self.sys_proxy_flag.swap(true, Ordering::SeqCst) {
+                        self.push_log(format!("已开启 Windows 系统代理: {listen}"));
+                    }
                 }
                 Err(e) => {
                     self.push_log(format!("开启系统代理失败: {e:#}"));
@@ -343,11 +363,15 @@ impl GameAccelApp {
                 run_client_with_shutdown(opts, stats, Some(raw_log_tx), shutdown_rx).await
             {
                 let _ = ev_tx.send(AsyncEvent::ConnError(format!("{e:#}")));
+            } else {
+                let _ = ev_tx.send(AsyncEvent::ConnEnded);
             }
         });
+        true
     }
 
     pub(crate) fn stop_connect(&mut self) {
+        self.reconnect.reset();
         if let Ok(mut guard) = self.shutdown_slot.lock() {
             if let Some(tx) = guard.take() {
                 let _ = tx.send(true);
@@ -460,14 +484,67 @@ impl GameAccelApp {
         added
     }
 
+    /// A retryable connect failure, or a non-retryable one outside a reconnect streak.
+    fn fail_connect(&mut self, err: &str) {
+        self.push_log(format!("连接异常: {err}"));
+        self.stop_connect();
+    }
+
+    /// An established tunnel dropped (or a reconnect attempt failed): schedule the next
+    /// attempt with backoff, or give up once the attempt budget is exhausted.
+    fn on_tunnel_lost(&mut self, reason: &str) {
+        let now = Instant::now();
+        if self.reconnect.dropped(now).is_some() {
+            let attempt = self.reconnect.attempt();
+            let secs = self.reconnect.countdown(now);
+            self.push_log(format!("{reason}，{secs} 秒后自动重连（第 {attempt} 次）"));
+            // Keep the system proxy on: the next attempt restores the local listener.
+            self.state = ConnState::Connecting;
+            self.tx_speed_bps = 0.0;
+            self.rx_speed_bps = 0.0;
+        } else {
+            let attempts = self.reconnect.attempt();
+            self.last_error = Some(format!("{reason}，自动重连 {attempts} 次仍未成功"));
+            self.push_log(format!("{reason}，已连续 {attempts} 次重连失败，停止自动重连"));
+            self.show_toast("自动重连失败，请检查节点后手动重连");
+            self.stop_connect();
+        }
+    }
+
     fn poll_async(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.event_rx.try_recv() {
             match ev {
                 AsyncEvent::Log(line) => self.push_log(line),
                 AsyncEvent::ConnError(err) => {
                     self.last_error = Some(err.clone());
-                    self.push_log(format!("连接异常: {err}"));
-                    self.stop_connect();
+                    if is_retryable_connect_error(&err) {
+                        match self.state {
+                            ConnState::Connected => {
+                                self.on_tunnel_lost(&format!("连接中断: {err}"));
+                            }
+                            ConnState::Connecting if self.reconnect.is_waiting() => {
+                                // Already scheduled by the stats watcher for this same failure
+                                self.push_log(format!("连接中断: {err}"));
+                            }
+                            ConnState::Connecting if self.reconnect.in_progress() => {
+                                self.on_tunnel_lost(&format!("重连失败: {err}"));
+                            }
+                            _ => self.fail_connect(&err),
+                        }
+                    } else {
+                        self.fail_connect(&err);
+                    }
+                }
+                AsyncEvent::ConnEnded => {
+                    // Normally the stats watcher below handles the drop. This only matters
+                    // when the session died before this frame ever observed it as connected.
+                    if self.state == ConnState::Connecting && !self.reconnect.is_waiting() {
+                        if self.reconnect.in_progress() {
+                            self.on_tunnel_lost("重连失败: 连接建立后立即被关闭");
+                        } else {
+                            self.fail_connect("连接建立后立即被服务端关闭");
+                        }
+                    }
                 }
                 AsyncEvent::Tray(cmd) => match cmd {
                     TrayCmd::Show => {
@@ -527,13 +604,23 @@ impl GameAccelApp {
 
         if self.state == ConnState::Connecting && self.stats.connected.load(Ordering::Relaxed) {
             self.state = ConnState::Connected;
+            self.last_error = None;
+            self.reconnect.connected(Instant::now());
+            if self.reconnect.in_progress() {
+                self.show_toast("自动重连成功");
+            }
         }
 
         // The tunnel can die without the client returning an error (idle timeout, server
         // restart, network switch). stats.connected is cleared by the client on exit.
         if self.state == ConnState::Connected && !self.stats.connected.load(Ordering::Relaxed) {
-            self.push_log("隧道连接已断开，已自动停止加速");
-            self.show_toast("连接已断开：隧道已失效");
+            self.on_tunnel_lost("连接已断开");
+        }
+
+        if self.state == ConnState::Connecting
+            && self.reconnect.take_due(Instant::now())
+            && !self.connect(true)
+        {
             self.stop_connect();
         }
 

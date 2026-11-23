@@ -263,6 +263,7 @@ pub fn draw_status_pill(
 pub fn draw_hero_power_button(
     ui: &mut egui::Ui,
     state: ConnState,
+    reconnect: Option<(u32, u64)>,
     has_nodes: bool,
     p: ThemePalette,
 ) -> egui::Response {
@@ -284,7 +285,8 @@ pub fn draw_hero_power_button(
                 "一键开启加速"
             } else {
                 "添加节点以开始"
-            };
+            }
+            .to_string();
             (
                 f,
                 Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
@@ -293,13 +295,19 @@ pub fn draw_hero_power_button(
                 lbl,
             )
         }
-        ConnState::Connecting => (
-            p.accent,
-            Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
-            Color32::from_rgba_unmultiplied(217, 119, 87, 46),
-            Color32::WHITE,
-            "正在建立加密通道...",
-        ),
+        ConnState::Connecting => {
+            let lbl = match reconnect {
+                Some((attempt, _)) => format!("正在自动重连（第 {attempt} 次）..."),
+                None => "正在建立加密通道...".to_string(),
+            };
+            (
+                p.accent,
+                Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
+                Color32::from_rgba_unmultiplied(217, 119, 87, 46),
+                Color32::WHITE,
+                lbl,
+            )
+        }
         ConnState::Connected => {
             if resp.hovered() {
                 (
@@ -307,7 +315,7 @@ pub fn draw_hero_power_button(
                     Stroke::new(1.5_f32, p.danger_text),
                     Color32::from_rgba_unmultiplied(198, 63, 59, 26),
                     p.danger_text,
-                    "点击断开加速",
+                    "点击断开加速".to_string(),
                 )
             } else {
                 (
@@ -315,7 +323,7 @@ pub fn draw_hero_power_button(
                     Stroke::new(1.5_f32, p.success_text),
                     Color32::from_rgba_unmultiplied(29, 107, 74, if p.is_dark { 34 } else { 20 }),
                     p.success_text,
-                    "加速保护中",
+                    "加速保护中".to_string(),
                 )
             }
         }
@@ -331,7 +339,7 @@ pub fn draw_hero_power_button(
     );
 
     let font_id = FontId::proportional(FONT_SUB);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font_id, fg_col));
+    let galley = ui.fonts(|f| f.layout_no_wrap(label, font_id, fg_col));
     let icon_w = 16.0;
     let gap = 9.0;
     let total_w = icon_w + gap + galley.size().x;

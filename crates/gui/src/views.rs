@@ -288,30 +288,34 @@ impl GameAccelApp {
                 }
 
                 // Compact status pill
-                let (badge_text, dot_col, bg, fg, stroke_col) = match self.state {
+                let reconnect = self.reconnect_status();
+                let pill = match (self.state, reconnect) {
+                    (ConnState::Connected, _) => "已连接".to_string(),
+                    (ConnState::Connecting, Some((attempt, 0))) => {
+                        format!("重连中 · 第 {attempt} 次")
+                    }
+                    (ConnState::Connecting, Some((attempt, secs))) => {
+                        format!("重连中 · {secs} 秒后重试（第 {attempt} 次）")
+                    }
+                    (ConnState::Connecting, None) => "连接中...".to_string(),
+                    (ConnState::Disconnected, _) => "未连接".to_string(),
+                };
+                let (dot_col, bg, fg, stroke_col) = match self.state {
                     ConnState::Connected => (
-                        "已连接",
                         p.success_text,
                         p.success_soft,
                         p.success_text,
                         p.success_text,
                     ),
-                    ConnState::Connecting => (
-                        "连接中...",
-                        p.accent,
-                        p.accent_soft,
-                        p.accent_text,
-                        p.accent,
-                    ),
+                    ConnState::Connecting => (p.accent, p.accent_soft, p.accent_text, p.accent),
                     ConnState::Disconnected => (
-                        "未连接",
                         p.text_muted,
                         p.bg_card,
                         p.text_secondary,
                         p.border_subtle,
                     ),
                 };
-                draw_status_pill(ui, badge_text, dot_col, bg, fg, stroke_col);
+                draw_status_pill(ui, &pill, dot_col, bg, fg, stroke_col);
 
                 // Exact remaining empty space between status pill and title -> drag handle
                 let gap_w = ui.available_width();
@@ -390,7 +394,15 @@ impl GameAccelApp {
             ui.add_space(8.0);
 
             ui.vertical_centered(|ui| {
-                if draw_hero_power_button(ui, self.state, has_nodes, p).clicked() {
+                if draw_hero_power_button(
+                    ui,
+                    self.state,
+                    self.reconnect_status(),
+                    has_nodes,
+                    p,
+                )
+                .clicked()
+                {
                     if !has_nodes {
                         self.active_tab = NavTab::Nodes;
                         self.import_panel_open = true;
