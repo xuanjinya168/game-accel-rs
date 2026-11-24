@@ -11,7 +11,10 @@ use clap::Parser;
 use protocol::auth::{AUTH_ERR, AUTH_OK, read_auth_request};
 use protocol::frame::{TargetAddr, UdpFrame};
 use protocol::pacer::UdpDupPacer;
-use protocol::{ALPN_PROTOCOL, DEFAULT_INITIAL_MTU};
+use protocol::{
+    ALPN_PROTOCOL, DATAGRAM_RECV_BUFFER, DATAGRAM_SEND_BUFFER, DEFAULT_INITIAL_MTU,
+    KEEP_ALIVE_INTERVAL, MAX_IDLE_TIMEOUT,
+};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -74,6 +77,7 @@ struct Args {
 }
 
 const INTERNAL_PANEL_HOST: &str = "panel.gacl.local";
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERNAL_PANEL_TUN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
 
 /// Maps authenticated tunnel-only panel aliases (`panel.gacl.local`, `198.18.0.1`,
@@ -295,10 +299,10 @@ fn build_server_config(
     transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
     transport.send_window(32 * 1024 * 1024);
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(512));
-    transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    transport.datagram_send_buffer_size(4 * 1024 * 1024);
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
-    transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
+    transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
+    transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
+    transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    transport.max_idle_timeout(Some(MAX_IDLE_TIMEOUT.try_into()?));
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     server_config.transport_config(Arc::new(transport));
@@ -455,7 +459,17 @@ async fn handle_tcp_stream(
         TargetAddr::Ip(addr) => (addr.ip().to_string(), addr.port(), true),
     };
 
-    let tcp = match TcpStream::connect(&dial_target).await {
+    // Bounded dial: a black-holed target must fail fast (OS SYN timeout is ~2 min on
+    // Linux) so the client gets an error instead of a hung connection.
+    let dial = tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&dial_target))
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connect timed out after {}s", TCP_CONNECT_TIMEOUT.as_secs()),
+            ))
+        });
+    let tcp = match dial {
         Ok(s) => {
             let _ = s.set_nodelay(true);
             quic_send.write_all(&[AUTH_OK]).await?;

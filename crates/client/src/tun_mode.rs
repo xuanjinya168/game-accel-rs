@@ -4,7 +4,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use netstack_smoltcp::StackBuilder;
-use protocol::DEFAULT_INITIAL_MTU;
+use protocol::TUN_MTU;
 use protocol::auth::AUTH_OK;
 use protocol::dedup::DedupWindow;
 use protocol::frame::{FLAG_GAME_MODE, TargetAddr, UdpFrame};
@@ -277,7 +277,7 @@ pub async fn run_tun_mode(
     // Use `mtu_v4` on Windows and explicitly locate `wintun.dll` beside the executable.
     #[cfg(target_os = "windows")]
     {
-        builder = builder.mtu_v4(DEFAULT_INITIAL_MTU);
+        builder = builder.mtu_v4(TUN_MTU);
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let candidate = dir.join("wintun.dll");
@@ -289,7 +289,7 @@ pub async fn run_tun_mode(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        builder = builder.mtu(DEFAULT_INITIAL_MTU);
+        builder = builder.mtu(TUN_MTU);
     }
 
     let dev = builder
@@ -299,7 +299,7 @@ pub async fn run_tun_mode(
     let if_index = dev.if_index().context("获取 TUN 网卡索引失败")?;
     let _route_guard = RouteGuard::install(server_ip, if_index)?;
     emit(format!(
-        "TUN 虚拟网卡已启动 ({TUN_NAME} {TUN_IP}/{TUN_PREFIX}, MTU {DEFAULT_INITIAL_MTU}, 全局路由已接管)"
+        "TUN 虚拟网卡已启动 ({TUN_NAME} {TUN_IP}/{TUN_PREFIX}, MTU {TUN_MTU}, 全局路由已接管)"
     ));
 
     let dev = Arc::new(dev);
@@ -308,7 +308,7 @@ pub async fn run_tun_mode(
     let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(true)
-        .mtu(DEFAULT_INITIAL_MTU as usize)
+        .mtu(TUN_MTU as usize)
         .build()
         .context("初始化用户态 TCP/IP 协议栈失败")?;
 

@@ -8,6 +8,7 @@ use protocol::frame::{FLAG_GAME_MODE, TargetAddr, UdpFrame};
 use protocol::pacer::{UdpDupPacer, send_datagram_checked};
 use quinn::Connection;
 use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,6 +17,30 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 const NAT_IDLE_TIMEOUT_SECS: u64 = 60;
+const NAT_SOCKET_BUFFER: usize = 2 * 1024 * 1024;
+
+/// Bind a per-flow NAT socket. Prefers one dual-stack `[::]:0` socket so both IPv4
+/// and IPv6 targets work (and the Full Cone mapping stays a single port); falls back
+/// to IPv4-only on hosts without IPv6. Returns `(socket, is_dual_stack)`.
+fn bind_nat_socket() -> std::io::Result<(std::net::UdpSocket, bool)> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let build = |domain: Domain, addr: SocketAddr| -> std::io::Result<std::net::UdpSocket> {
+        let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        if domain == Domain::IPV6 {
+            s.set_only_v6(false)?;
+        }
+        // Linux default (~208 KB) overflows on bursty game/voice traffic.
+        let _ = s.set_recv_buffer_size(NAT_SOCKET_BUFFER);
+        let _ = s.set_send_buffer_size(NAT_SOCKET_BUFFER);
+        s.set_nonblocking(true)?;
+        s.bind(&addr.into())?;
+        Ok(s.into())
+    };
+    match build(Domain::IPV6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) {
+        Ok(s) => Ok((s, true)),
+        Err(_) => Ok((build(Domain::IPV4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?, false)),
+    }
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -32,6 +57,9 @@ struct NatMeta {
 
 struct NatEntry {
     socket: Arc<UdpSocket>,
+    /// `true` when `socket` is an AF_INET6 dual-stack socket (IPv4 targets must be
+    /// addressed as v4-mapped IPv6); `false` for an IPv4-only fallback socket.
+    dual_stack: bool,
     meta: Arc<NatMeta>,
     dedup: Mutex<DedupWindow>,
     seen_targets: Mutex<HashSet<String>>,
@@ -139,7 +167,17 @@ impl FullConeNat {
             }
         };
 
-        let sent = entry.socket.send_to(&frame.payload, dst).await?;
+        let send_addr = match (entry.dual_stack, dst) {
+            (true, SocketAddr::V4(v4)) => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            (false, SocketAddr::V6(_)) => {
+                debug!("dropping udp to {dst}: host has no IPv6 socket");
+                return Ok(());
+            }
+            _ => dst,
+        };
+        let sent = entry.socket.send_to(&frame.payload, send_addr).await?;
         self.counters
             .tx_bytes
             .fetch_add(sent as u64, Ordering::Relaxed);
@@ -182,7 +220,8 @@ impl FullConeNat {
             return Ok(existing.clone());
         }
 
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let (std_sock, dual_stack) = bind_nat_socket()?;
+        let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let meta = Arc::new(NatMeta {
             last_active: AtomicU64::new(now_secs()),
             game_mode: AtomicBool::new(false),
@@ -191,6 +230,7 @@ impl FullConeNat {
 
         let entry = Arc::new(NatEntry {
             socket: socket.clone(),
+            dual_stack,
             meta: meta.clone(),
             dedup: Mutex::new(DedupWindow::new()),
             seen_targets: Mutex::new(HashSet::new()),
@@ -209,6 +249,8 @@ impl FullConeNat {
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((n, src_addr)) => {
+                        // Report v4-mapped sources (dual-stack socket) as plain IPv4.
+                        let src_addr = SocketAddr::new(src_addr.ip().to_canonical(), src_addr.port());
                         meta.last_active.store(now_secs(), Ordering::Relaxed);
                         counters_rx.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                         let is_game = meta.game_mode.load(Ordering::Relaxed);

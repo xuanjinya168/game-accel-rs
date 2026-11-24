@@ -7,7 +7,10 @@ use dashmap::DashMap;
 use protocol::auth::{AUTH_OK, write_auth_request};
 use protocol::frame::UdpFrame;
 use protocol::pacer::UdpDupPacer;
-use protocol::{ALPN_PROTOCOL, DEFAULT_INITIAL_MTU};
+use protocol::{
+    ALPN_PROTOCOL, DATAGRAM_RECV_BUFFER, DATAGRAM_SEND_BUFFER, DEFAULT_INITIAL_MTU,
+    KEEP_ALIVE_INTERVAL, MAX_IDLE_TIMEOUT,
+};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, TransportConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -78,7 +81,7 @@ pub async fn run_client_with_shutdown(
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client_config = build_client_config(opts.insecure)?;
-    let udp_sock = bind_tuned_udp_socket("0.0.0.0:0".parse()?)?;
+    let udp_sock = bind_tuned_udp_socket(unspecified_bind_for(opts.server))?;
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
@@ -303,7 +306,7 @@ pub async fn probe_node_rtt(
 ) -> Result<u64> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client_config = build_client_config(insecure)?;
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    let mut endpoint = Endpoint::client(unspecified_bind_for(server))?;
     endpoint.set_default_client_config(client_config);
 
     let fut = async {
@@ -327,6 +330,16 @@ pub async fn probe_node_rtt(
     tokio::time::timeout(Duration::from_secs(4), fut)
         .await
         .context("测速超时 (>4s)")?
+}
+
+/// Local wildcard bind address matching the server's address family
+/// (an IPv4-only socket cannot reach an IPv6 node and vice versa).
+fn unspecified_bind_for(server: SocketAddr) -> SocketAddr {
+    if server.is_ipv6() {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+    }
 }
 
 fn bind_tuned_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
@@ -369,10 +382,10 @@ fn build_client_config(insecure: bool) -> Result<ClientConfig> {
     transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
     transport.send_window(32 * 1024 * 1024);
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(512));
-    transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    transport.datagram_send_buffer_size(4 * 1024 * 1024);
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
-    transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
+    transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
+    transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
+    transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    transport.max_idle_timeout(Some(MAX_IDLE_TIMEOUT.try_into()?));
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     client_config.transport_config(Arc::new(transport));

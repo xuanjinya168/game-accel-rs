@@ -157,7 +157,25 @@ pub fn send_datagram_checked(conn: &Connection, pkt: Bytes) -> bool {
         Ok(()) => true,
         Err(SendDatagramError::ConnectionLost(_)) => false,
         Err(SendDatagramError::TooLarge) => {
-            warn!("dropped oversized UDP datagram (> QUIC max_datagram_size)");
+            // Rate-limited: a game sending oversized packets would otherwise flood the log.
+            static DROPPED: AtomicU64 = AtomicU64::new(0);
+            static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+            let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+            if now >= last + 10
+                && LAST_WARN_SECS
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                warn!(
+                    "dropped oversized UDP datagram (> QUIC max_datagram_size {:?}); {dropped} dropped so far",
+                    conn.max_datagram_size()
+                );
+            }
             true
         }
         Err(e) => {
