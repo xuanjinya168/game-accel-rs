@@ -332,20 +332,6 @@ impl GameAccelApp {
             });
         });
 
-        // Toast Notification
-        if let Some((msg, _)) = &self.toast {
-            ui.add_space(6.0);
-            Frame::new()
-                .fill(p.accent_soft)
-                .stroke(Stroke::new(1.0_f32, p.accent))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 6))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new(msg).size(FONT_SM).color(p.accent_text));
-                });
-        }
-
         ui.add_space(16.0);
 
         // Responsive max-width centering on very wide/maximized monitors so layouts stay balanced
@@ -832,57 +818,54 @@ impl GameAccelApp {
             .inner_margin(Margin::same(4))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add_enabled_ui(self.state == ConnState::Disconnected, |ui| {
-                    let modes = [
-                        (ProxyMode::Tun, "TUN 全局"),
-                        (ProxyMode::SystemProxy, "系统代理"),
-                        (ProxyMode::Manual, "本地端口"),
-                    ];
-                    ui.columns(3, |cols| {
-                        for (idx, (mode, title)) in modes.iter().enumerate() {
-                            let selected = self.cfg.proxy_mode == *mode;
-                            let (rect, resp) = cols[idx].allocate_exact_size(
-                                Vec2::new(cols[idx].available_width(), 32.0),
-                                Sense::click(),
-                            );
-                            let fill = if selected {
-                                p.bg_card
-                            } else if resp.hovered() && self.state == ConnState::Disconnected {
-                                p.bg_nav_hover
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            let stroke = if selected {
-                                Stroke::new(1.0_f32, p.border_subtle)
-                            } else {
-                                Stroke::NONE
-                            };
-                            let col = if selected {
-                                p.text_primary
-                            } else {
-                                p.text_muted
-                            };
-                            let painter = cols[idx].painter();
-                            painter.rect(
-                                rect,
-                                CornerRadius::same(6),
-                                fill,
-                                stroke,
-                                egui::StrokeKind::Inside,
-                            );
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                *title,
-                                FontId::proportional(FONT_BODY),
-                                col,
-                            );
-                            if resp.clicked() {
-                                self.cfg.proxy_mode = *mode;
-                                save_config(&self.cfg);
-                            }
+                let modes = [
+                    (ProxyMode::Tun, "TUN 全局"),
+                    (ProxyMode::SystemProxy, "系统代理"),
+                    (ProxyMode::Manual, "本地端口"),
+                ];
+                ui.columns(3, |cols| {
+                    for (idx, (mode, title)) in modes.iter().enumerate() {
+                        let selected = self.cfg.proxy_mode == *mode;
+                        let (rect, resp) = cols[idx].allocate_exact_size(
+                            Vec2::new(cols[idx].available_width(), 32.0),
+                            Sense::click(),
+                        );
+                        let fill = if selected {
+                            p.bg_card
+                        } else if resp.hovered() {
+                            p.bg_nav_hover
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let stroke = if selected {
+                            Stroke::new(1.0_f32, p.border_subtle)
+                        } else {
+                            Stroke::NONE
+                        };
+                        let col = if selected {
+                            p.text_primary
+                        } else {
+                            p.text_muted
+                        };
+                        let painter = cols[idx].painter();
+                        painter.rect(
+                            rect,
+                            CornerRadius::same(6),
+                            fill,
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            *title,
+                            FontId::proportional(FONT_BODY),
+                            col,
+                        );
+                        if resp.clicked() {
+                            self.switch_proxy_mode(*mode);
                         }
-                    });
+                    }
                 });
             });
 
@@ -905,6 +888,9 @@ impl GameAccelApp {
                         .color(p.accent_text),
                 );
                 if primary_btn(ui, "以管理员身份重启", p).clicked() {
+                    if self.state != ConnState::Disconnected {
+                        self.stop_connect();
+                    }
                     save_config(&self.cfg);
                     relaunch_as_admin();
                 }
@@ -1483,7 +1469,20 @@ impl GameAccelApp {
                         } else {
                             p.text_secondary
                         };
-                        ui.label(RichText::new(line).size(FONT_SM).monospace().color(color));
+                        // Use Proportional (Microsoft YaHei) for mixed CJK/ASCII log lines so
+                        // timestamps, ASCII acronyms (e.g. TUN), and CJK share one baseline.
+                        let font = FontId::proportional(FONT_SM);
+                        let mut job = egui::text::LayoutJob::default();
+                        if line.starts_with('[')
+                            && let Some(end) = line.find("] ")
+                        {
+                            let (ts, rest) = line.split_at(end + 2);
+                            job.append(ts, 0.0, egui::TextFormat::simple(font.clone(), p.text_muted));
+                            job.append(rest, 0.0, egui::TextFormat::simple(font, color));
+                        } else {
+                            job.append(line, 0.0, egui::TextFormat::simple(font, color));
+                        }
+                        ui.label(job);
                     }
                 });
         });
@@ -1695,6 +1694,9 @@ impl GameAccelApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if !self.is_admin && primary_btn(ui, "管理员重启", p).clicked() {
+                        if self.state != ConnState::Disconnected {
+                            self.stop_connect();
+                        }
                         save_config(&self.cfg);
                         relaunch_as_admin();
                     }

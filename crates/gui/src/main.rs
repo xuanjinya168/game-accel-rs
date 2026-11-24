@@ -135,6 +135,7 @@ pub(crate) struct GameAccelApp {
     pub(crate) last_error: Option<String>,
     pub(crate) toast: Option<(String, Instant)>,
     reconnect: ReconnectPolicy,
+    pending_mode_reconnect: Option<Instant>,
     session_id: u64,
 
     // Speed & RTT history
@@ -216,6 +217,7 @@ impl GameAccelApp {
             last_error: None,
             toast: None,
             reconnect: ReconnectPolicy::default(),
+            pending_mode_reconnect: None,
             session_id: 0,
             last_sample_at: Instant::now(),
             last_tx_bytes: 0,
@@ -265,7 +267,83 @@ impl GameAccelApp {
     }
 
     pub(crate) fn start_connect(&mut self) {
+        self.pending_mode_reconnect = None;
         self.connect(false);
+    }
+
+    pub(crate) fn switch_proxy_mode(&mut self, mode: ProxyMode) {
+        if self.cfg.proxy_mode == mode {
+            return;
+        }
+        let prev = self.cfg.proxy_mode;
+        self.cfg.proxy_mode = mode;
+        save_config(&self.cfg);
+
+        // Switching to TUN without admin rights: clean up active session and elevate immediately
+        if mode == ProxyMode::Tun && !self.is_admin {
+            if self.state != ConnState::Disconnected {
+                self.stop_connect();
+            }
+            self.push_log("切换至 TUN 模式需要管理员权限，正在以管理员身份重启...");
+            relaunch_as_admin();
+            return;
+        }
+
+        if self.state == ConnState::Disconnected {
+            return;
+        }
+
+        // SystemProxy <-> Manual share the exact same QUIC + local mixed proxy session:
+        // hot-toggle Windows system proxy without dropping the tunnel.
+        if prev != ProxyMode::Tun && mode != ProxyMode::Tun {
+            match mode {
+                ProxyMode::SystemProxy => {
+                    let listen = self.cfg.listen_addr.trim().to_string();
+                    match sys_proxy::enable_system_proxy(&listen) {
+                        Ok(()) => {
+                            self.sys_proxy_flag.store(true, Ordering::SeqCst);
+                            self.push_log(format!("已热切换为系统代理模式: {listen}"));
+                            self.show_toast("已切换为系统代理模式");
+                        }
+                        Err(e) => {
+                            self.push_log(format!("开启系统代理失败: {e:#}"));
+                            self.show_toast("开启系统代理失败");
+                        }
+                    }
+                }
+                ProxyMode::Manual => {
+                    if self.sys_proxy_flag.swap(false, Ordering::SeqCst) {
+                        match sys_proxy::disable_system_proxy() {
+                            Ok(()) => {
+                                self.push_log("已热切换为本地端口模式（已关闭系统代理）");
+                                self.show_toast("已切换为本地端口模式");
+                            }
+                            Err(e) => {
+                                self.push_log(format!("关闭系统代理失败: {e:#}"));
+                                self.show_toast("关闭系统代理失败");
+                            }
+                        }
+                    } else {
+                        self.show_toast("已切换为本地端口模式");
+                    }
+                }
+                ProxyMode::Tun => unreachable!(),
+            }
+            return;
+        }
+
+        // Transitions involving TUN require tearing down the old session first so the
+        // local listener port and Wintun adapter finish releasing before reconnecting.
+        let mode_label = match mode {
+            ProxyMode::Tun => "TUN 全局",
+            ProxyMode::SystemProxy => "系统代理",
+            ProxyMode::Manual => "本地端口",
+        };
+        self.stop_connect();
+        self.state = ConnState::Connecting;
+        self.pending_mode_reconnect = Some(Instant::now() + Duration::from_millis(450));
+        self.push_log(format!("正在切换为{mode_label}模式并重新建立连接..."));
+        self.show_toast(format!("正在切换为{mode_label}模式..."));
     }
 
     /// (attempt, seconds until it fires) while a reconnect is pending or in flight.
@@ -378,6 +456,7 @@ impl GameAccelApp {
 
     pub(crate) fn stop_connect(&mut self) {
         self.reconnect.reset();
+        self.pending_mode_reconnect = None;
         self.session_id = self.session_id.wrapping_add(1);
         if let Ok(mut guard) = self.shutdown_slot.lock() {
             if let Some(tx) = guard.take() {
@@ -630,6 +709,15 @@ impl GameAccelApp {
             self.on_tunnel_lost("连接已断开");
         }
 
+        if let Some(due) = self.pending_mode_reconnect
+            && Instant::now() >= due
+        {
+            self.pending_mode_reconnect = None;
+            if !self.connect(false) {
+                self.stop_connect();
+            }
+        }
+
         if self.state == ConnState::Connecting
             && self.reconnect.take_due(Instant::now())
             && !self.connect(true)
@@ -664,10 +752,112 @@ impl GameAccelApp {
             self.last_sample_at = Instant::now();
         }
 
-        if let Some((_, ts)) = &self.toast {
-            if ts.elapsed() > Duration::from_millis(3500) {
-                self.toast = None;
-            }
+        if let Some((_, ts)) = &self.toast
+            && ts.elapsed() > Duration::from_millis(2700)
+        {
+            self.toast = None;
+        }
+    }
+
+    fn render_toast_overlay(
+        &mut self,
+        ctx: &egui::Context,
+        right_rect: egui::Rect,
+        p: ThemePalette,
+    ) {
+        let Some((msg, ts)) = self.toast.clone() else {
+            return;
+        };
+        let elapsed_ms = ts.elapsed().as_secs_f32() * 1000.0;
+        const TOTAL_MS: f32 = 2700.0;
+        const IN_MS: f32 = 160.0;
+        const OUT_MS: f32 = 340.0;
+        if elapsed_ms >= TOTAL_MS {
+            self.toast = None;
+            return;
+        }
+
+        let (alpha, y_offset) = if elapsed_ms < IN_MS {
+            let t = (elapsed_ms / IN_MS).clamp(0.0, 1.0);
+            let ease = 1.0 - (1.0 - t) * (1.0 - t);
+            ctx.request_repaint();
+            (ease, (1.0 - ease) * 8.0)
+        } else if elapsed_ms > TOTAL_MS - OUT_MS {
+            let t = ((TOTAL_MS - elapsed_ms) / OUT_MS).clamp(0.0, 1.0);
+            ctx.request_repaint();
+            (t * t, (1.0 - t) * 4.0)
+        } else {
+            (1.0, 0.0)
+        };
+
+        let is_err = msg.contains("失败")
+            || msg.contains("异常")
+            || msg.contains("错误")
+            || msg.contains("无效")
+            || msg.contains("断开");
+        let is_ok = msg.contains("成功")
+            || msg.contains("已切换")
+            || msg.contains("已复制")
+            || msg.contains("已保存")
+            || msg.contains("已添加")
+            || msg.contains("已重置");
+
+        let dot_col = if is_err {
+            p.danger_text
+        } else if is_ok {
+            p.success_text
+        } else {
+            p.accent
+        };
+        let border_col = if is_err {
+            p.danger_text
+        } else {
+            p.border_strong
+        };
+
+        let bg = p.bg_card.gamma_multiply(alpha);
+        let border = border_col.gamma_multiply(alpha);
+        let dot = dot_col.gamma_multiply(alpha);
+        let text_col = p.text_primary.gamma_multiply(alpha);
+        let shadow_alpha = ((if p.is_dark { 96.0 } else { 32.0 }) * alpha) as u8;
+
+        let anchor_pos = Pos2::new(right_rect.center().x, right_rect.max.y - 24.0 + y_offset);
+        let mut dismissed = false;
+        egui::Area::new(egui::Id::new("floating_toast_overlay"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(anchor_pos)
+            .show(ctx, |ui| {
+                let frame_resp = Frame::new()
+                    .fill(bg)
+                    .stroke(Stroke::new(1.0_f32, border))
+                    .corner_radius(CornerRadius::same(18))
+                    .inner_margin(Margin::symmetric(14, 8))
+                    .shadow(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 14,
+                        spread: 0,
+                        color: Color32::from_black_alpha(shadow_alpha),
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(7.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot_rect.center(), 3.5, dot);
+                            ui.label(
+                                egui::RichText::new(&msg)
+                                    .size(theme::FONT_SM)
+                                    .color(text_col),
+                            );
+                        });
+                    });
+                if frame_resp.response.interact(egui::Sense::click()).clicked() {
+                    dismissed = true;
+                }
+            });
+        if dismissed {
+            self.toast = None;
         }
     }
 }
@@ -707,6 +897,8 @@ impl eframe::App for GameAccelApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
+        let mut toast_workspace_rect = egui::Rect::NOTHING;
+
         // Frameless rounded window container with single crisp 1px outer border (zero double-stroke)
         egui::CentralPanel::default()
             .frame(Frame::NONE)
@@ -733,6 +925,7 @@ impl eframe::App for GameAccelApp {
                     Pos2::new(split_x, total_rect.min.y),
                     total_rect.max,
                 );
+                toast_workspace_rect = right_rect;
                 ui.painter().rect_filled(
                     sidebar_rect,
                     CornerRadius {
@@ -804,6 +997,10 @@ impl eframe::App for GameAccelApp {
                     );
                 }
             });
+
+        if toast_workspace_rect.is_positive() {
+            self.render_toast_overlay(ctx, toast_workspace_rect, p);
+        }
     }
 }
 

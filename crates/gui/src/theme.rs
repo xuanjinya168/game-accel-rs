@@ -215,7 +215,7 @@ pub fn configure_fonts(ctx: &egui::Context) {
         }
     }
 
-    // Microsoft YaHei for proportional UI copy, and appended at the end of Monospace only as CJK fallback
+    // Microsoft YaHei for proportional UI copy, plus a baseline-aligned CJK fallback for Monospace
     let cn_candidates = [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyh.ttf",
@@ -223,18 +223,25 @@ pub fn configure_fonts(ctx: &egui::Context) {
     ];
     for path in cn_candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            let data = Arc::new(FontData::from_owned(bytes));
-            fonts.font_data.insert("cn_font".to_owned(), data);
+            let prop_data = Arc::new(FontData::from_owned(bytes.clone()));
+            fonts.font_data.insert("cn_font".to_owned(), prop_data);
             fonts
                 .families
                 .entry(FontFamily::Proportional)
                 .or_default()
                 .insert(0, "cn_font".to_owned());
+
+            // Shift CJK fallback slightly upward in Monospace so it aligns with Consolas baseline
+            let mut mono_cn = FontData::from_owned(bytes);
+            mono_cn.tweak.y_offset_factor = -0.09;
+            fonts
+                .font_data
+                .insert("cn_font_mono".to_owned(), Arc::new(mono_cn));
             fonts
                 .families
                 .entry(FontFamily::Monospace)
                 .or_default()
-                .push("cn_font".to_owned());
+                .push("cn_font_mono".to_owned());
             break;
         }
     }
