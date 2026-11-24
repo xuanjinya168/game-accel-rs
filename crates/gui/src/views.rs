@@ -372,6 +372,14 @@ impl GameAccelApp {
     }
 
     fn render_dashboard(&mut self, ui: &mut egui::Ui, p: ThemePalette) {
+        ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                self.render_dashboard_inner(ui, p);
+            });
+    }
+
+    fn render_dashboard_inner(&mut self, ui: &mut egui::Ui, p: ThemePalette) {
         let rtt = self.stats.rtt_ms.load(Ordering::Relaxed);
         let tcp = self.stats.active_tcp.load(Ordering::Relaxed);
         let udp = self.stats.active_udp.load(Ordering::Relaxed);
