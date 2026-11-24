@@ -4,6 +4,7 @@ pub mod frame;
 pub mod io;
 pub mod pacer;
 pub mod share;
+pub mod sniff;
 
 pub const ALPN_PROTOCOL: &[u8] = b"h3";
 pub const DEFAULT_INITIAL_MTU: u16 = 1200;

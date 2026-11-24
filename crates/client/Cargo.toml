@@ -13,6 +13,7 @@ netstack-smoltcp.workspace = true
 protocol = { path = "../protocol" }
 quinn.workspace = true
 rustls.workspace = true
+serde.workspace = true
 socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true

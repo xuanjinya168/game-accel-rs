@@ -1,4 +1,5 @@
-use crate::ERR_PORT_IN_USE;
+use crate::rules::{Route, Router};
+use crate::{AbortOnDrop, ERR_PORT_IN_USE};
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -24,6 +25,9 @@ pub(crate) const SOCKS_FLOW_MIN: u16 = 1;
 pub(crate) const SOCKS_FLOW_MAX: u16 = 32767;
 pub(crate) const TUN_FLOW_MIN: u16 = 32768;
 pub(crate) const TUN_FLOW_MAX: u16 = 65534;
+
+/// Timeout for DIRECT (non-tunnelled) TCP dials from this machine.
+const DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Atomically reserve an unused `flow_id` strictly within `[min_id, max_id]` and insert `tx`
 /// into `dispatch`, skipping any currently occupied IDs even across wraparound.
@@ -87,13 +91,17 @@ impl ClientStats {
 }
 
 /// Mixed (HTTP + HTTPS CONNECT + SOCKS5 TCP/UDP) proxy listener on a single port.
+/// Uses `tcp_conn` for TCP streams and dedicated `udp_conn` for SOCKS5 UDP datagrams.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mixed_proxy_server(
     listen_addr: SocketAddr,
-    conn: Connection,
+    tcp_conn: Connection,
+    udp_conn: Connection,
     pacer: UdpDupPacer,
     udp_dispatch: UdpDispatchMap,
     game_dup: bool,
     stats: Arc<ClientStats>,
+    router: Arc<Router>,
     log_tx: Option<mpsc::UnboundedSender<String>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -125,16 +133,20 @@ pub async fn run_mixed_proxy_server(
                         continue;
                     }
                 };
-                let conn = conn.clone();
+                let tcp_conn = tcp_conn.clone();
+                let udp_conn = udp_conn.clone();
                 let pacer = pacer.clone();
                 let dispatch = udp_dispatch.clone();
                 let next_flow_id = next_flow_id.clone();
                 let stats = stats.clone();
+                let router = router.clone();
 
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
-                    if let Err(e) =
-                        handle_mixed_client(stream, conn, pacer, dispatch, next_flow_id, game_dup, stats).await
+                    if let Err(e) = handle_mixed_client(
+                        stream, tcp_conn, udp_conn, pacer, dispatch, next_flow_id, game_dup, stats, router,
+                    )
+                    .await
                     {
                         debug!("proxy client {} ended: {:#}", peer, e);
                     }
@@ -145,14 +157,17 @@ pub async fn run_mixed_proxy_server(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_mixed_client(
     stream: TcpStream,
-    conn: Connection,
+    tcp_conn: Connection,
+    udp_conn: Connection,
     pacer: UdpDupPacer,
     udp_dispatch: UdpDispatchMap,
     next_flow_id: Arc<AtomicU16>,
     game_dup: bool,
     stats: Arc<ClientStats>,
+    router: Arc<Router>,
 ) -> Result<()> {
     let mut first = [0u8; 1];
     let n = stream.peek(&mut first).await?;
@@ -160,9 +175,12 @@ async fn handle_mixed_client(
         return Ok(());
     }
     if first[0] == 0x05 {
-        handle_socks5_client(stream, conn, pacer, udp_dispatch, next_flow_id, game_dup, stats).await
+        handle_socks5_client(
+            stream, tcp_conn, udp_conn, pacer, udp_dispatch, next_flow_id, game_dup, stats, router,
+        )
+        .await
     } else {
-        handle_http_proxy_client(stream, conn, stats).await
+        handle_http_proxy_client(stream, tcp_conn, stats, router).await
     }
 }
 
@@ -171,6 +189,7 @@ async fn handle_http_proxy_client(
     mut client: TcpStream,
     conn: Connection,
     stats: Arc<ClientStats>,
+    router: Arc<Router>,
 ) -> Result<()> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
@@ -197,33 +216,27 @@ async fn handle_http_proxy_client(
     let version = parts.next().unwrap_or("HTTP/1.1");
 
     let leftover = &buf[header_end + 4..];
+    const BAD_GATEWAY: &[u8] =
+        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-    if method.eq_ignore_ascii_case("CONNECT") {
-        let target = parse_host_port(raw_target, 443)?;
-        let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
-        target.write_tcp_open(&mut quic_send).await?;
-
-        // Fast-open: answer 200 right away instead of waiting a full tunnel RTT for the
-        // server's dial status; the browser's TLS ClientHello travels together with the
-        // open request. A failed dial closes the connection (see `relay_fast_open`).
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
-
-        if !leftover.is_empty() {
-            quic_send.write_all(leftover).await?;
-            stats
-                .tx_bytes
-                .fetch_add(leftover.len() as u64, Ordering::Relaxed);
-        }
-
-        relay_fast_open(client, quic_send, quic_recv, stats, None).await
+    // `ok_reply` is written to the local client once the upstream path is ready;
+    // `upstream_preamble` is the first bytes to send upstream (rebuilt request + body).
+    let (target, ok_reply, upstream_preamble, fail_reply): (
+        TargetAddr,
+        Option<&'static [u8]>,
+        Vec<u8>,
+        Option<&'static [u8]>,
+    ) = if method.eq_ignore_ascii_case("CONNECT") {
+        (
+            parse_host_port(raw_target, 443)?,
+            Some(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+            leftover.to_vec(),
+            // After 200 was sent (proxy fast-open) there is no way to report an error.
+            None,
+        )
     } else {
         // Plain HTTP proxy request: e.g. GET http://example.com/path HTTP/1.1
         let (target, path) = parse_http_url(raw_target)?;
-        let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
-        target.write_tcp_open(&mut quic_send).await?;
-
         let mut rebuilt = String::with_capacity(header_str.len() + 32);
         rebuilt.push_str(method);
         rebuilt.push(' ');
@@ -231,7 +244,6 @@ async fn handle_http_proxy_client(
         rebuilt.push(' ');
         rebuilt.push_str(version);
         rebuilt.push_str("\r\n");
-
         for line in lines {
             if line.is_empty() {
                 continue;
@@ -246,31 +258,64 @@ async fn handle_http_proxy_client(
             rebuilt.push_str(line);
             rebuilt.push_str("\r\n");
         }
-        // This tunnel is bound to ONE origin. A keep-alive browser would reuse the proxy
-        // connection for a request to a different host and it would be sent to the wrong
-        // server, so force one request per proxy connection.
+        // This connection is bound to ONE origin. A keep-alive browser would reuse the
+        // proxy connection for a request to a different host and it would be sent to the
+        // wrong server, so force one request per proxy connection.
         rebuilt.push_str("Connection: close\r\n\r\n");
+        let mut preamble = rebuilt.into_bytes();
+        preamble.extend_from_slice(leftover);
+        (target, None, preamble, Some(BAD_GATEWAY))
+    };
 
-        quic_send.write_all(rebuilt.as_bytes()).await?;
+    if router.decide(&target).await == Route::Direct {
+        // CONNECT: a local dial is fast, so wait for it and report failure honestly.
+        let fail = if ok_reply.is_some() { Some(BAD_GATEWAY) } else { fail_reply };
+        return relay_direct(&router, client, &target, ok_reply, &upstream_preamble, fail).await;
+    }
+
+    let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
+    target.write_tcp_open(&mut quic_send).await?;
+    // Fast-open: answer the client right away instead of waiting a full tunnel RTT for
+    // the server's dial status; the first payload travels with the open request.
+    if let Some(reply) = ok_reply {
+        client.write_all(reply).await?;
+    }
+    if !upstream_preamble.is_empty() {
+        quic_send.write_all(&upstream_preamble).await?;
         stats
             .tx_bytes
-            .fetch_add(rebuilt.len() as u64, Ordering::Relaxed);
-        if !leftover.is_empty() {
-            quic_send.write_all(leftover).await?;
-            stats
-                .tx_bytes
-                .fetch_add(leftover.len() as u64, Ordering::Relaxed);
-        }
-
-        relay_fast_open(
-            client,
-            quic_send,
-            quic_recv,
-            stats,
-            Some(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-        )
-        .await
+            .fetch_add(upstream_preamble.len() as u64, Ordering::Relaxed);
     }
+    relay_fast_open(client, quic_send, quic_recv, stats, fail_reply).await
+}
+
+/// DIRECT outbound: dial `target` from this machine (pinned to physical NIC when TUN is
+/// active so it never loops back into TUN), then splice.
+async fn relay_direct(
+    router: &Router,
+    mut client: TcpStream,
+    target: &TargetAddr,
+    ok_reply: Option<&[u8]>,
+    upstream_preamble: &[u8],
+    fail_reply: Option<&[u8]>,
+) -> Result<()> {
+    let mut upstream = match router.dialer.connect_target(target, DIRECT_CONNECT_TIMEOUT).await {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(reply) = fail_reply {
+                let _ = client.write_all(reply).await;
+            }
+            bail!("direct connect {} failed: {e}", target.to_host_port());
+        }
+    };
+    if let Some(reply) = ok_reply {
+        client.write_all(reply).await?;
+    }
+    if !upstream_preamble.is_empty() {
+        upstream.write_all(upstream_preamble).await?;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    Ok(())
 }
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
@@ -373,14 +418,17 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socks5_client(
     mut client: TcpStream,
-    conn: Connection,
+    tcp_conn: Connection,
+    udp_conn: Connection,
     pacer: UdpDupPacer,
     udp_dispatch: UdpDispatchMap,
     next_flow_id: Arc<AtomicU16>,
     game_dup: bool,
     stats: Arc<ClientStats>,
+    router: Arc<Router>,
 ) -> Result<()> {
     let mut head = [0u8; 2];
     client.read_exact(&mut head).await?;
@@ -400,16 +448,17 @@ async fn handle_socks5_client(
     let target = read_socks5_addr(&mut client, req[3]).await?;
 
     match cmd {
-        0x01 => handle_tcp_connect(client, conn, target, stats).await,
+        0x01 => handle_tcp_connect(client, tcp_conn, target, stats, router).await,
         0x03 => {
             handle_udp_associate(
                 client,
-                conn,
+                udp_conn,
                 pacer,
                 udp_dispatch,
                 next_flow_id,
                 game_dup,
                 stats,
+                router,
             )
             .await
         }
@@ -427,20 +476,27 @@ async fn handle_tcp_connect(
     conn: Connection,
     target: TargetAddr,
     stats: Arc<ClientStats>,
+    router: Arc<Router>,
 ) -> Result<()> {
+    const SOCKS_OK: &[u8] = &[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    const SOCKS_HOST_UNREACHABLE: &[u8] = &[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+
+    if router.decide(&target).await == Route::Direct {
+        return relay_direct(&router, client, &target, Some(SOCKS_OK), &[], Some(SOCKS_HOST_UNREACHABLE)).await;
+    }
+
     let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
     target.write_tcp_open(&mut quic_send).await?;
 
     // Fast-open: report success immediately; the dial status is checked in the relay.
-    client
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
+    client.write_all(SOCKS_OK).await?;
 
     relay_fast_open(client, quic_send, quic_recv, stats, None)
         .await
         .with_context(|| format!("tcp to {}", target.to_host_port()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_udp_associate(
     mut tcp_ctrl: TcpStream,
     conn: Connection,
@@ -449,6 +505,7 @@ async fn handle_udp_associate(
     next_flow_id: Arc<AtomicU16>,
     game_dup: bool,
     stats: Arc<ClientStats>,
+    router: Arc<Router>,
 ) -> Result<()> {
     let local_ip = tcp_ctrl.local_addr()?.ip();
     let udp_sock = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
@@ -488,20 +545,56 @@ async fn handle_udp_associate(
     let tx_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         let mut seq: u16 = 0;
+        // Lazily created DIRECT socket for rule-matched (e.g. domestic) UDP targets,
+        // with its reply pump; aborted together with this task.
+        let mut direct: Option<(Arc<UdpSocket>, AbortOnDrop)> = None;
         loop {
             let Ok((n, src)) = sock_in.recv_from(&mut buf).await else {
                 break;
             };
-            {
-                let mut guard = peer_addr_writer.write().await;
-                if *guard != Some(src) {
-                    *guard = Some(src);
-                }
+            // Hot path: take the write lock only when the client's UDP source changes.
+            if *peer_addr_writer.read().await != Some(src) {
+                *peer_addr_writer.write().await = Some(src);
             }
             let Ok((dst, payload)) = parse_socks5_udp_packet(Bytes::copy_from_slice(&buf[..n]))
             else {
                 continue;
             };
+
+            let is_v6_ip = matches!(dst, TargetAddr::Ip(SocketAddr::V6(_)));
+            if !is_v6_ip && router.decide(&dst).await == Route::Direct {
+                if direct.is_none() {
+                    match router.dialer.bind_udp_v4() {
+                        Ok(s) => {
+                            let s = Arc::new(s);
+                            let pump = spawn_direct_udp_reply_pump(
+                                s.clone(),
+                                sock_in.clone(),
+                                peer_addr_writer.clone(),
+                            );
+                            direct = Some((s, AbortOnDrop(pump)));
+                        }
+                        Err(e) => {
+                            warn!("bind direct udp socket failed: {e}");
+                            continue;
+                        }
+                    }
+                }
+                let dst_addr = match &dst {
+                    TargetAddr::Ip(a) => Some(*a),
+                    TargetAddr::Domain(h, p) => router
+                        .resolve_cached(&h.to_ascii_lowercase())
+                        .await
+                        .filter(IpAddr::is_ipv4)
+                        .map(|ip| SocketAddr::new(ip, *p)),
+                };
+                if let (Some((s, _)), Some(a)) = (&direct, dst_addr) {
+                    if let Err(e) = s.send_to(&payload, a).await {
+                        debug!("direct udp send to {a} failed: {e}");
+                    }
+                }
+                continue;
+            }
 
             let cur_seq = seq;
             seq = seq.wrapping_add(1);
@@ -561,6 +654,30 @@ async fn handle_udp_associate(
     udp_dispatch.remove(&flow_id);
     stats.active_udp.fetch_sub(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// Forward replies received on a DIRECT UDP socket back to the SOCKS5 client,
+/// wrapped in the SOCKS5 UDP header with the real remote source address.
+fn spawn_direct_udp_reply_pump(
+    direct: Arc<UdpSocket>,
+    local: Arc<UdpSocket>,
+    peer: Arc<tokio::sync::RwLock<Option<SocketAddr>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let Ok((n, src)) = direct.recv_from(&mut buf).await else {
+                break;
+            };
+            let Some(client) = *peer.read().await else {
+                continue;
+            };
+            let src = SocketAddr::new(src.ip().to_canonical(), src.port());
+            if let Ok(pkt) = build_socks5_udp_packet(&TargetAddr::Ip(src), &buf[..n]) {
+                let _ = local.send_to(&pkt, client).await;
+            }
+        }
+    })
 }
 
 async fn read_socks5_addr(stream: &mut TcpStream, atyp: u8) -> Result<TargetAddr> {

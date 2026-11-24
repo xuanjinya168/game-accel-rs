@@ -1,6 +1,6 @@
 use crate::icons;
 use crate::logger;
-use crate::storage::{ProxyMode, config_dir, format_bytes, format_speed, save_config};
+use crate::storage::{ProxyMode, RouteMode, config_dir, format_bytes, format_speed, save_config};
 use crate::theme::{
     FONT_BODY, FONT_SM, FONT_SUB, FONT_TITLE, FONT_XS, ThemeMode, ThemePalette, apply_theme,
 };
@@ -884,6 +884,68 @@ impl GameAccelApp {
             ui.label(RichText::new(mode_desc).size(FONT_SM).color(p.text_muted));
         });
 
+        // Split-routing selector (规则 / 全局 / 直连), applied live to new connections.
+        ui.add_space(10.0);
+        Frame::new()
+            .fill(p.bg_card_alt)
+            .stroke(Stroke::new(1.0_f32, p.border_subtle))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let routes = [
+                    (RouteMode::Rule, "规则分流"),
+                    (RouteMode::Global, "全局代理"),
+                    (RouteMode::Direct, "全部直连"),
+                ];
+                ui.columns(3, |cols| {
+                    for (idx, (mode, title)) in routes.iter().enumerate() {
+                        let selected = self.cfg.route_mode == *mode;
+                        let (rect, resp) = cols[idx].allocate_exact_size(
+                            Vec2::new(cols[idx].available_width(), 28.0),
+                            Sense::click(),
+                        );
+                        let fill = if selected {
+                            p.bg_card
+                        } else if resp.hovered() {
+                            p.bg_nav_hover
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let stroke = if selected {
+                            Stroke::new(1.0_f32, p.border_subtle)
+                        } else {
+                            Stroke::NONE
+                        };
+                        let col = if selected { p.text_primary } else { p.text_muted };
+                        let painter = cols[idx].painter();
+                        painter.rect(rect, CornerRadius::same(6), fill, stroke, egui::StrokeKind::Inside);
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            *title,
+                            FontId::proportional(FONT_SM),
+                            col,
+                        );
+                        if resp.clicked() {
+                            self.switch_route_mode(*mode);
+                        }
+                    }
+                });
+            });
+        ui.add_space(6.0);
+        let route_desc = match (self.cfg.route_mode, self.cfg.proxy_mode) {
+            (RouteMode::Rule, ProxyMode::Tun) => {
+                "国内网站直连物理网卡 + 国内 DNS 分流，国外与游戏走加速隧道"
+            }
+            (RouteMode::Rule, _) => "国内网站与国内 IP 直连，其余流量走加速线路",
+            (RouteMode::Global, _) => "所有流量都走加速线路",
+            (RouteMode::Direct, _) => "所有流量直连，不经过加速线路（用于对比测试）",
+        };
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(route_desc).size(FONT_SM).color(p.text_muted));
+        });
+
         if self.cfg.proxy_mode == ProxyMode::Tun && !self.is_admin {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1111,14 +1173,14 @@ impl GameAccelApp {
                         ui.end_row();
 
                         ui.label(
-                            RichText::new("服务器 (IP:端口)")
+                            RichText::new("服务器 (IP / 域名:端口)")
                                 .size(FONT_BODY)
                                 .color(p.text_secondary),
                         );
                         styled_input(
                             ui,
                             &mut ed.server,
-                            "203.0.113.10:8443",
+                            "203.0.113.10:8443 或 hk1.example.com:8443",
                             300.0,
                             false,
                             p,

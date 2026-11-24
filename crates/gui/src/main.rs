@@ -142,6 +142,8 @@ pub(crate) struct GameAccelApp {
     reconnect: ReconnectPolicy,
     pending_mode_reconnect: Option<Instant>,
     session_id: u64,
+    /// Live split-routing mode shared with the running session (no reconnect needed).
+    pub(crate) route_mode_cell: Arc<client::rules::RouteModeCell>,
 
     // Speed & RTT history
     last_sample_at: Instant,
@@ -219,6 +221,7 @@ impl GameAccelApp {
 
         let mut app = Self {
             rt,
+            route_mode_cell: client::rules::RouteModeCell::new(cfg.route_mode),
             cfg,
             active_tab: NavTab::Dashboard,
             state: ConnState::Disconnected,
@@ -287,6 +290,18 @@ impl GameAccelApp {
     pub(crate) fn start_connect(&mut self) {
         self.pending_mode_reconnect = None;
         self.connect(false);
+    }
+
+    pub(crate) fn switch_route_mode(&mut self, mode: storage::RouteMode) {
+        if self.cfg.route_mode == mode {
+            return;
+        }
+        self.cfg.route_mode = mode;
+        self.route_mode_cell.set(mode);
+        save_config(&self.cfg);
+        let msg = format!("分流模式已切换为「{}」（对新连接立即生效）", mode.label());
+        self.push_log(msg.clone());
+        self.toast = Some((msg, Instant::now()));
     }
 
     pub(crate) fn switch_proxy_mode(&mut self, mode: ProxyMode) {
@@ -380,15 +395,13 @@ impl GameAccelApp {
             return false;
         };
 
-        let server: SocketAddr = match node.server.trim().parse() {
-            Ok(a) => a,
-            Err(_) => {
-                let err = format!("节点地址格式无效：{}（应为 IP:端口）", node.server);
-                self.last_error = Some(err.clone());
-                self.push_log(err);
-                return false;
-            }
-        };
+        let server = node.server.trim().to_string();
+        if let Err(e) = client::validate_server_addr(&server) {
+            let err = format!("节点地址格式无效：{}（{e}，支持 IP:端口 或 域名:端口）", node.server);
+            self.last_error = Some(err.clone());
+            self.push_log(err);
+            return false;
+        }
         let listen: SocketAddr = match self.cfg.listen_addr.trim().parse() {
             Ok(a) => a,
             Err(_) => {
@@ -456,6 +469,8 @@ impl GameAccelApp {
             game_dup: node.game_dup,
             enable_tun: self.cfg.proxy_mode == ProxyMode::Tun,
             insecure: node.insecure,
+            route_mode: self.route_mode_cell.clone(),
+            rules_dir: Some(storage::config_dir().join("rules")),
         };
         let stats = self.stats.clone();
         let ev_tx = self.event_tx.clone();
@@ -503,15 +518,16 @@ impl GameAccelApp {
     }
 
     pub(crate) fn probe_single_node(&mut self, node: NodeProfile) {
-        let Ok(server) = node.server.trim().parse::<SocketAddr>() else {
+        let server = node.server.trim().to_string();
+        if client::validate_server_addr(&server).is_err() {
             self.probes
                 .insert(node.id.clone(), ProbeState::Err("地址无效".into()));
             return;
-        };
+        }
         self.probes.insert(node.id.clone(), ProbeState::Probing);
         let ev_tx = self.event_tx.clone();
         self.rt.spawn(async move {
-            let res = probe_node_rtt(server, node.sni.trim(), node.token.trim(), node.insecure)
+            let res = probe_node_rtt(&server, node.sni.trim(), node.token.trim(), node.insecure)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = ev_tx.send(AsyncEvent::ProbeResult {

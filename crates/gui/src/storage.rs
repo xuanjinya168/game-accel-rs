@@ -1,4 +1,5 @@
 use crate::theme::ThemeMode;
+pub use client::rules::RouteMode;
 use protocol::share::NodeProfile;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -63,6 +64,9 @@ pub struct AppConfig {
     pub admin_servers: Vec<AdminServerProfile>,
     #[serde(default)]
     pub active_admin_server_id: String,
+    /// Split routing: Rule (CN direct, rest proxied) / Global / Direct.
+    #[serde(default)]
+    pub route_mode: RouteMode,
 }
 
 impl Default for AppConfig {
@@ -79,6 +83,7 @@ impl Default for AppConfig {
             show_admin_menu: false,
             admin_servers: vec![default_srv],
             active_admin_server_id,
+            route_mode: RouteMode::default(),
         }
     }
 }
@@ -184,6 +189,7 @@ pub fn load_config() -> AppConfig {
             show_admin_menu: false,
             admin_servers: vec![default_srv],
             active_admin_server_id,
+            route_mode: RouteMode::default(),
         };
         save_config(&migrated);
         return migrated;
