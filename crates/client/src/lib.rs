@@ -37,6 +37,14 @@ pub struct ClientOptions {
 pub const ERR_AUTH_REJECTED: &str = "服务端拒绝鉴权";
 pub const ERR_PORT_IN_USE: &str = "被占用，无法监听";
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub async fn run_client_with_shutdown(
     opts: ClientOptions,
     stats: Arc<ClientStats>,
@@ -53,9 +61,9 @@ pub async fn run_client_with_shutdown(
     // Internal shutdown flag raised by the caller's signal or by the QUIC connection dying,
     // so every data-plane task observes one consistent stop condition.
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    {
+    let _ext_shutdown_guard = {
         let tx = shutdown_tx.clone();
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             loop {
                 if *ext_shutdown_rx.borrow() {
                     break;
@@ -65,8 +73,8 @@ pub async fn run_client_with_shutdown(
                 }
             }
             let _ = tx.send(true);
-        });
-    }
+        }))
+    };
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client_config = build_client_config(opts.insecure)?;
@@ -169,10 +177,10 @@ pub async fn run_client_with_shutdown(
     // instead of leaving a dead connection reported as healthy.
     let watchdog_tx = shutdown_tx.clone();
     let watchdog_conn = conn.clone();
-    tokio::spawn(async move {
+    let _watchdog_guard = AbortOnDrop(tokio::spawn(async move {
         watchdog_conn.closed().await;
         let _ = watchdog_tx.send(true);
-    });
+    }));
 
     // Periodic RTT updater
     let rtt_conn = conn.clone();

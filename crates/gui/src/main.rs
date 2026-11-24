@@ -65,9 +65,9 @@ pub(crate) enum ProbeState {
 
 enum AsyncEvent {
     Log(String),
-    ConnError(String),
+    ConnError(u64, String),
     /// The client session ended without an error (tunnel dropped or user stop).
-    ConnEnded,
+    ConnEnded(u64),
     Tray(TrayCmd),
     ProbeResult {
         node_id: String,
@@ -135,6 +135,7 @@ pub(crate) struct GameAccelApp {
     pub(crate) last_error: Option<String>,
     pub(crate) toast: Option<(String, Instant)>,
     reconnect: ReconnectPolicy,
+    session_id: u64,
 
     // Speed & RTT history
     last_sample_at: Instant,
@@ -215,6 +216,7 @@ impl GameAccelApp {
             last_error: None,
             toast: None,
             reconnect: ReconnectPolicy::default(),
+            session_id: 0,
             last_sample_at: Instant::now(),
             last_tx_bytes: 0,
             last_rx_bytes: 0,
@@ -311,7 +313,11 @@ impl GameAccelApp {
         if !reconnect {
             save_config(&self.cfg);
         }
-        self.stats.reset();
+        self.session_id = self.session_id.wrapping_add(1);
+        let session_id = self.session_id;
+        // Allocate fresh stats per session so a winding-down previous task cannot
+        // reset `connected` or counters of the newly started session.
+        self.stats = Arc::new(ClientStats::default());
         self.rtt_history.clear();
         self.speed_history.clear();
         self.last_tx_bytes = 0;
@@ -362,9 +368,9 @@ impl GameAccelApp {
             if let Err(e) =
                 run_client_with_shutdown(opts, stats, Some(raw_log_tx), shutdown_rx).await
             {
-                let _ = ev_tx.send(AsyncEvent::ConnError(format!("{e:#}")));
+                let _ = ev_tx.send(AsyncEvent::ConnError(session_id, format!("{e:#}")));
             } else {
-                let _ = ev_tx.send(AsyncEvent::ConnEnded);
+                let _ = ev_tx.send(AsyncEvent::ConnEnded(session_id));
             }
         });
         true
@@ -372,13 +378,14 @@ impl GameAccelApp {
 
     pub(crate) fn stop_connect(&mut self) {
         self.reconnect.reset();
+        self.session_id = self.session_id.wrapping_add(1);
         if let Ok(mut guard) = self.shutdown_slot.lock() {
             if let Some(tx) = guard.take() {
                 let _ = tx.send(true);
             }
         }
         self.state = ConnState::Disconnected;
-        self.stats.reset();
+        self.stats = Arc::new(ClientStats::default());
         self.rtt_history.clear();
         self.speed_history.clear();
         self.last_tx_bytes = 0;
@@ -515,7 +522,10 @@ impl GameAccelApp {
         while let Ok(ev) = self.event_rx.try_recv() {
             match ev {
                 AsyncEvent::Log(line) => self.push_log(line),
-                AsyncEvent::ConnError(err) => {
+                AsyncEvent::ConnError(sid, err) => {
+                    if sid != self.session_id {
+                        continue;
+                    }
                     self.last_error = Some(err.clone());
                     if is_retryable_connect_error(&err) {
                         match self.state {
@@ -535,7 +545,10 @@ impl GameAccelApp {
                         self.fail_connect(&err);
                     }
                 }
-                AsyncEvent::ConnEnded => {
+                AsyncEvent::ConnEnded(sid) => {
+                    if sid != self.session_id {
+                        continue;
+                    }
                     // Normally the stats watcher below handles the drop. This only matters
                     // when the session died before this frame ever observed it as connected.
                     if self.state == ConnState::Connecting && !self.reconnect.is_waiting() {

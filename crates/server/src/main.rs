@@ -353,16 +353,20 @@ async fn handle_connection(
                         Ok(TargetAddr::Domain(..))
                     );
                     if needs_resolve {
-                        let Ok(permit) = resolve_slots.clone().acquire_owned().await else {
-                            break;
-                        };
-                        let nat = nat.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            if let Err(e) = nat.handle_datagram(data).await {
-                                warn!("udp datagram error: {:#}", e);
+                        match resolve_slots.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                let nat = nat.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    if let Err(e) = nat.handle_datagram(data).await {
+                                        warn!("udp datagram error: {:#}", e);
+                                    }
+                                });
                             }
-                        });
+                            Err(_) => {
+                                warn!("dropping domain-targeted udp datagram: dns resolve queue full");
+                            }
+                        }
                     } else if let Err(e) = nat.handle_datagram(data).await {
                         warn!("udp datagram error: {:#}", e);
                     }

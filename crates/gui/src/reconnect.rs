@@ -69,7 +69,7 @@ impl ReconnectPolicy {
     /// Seconds until the pending attempt fires (0 when an attempt is already in flight).
     pub(crate) fn countdown(&self, now: Instant) -> u64 {
         self.next_at
-            .map(|t| t.saturating_duration_since(now).as_secs())
+            .map(|t| t.saturating_duration_since(now).as_millis().div_ceil(1000) as u64)
             .unwrap_or(0)
     }
 
@@ -175,6 +175,7 @@ mod tests {
         assert!(p.in_progress() && p.is_waiting());
         assert!(!p.take_due(at(base, 0)));
         assert_eq!(p.countdown(at(base, 0)), 1);
+        assert_eq!(p.countdown(base + Duration::from_millis(500)), 1);
         assert_eq!(p.countdown(at(base, 1)), 0);
         assert!(p.take_due(at(base, 1)));
         assert!(!p.is_waiting());
