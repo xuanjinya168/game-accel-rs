@@ -195,7 +195,13 @@ async fn main() -> Result<()> {
 
     let server_config =
         build_server_config(args.cert.as_deref(), args.key.as_deref(), &args.dev_domain)?;
-    let endpoint = Endpoint::server(server_config, args.listen)?;
+    let udp_sock = bind_tuned_udp_socket(args.listen)?;
+    let endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        udp_sock,
+        Arc::new(quinn::TokioRuntime),
+    )?;
     info!("QUIC server listening on udp://{}", args.listen);
 
     while let Some(incoming) = endpoint.accept().await {
@@ -216,6 +222,20 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn bind_tuned_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .context("create UDP socket")?;
+    let _ = sock.set_recv_buffer_size(8 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
+    sock.bind(&addr.into()).context("bind UDP socket")?;
+    Ok(sock.into())
 }
 
 fn build_server_config(
@@ -270,8 +290,13 @@ fn build_server_config(
 
     let mut transport = TransportConfig::default();
     transport.initial_mtu(DEFAULT_INITIAL_MTU);
-    transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
-    transport.datagram_send_buffer_size(2 * 1024 * 1024);
+    transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
+    transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    transport.send_window(32 * 1024 * 1024);
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(512));
+    transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+    transport.datagram_send_buffer_size(4 * 1024 * 1024);
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
     transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const COPY_BUF_SIZE: usize = 16 * 1024;
+const COPY_BUF_SIZE: usize = 64 * 1024;
 
 /// Copy bytes from `reader` to `writer` in 16 KB chunks, updating `counter` in real time
 /// after every chunk instead of waiting for EOF.

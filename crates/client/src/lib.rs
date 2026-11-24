@@ -78,7 +78,13 @@ pub async fn run_client_with_shutdown(
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client_config = build_client_config(opts.insecure)?;
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    let udp_sock = bind_tuned_udp_socket("0.0.0.0:0".parse()?)?;
+    let mut endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        udp_sock,
+        Arc::new(quinn::TokioRuntime),
+    )?;
     endpoint.set_default_client_config(client_config);
 
     emit(format!(
@@ -323,6 +329,21 @@ pub async fn probe_node_rtt(
         .context("测速超时 (>4s)")?
 }
 
+fn bind_tuned_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .context("create UDP socket")?;
+    // Raise OS UDP socket buffers (Windows defaults to ~64 KB which overflows under high-BDP QUIC)
+    let _ = sock.set_recv_buffer_size(8 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
+    sock.bind(&addr.into()).context("bind UDP socket")?;
+    Ok(sock.into())
+}
+
 fn build_client_config(insecure: bool) -> Result<ClientConfig> {
     let mut tls_config = if insecure {
         rustls::ClientConfig::builder()
@@ -343,8 +364,13 @@ fn build_client_config(insecure: bool) -> Result<ClientConfig> {
 
     let mut transport = TransportConfig::default();
     transport.initial_mtu(DEFAULT_INITIAL_MTU);
-    transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
-    transport.datagram_send_buffer_size(2 * 1024 * 1024);
+    transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
+    transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    transport.send_window(32 * 1024 * 1024);
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(512));
+    transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+    transport.datagram_send_buffer_size(4 * 1024 * 1024);
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
     transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
