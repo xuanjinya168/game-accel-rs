@@ -18,6 +18,37 @@ pub struct SubscriptionEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminServerProfile {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    #[serde(default = "default_true")]
+    pub via_tunnel: bool,
+    #[serde(default = "default_admin_user")]
+    pub username: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_admin_user() -> String {
+    "admin".to_string()
+}
+
+impl AdminServerProfile {
+    pub fn default_tunnel() -> Self {
+        Self {
+            id: "default-tunnel".to_string(),
+            name: "当前加密隧道服务端".to_string(),
+            base_url: "http://panel.gacl.local".to_string(),
+            via_tunnel: true,
+            username: "admin".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub nodes: Vec<NodeProfile>,
     pub active_node_id: String,
@@ -26,10 +57,18 @@ pub struct AppConfig {
     pub proxy_mode: ProxyMode,
     pub listen_addr: String,
     pub theme_mode: ThemeMode,
+    #[serde(default)]
+    pub show_admin_menu: bool,
+    #[serde(default)]
+    pub admin_servers: Vec<AdminServerProfile>,
+    #[serde(default)]
+    pub active_admin_server_id: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
+        let default_srv = AdminServerProfile::default_tunnel();
+        let active_admin_server_id = default_srv.id.clone();
         Self {
             active_node_id: String::new(),
             nodes: Vec::new(),
@@ -37,6 +76,9 @@ impl Default for AppConfig {
             proxy_mode: ProxyMode::Tun,
             listen_addr: "127.0.0.1:1080".to_string(),
             theme_mode: ThemeMode::Light,
+            show_admin_menu: false,
+            admin_servers: vec![default_srv],
+            active_admin_server_id,
         }
     }
 }
@@ -47,6 +89,27 @@ impl AppConfig {
             .iter()
             .find(|n| n.id == self.active_node_id)
             .or_else(|| self.nodes.first())
+    }
+
+    pub fn ensure_default_admin_server(&mut self) {
+        if self.admin_servers.is_empty() {
+            let s = AdminServerProfile::default_tunnel();
+            self.active_admin_server_id = s.id.clone();
+            self.admin_servers.push(s);
+        } else if !self
+            .admin_servers
+            .iter()
+            .any(|s| s.id == self.active_admin_server_id)
+        {
+            self.active_admin_server_id = self.admin_servers[0].id.clone();
+        }
+    }
+
+    pub fn active_admin_server(&self) -> Option<&AdminServerProfile> {
+        self.admin_servers
+            .iter()
+            .find(|s| s.id == self.active_admin_server_id)
+            .or_else(|| self.admin_servers.first())
     }
 }
 
@@ -86,6 +149,7 @@ pub fn load_config() -> AppConfig {
         if !cfg.nodes.is_empty() && cfg.active_node().is_none() {
             cfg.active_node_id = cfg.nodes[0].id.clone();
         }
+        cfg.ensure_default_admin_server();
         return cfg;
     }
 
@@ -108,6 +172,8 @@ pub fn load_config() -> AppConfig {
         } else {
             ProxyMode::Manual
         };
+        let default_srv = AdminServerProfile::default_tunnel();
+        let active_admin_server_id = default_srv.id.clone();
         let migrated = AppConfig {
             active_node_id: node.id.clone(),
             nodes: vec![node],
@@ -115,6 +181,9 @@ pub fn load_config() -> AppConfig {
             proxy_mode,
             listen_addr: old.listen_addr,
             theme_mode: old.theme_mode,
+            show_admin_menu: false,
+            admin_servers: vec![default_srv],
+            active_admin_server_id,
         };
         save_config(&migrated);
         return migrated;

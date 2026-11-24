@@ -105,6 +105,23 @@ pub fn draw_nav_icon(painter: &Painter, center: Pos2, kind: u8, color: Color32) 
                 Stroke::new(1.4_f32, color),
             );
         }
+        // 4: Server Admin (dual stacked server rack units with status LEDs)
+        4 => {
+            let top = Rect::from_center_size(Pos2::new(center.x, center.y - 3.2), Vec2::new(12.4, 4.6));
+            let bot = Rect::from_center_size(Pos2::new(center.x, center.y + 3.2), Vec2::new(12.4, 4.6));
+            painter.rect_stroke(top, CornerRadius::same(2), stroke, eframe::egui::StrokeKind::Middle);
+            painter.rect_stroke(bot, CornerRadius::same(2), stroke, eframe::egui::StrokeKind::Middle);
+            painter.circle_filled(Pos2::new(top.left() + 3.0, top.center().y), 1.1, color);
+            painter.circle_filled(Pos2::new(bot.left() + 3.0, bot.center().y), 1.1, color);
+            painter.line_segment(
+                [Pos2::new(top.right() - 4.8, top.center().y), Pos2::new(top.right() - 2.2, top.center().y)],
+                Stroke::new(1.3_f32, color),
+            );
+            painter.line_segment(
+                [Pos2::new(bot.right() - 4.8, bot.center().y), Pos2::new(bot.right() - 2.2, bot.center().y)],
+                Stroke::new(1.3_f32, color),
+            );
+        }
         // 3: Settings (dual horizontal sliders)
         _ => {
             let y1 = center.y - 3.0;
