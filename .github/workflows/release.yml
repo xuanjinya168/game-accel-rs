@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override (e.g. 0.1.0); defaults to Cargo.toml version"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64 (GUI + CLI + Installer)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          cargo test -p protocol -p client -p server
+          cargo test -p game-accel-gui --no-run
+
+      - name: Package Windows portable zip and Inno Setup installer
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($ver) -and "${{ github.ref }}".StartsWith("refs/tags/v")) {
+            $ver = "${{ github.ref_name }}".TrimStart("v")
+          }
+          if ([string]::IsNullOrWhiteSpace($ver)) {
+            pwsh -File scripts/package-windows.ps1
+          } else {
+            pwsh -File scripts/package-windows.ps1 -Version $ver
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/game-accel-*-windows-x64-portable.zip
+            dist/game-accel-*-windows-x64-setup.exe
+          if-no-files-found: error
+
+  build-linux-server:
+    name: Build Linux x86_64 (Server)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test -p protocol -p server
+
+      - name: Build and package Linux server
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version }}"
+          if [[ -z "$VER" && "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ -z "$VER" ]]; then
+            VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          VER="${VER#v}"
+
+          cargo build --release -p server
+          mkdir -p dist/server-stage
+          cp target/release/server dist/server-stage/
+          cp scripts/install.sh dist/server-stage/
+          cp README.md dist/server-stage/
+          chmod +x dist/server-stage/server dist/server-stage/install.sh
+          tar -C dist/server-stage -czf "dist/game-accel-server-v${VER}-linux-x86_64.tar.gz" .
+
+      - name: Upload Linux server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-server
+          path: dist/game-accel-server-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-linux-server]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*
