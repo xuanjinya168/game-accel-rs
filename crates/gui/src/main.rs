@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod admin;
+mod admin_view;
 mod icons;
 mod logger;
 mod reconnect;
