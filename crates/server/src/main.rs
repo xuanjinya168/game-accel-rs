@@ -1,3 +1,4 @@
+mod dns;
 mod nat;
 mod panel;
 mod sniff;
@@ -26,7 +27,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -298,7 +298,9 @@ fn build_server_config(
     transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
     transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
     transport.send_window(32 * 1024 * 1024);
-    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(512));
+    // Browsers open many parallel connections; when this limit is hit the client's
+    // `open_bi()` blocks and pages stall, so keep it far above realistic usage.
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(4096));
     transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
     transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
@@ -459,16 +461,12 @@ async fn handle_tcp_stream(
         TargetAddr::Ip(addr) => (addr.ip().to_string(), addr.port(), true),
     };
 
-    // Bounded dial: a black-holed target must fail fast (OS SYN timeout is ~2 min on
-    // Linux) so the client gets an error instead of a hung connection.
-    let dial = tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&dial_target))
-        .await
-        .unwrap_or_else(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("connect timed out after {}s", TCP_CONNECT_TIMEOUT.as_secs()),
-            ))
-        });
+    // Bounded dial through the DNS cache: a black-holed target fails fast (OS SYN timeout
+    // is ~2 min on Linux) and multi-address hosts fall through to the next address.
+    let dial_addr = internal_panel_addr
+        .map(TargetAddr::Ip)
+        .unwrap_or_else(|| target.clone());
+    let dial = dns::connect_tcp(&dial_addr, TCP_CONNECT_TIMEOUT).await;
     let tcp = match dial {
         Ok(s) => {
             let _ = s.set_nodelay(true);
@@ -721,6 +719,45 @@ mod tests {
         );
 
         let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        ep.close(0u32.into(), b"done");
+        let _ = std::fs::remove_file(&data_path);
+    }
+
+    #[tokio::test]
+    async fn fast_open_pipelined_payload_and_failed_dial() {
+        let (ep, conn, data_path) = spawn_loopback_quic().await;
+
+        // Echo target
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf).await {
+                    let _ = s.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        // Client-side fast-open: payload is written BEFORE the dial status is read.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        TargetAddr::Ip(target_addr).write_tcp_open(&mut send).await.unwrap();
+        send.write_all(b"client-hello").await.unwrap();
+        assert_eq!(recv.read_u8().await.unwrap(), AUTH_OK);
+        let mut echoed = [0u8; 12];
+        recv.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"client-hello");
+
+        // Failed dial with pipelined payload: server must still report AUTH_ERR.
+        let (mut send2, mut recv2) = conn.open_bi().await.unwrap();
+        TargetAddr::Ip("127.0.0.1:1".parse().unwrap())
+            .write_tcp_open(&mut send2)
+            .await
+            .unwrap();
+        let _ = send2.write_all(b"doomed").await;
+        assert_eq!(recv2.read_u8().await.unwrap(), AUTH_ERR);
+
         conn.close(0u32.into(), b"done");
         ep.close(0u32.into(), b"done");
         let _ = std::fs::remove_file(&data_path);

@@ -1,11 +1,12 @@
-use crate::socks5::{ClientStats, TUN_FLOW_MAX, TUN_FLOW_MIN, UdpDispatchMap, reserve_flow_id};
+use crate::socks5::{
+    ClientStats, TUN_FLOW_MAX, TUN_FLOW_MIN, UdpDispatchMap, relay_fast_open, reserve_flow_id,
+};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use netstack_smoltcp::StackBuilder;
 use protocol::TUN_MTU;
-use protocol::auth::AUTH_OK;
 use protocol::dedup::DedupWindow;
 use protocol::frame::{FLAG_GAME_MODE, TargetAddr, UdpFrame};
 use protocol::pacer::{UdpDupPacer, send_datagram_checked};
@@ -15,7 +16,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -540,30 +540,12 @@ async fn handle_tun_tcp(
     stats: Arc<ClientStats>,
 ) -> Result<()> {
     let dst = *stream.remote_addr();
-    let (mut quic_send, mut quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
+    let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
     TargetAddr::Ip(dst).write_tcp_open(&mut quic_send).await?;
 
-    let status = quic_recv.read_u8().await.context("read server tcp status")?;
-    if status != AUTH_OK {
-        bail!("remote failed to connect to {dst}");
-    }
-
-    stats.active_tcp.fetch_add(1, Ordering::Relaxed);
-    let (mut t_read, mut t_write) = tokio::io::split(stream);
-
-    let stats_u = stats.clone();
-    let u = tokio::spawn(async move {
-        let _ = protocol::io::copy_with_counter(&mut t_read, &mut quic_send, &stats_u.tx_bytes).await;
-        let _ = quic_send.finish();
-    });
-
-    let stats_d = stats.clone();
-    let d = tokio::spawn(async move {
-        let _ = protocol::io::copy_with_counter(&mut quic_recv, &mut t_write, &stats_d.rx_bytes).await;
-        let _ = t_write.shutdown().await;
-    });
-
-    let _ = tokio::join!(u, d);
-    stats.active_tcp.fetch_sub(1, Ordering::Relaxed);
-    Ok(())
+    // Fast-open: the smoltcp handshake with the app is already complete, so start
+    // relaying immediately; the server's dial status is checked inside the relay.
+    relay_fast_open(stream, quic_send, quic_recv, stats, None)
+        .await
+        .with_context(|| format!("tcp to {dst}"))
 }

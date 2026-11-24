@@ -13,7 +13,7 @@ use quinn::Connection;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -200,17 +200,12 @@ async fn handle_http_proxy_client(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let target = parse_host_port(raw_target, 443)?;
-        let (mut quic_send, mut quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
+        let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
         target.write_tcp_open(&mut quic_send).await?;
 
-        let status = quic_recv.read_u8().await.context("read server tcp status")?;
-        if status != AUTH_OK {
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
-            bail!("remote failed to connect to {}", target.to_host_port());
-        }
-
+        // Fast-open: answer 200 right away instead of waiting a full tunnel RTT for the
+        // server's dial status; the browser's TLS ClientHello travels together with the
+        // open request. A failed dial closes the connection (see `relay_fast_open`).
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
@@ -222,20 +217,12 @@ async fn handle_http_proxy_client(
                 .fetch_add(leftover.len() as u64, Ordering::Relaxed);
         }
 
-        pipe_tcp_quic(client, quic_send, quic_recv, stats).await
+        relay_fast_open(client, quic_send, quic_recv, stats, None).await
     } else {
         // Plain HTTP proxy request: e.g. GET http://example.com/path HTTP/1.1
         let (target, path) = parse_http_url(raw_target)?;
-        let (mut quic_send, mut quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
+        let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
         target.write_tcp_open(&mut quic_send).await?;
-
-        let status = quic_recv.read_u8().await.context("read server tcp status")?;
-        if status != AUTH_OK {
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
-            bail!("remote failed to connect to {}", target.to_host_port());
-        }
 
         let mut rebuilt = String::with_capacity(header_str.len() + 32);
         rebuilt.push_str(method);
@@ -249,13 +236,20 @@ async fn handle_http_proxy_client(
             if line.is_empty() {
                 continue;
             }
-            if line.to_ascii_lowercase().starts_with("proxy-connection:") {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("proxy-connection:")
+                || lower.starts_with("connection:")
+                || lower.starts_with("keep-alive:")
+            {
                 continue;
             }
             rebuilt.push_str(line);
             rebuilt.push_str("\r\n");
         }
-        rebuilt.push_str("\r\n");
+        // This tunnel is bound to ONE origin. A keep-alive browser would reuse the proxy
+        // connection for a request to a different host and it would be sent to the wrong
+        // server, so force one request per proxy connection.
+        rebuilt.push_str("Connection: close\r\n\r\n");
 
         quic_send.write_all(rebuilt.as_bytes()).await?;
         stats
@@ -268,7 +262,14 @@ async fn handle_http_proxy_client(
                 .fetch_add(leftover.len() as u64, Ordering::Relaxed);
         }
 
-        pipe_tcp_quic(client, quic_send, quic_recv, stats).await
+        relay_fast_open(
+            client,
+            quic_send,
+            quic_recv,
+            stats,
+            Some(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        )
+        .await
     }
 }
 
@@ -317,29 +318,59 @@ fn parse_http_url(url: &str) -> Result<(TargetAddr, String)> {
     Ok((target, path.to_string()))
 }
 
-async fn pipe_tcp_quic(
-    client: TcpStream,
+/// Fast-open TCP relay over an already-opened QUIC stream whose open header has been
+/// written but whose dial status has NOT been awaited.
+///
+/// The local side was already told "connected", so the application's first bytes (TLS
+/// ClientHello, HTTP request) are pipelined behind the open header instead of waiting
+/// one full tunnel RTT for the server's status byte. The status byte is consumed at
+/// the head of the downstream: on failure the local connection is closed (after an
+/// optional protocol-specific `fail_reply`). Wire-compatible with existing servers.
+pub(crate) async fn relay_fast_open<S>(
+    stream: S,
     mut quic_send: quinn::SendStream,
     mut quic_recv: quinn::RecvStream,
     stats: Arc<ClientStats>,
-) -> Result<()> {
+    fail_reply: Option<&'static [u8]>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
     stats.active_tcp.fetch_add(1, Ordering::Relaxed);
-    let (mut c_read, mut c_write) = client.into_split();
+    let (mut s_read, mut s_write) = tokio::io::split(stream);
 
     let stats_u = stats.clone();
     let u = tokio::spawn(async move {
-        let _ = protocol::io::copy_with_counter(&mut c_read, &mut quic_send, &stats_u.tx_bytes).await;
+        let _ = protocol::io::copy_with_counter(&mut s_read, &mut quic_send, &stats_u.tx_bytes).await;
         let _ = quic_send.finish();
     });
+
     let stats_d = stats.clone();
     let d = tokio::spawn(async move {
-        let _ = protocol::io::copy_with_counter(&mut quic_recv, &mut c_write, &stats_d.rx_bytes).await;
-        let _ = c_write.shutdown().await;
+        let ok = matches!(quic_recv.read_u8().await, Ok(AUTH_OK));
+        if ok {
+            let _ =
+                protocol::io::copy_with_counter(&mut quic_recv, &mut s_write, &stats_d.rx_bytes).await;
+        } else if let Some(reply) = fail_reply {
+            let _ = s_write.write_all(reply).await;
+        }
+        let _ = s_write.shutdown().await;
+        ok
     });
 
-    let _ = tokio::join!(u, d);
+    let ok = d.await.unwrap_or(false);
+    if ok {
+        let _ = u.await;
+    } else {
+        // Remote dial failed: stop forwarding local bytes into a dead stream.
+        u.abort();
+    }
     stats.active_tcp.fetch_sub(1, Ordering::Relaxed);
-    Ok(())
+    if ok {
+        Ok(())
+    } else {
+        bail!("remote failed to connect")
+    }
 }
 
 async fn handle_socks5_client(
@@ -397,22 +428,17 @@ async fn handle_tcp_connect(
     target: TargetAddr,
     stats: Arc<ClientStats>,
 ) -> Result<()> {
-    let (mut quic_send, mut quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
+    let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
     target.write_tcp_open(&mut quic_send).await?;
 
-    let status = quic_recv.read_u8().await.context("read server tcp status")?;
-    if status != AUTH_OK {
-        let _ = client
-            .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await;
-        bail!("remote failed to connect to {}", target.to_host_port());
-    }
-
+    // Fast-open: report success immediately; the dial status is checked in the relay.
     client
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
 
-    pipe_tcp_quic(client, quic_send, quic_recv, stats).await
+    relay_fast_open(client, quic_send, quic_recv, stats, None)
+        .await
+        .with_context(|| format!("tcp to {}", target.to_host_port()))
 }
 
 async fn handle_udp_associate(

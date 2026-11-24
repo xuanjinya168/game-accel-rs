@@ -156,7 +156,10 @@ impl FullConeNat {
             TargetAddr::Ip(addr) => (addr.ip().to_string(), addr.to_string(), addr),
             TargetAddr::Domain(host, port) => {
                 let target_s = format!("{host}:{port}");
-                let resolved = tokio::net::lookup_host((host.as_str(), port)).await?.next();
+                let resolved = crate::dns::resolve(&host, port)
+                    .await?
+                    .into_iter()
+                    .find(|a| entry.dual_stack || a.is_ipv4());
                 match resolved {
                     Some(addr) => (host, target_s, addr),
                     None => {
