@@ -1,7 +1,9 @@
 use crate::admin::{AdminLinkEditor, AdminServerEditor, format_uptime};
 use crate::storage::{AdminServerProfile, format_bytes, save_config};
 use crate::theme::{FONT_BODY, FONT_SM, FONT_SUB, FONT_TITLE, FONT_XS, ThemePalette};
-use crate::widgets::{accent_chip_btn, card_frame, chip_btn, pill, primary_btn, soft_btn, styled_input};
+use crate::widgets::{
+    accent_chip_btn, card_frame, chip_btn, modal_dialog, pill, primary_btn, soft_btn, styled_input,
+};
 use crate::{ConnState, GameAccelApp};
 use chrono::Local;
 use eframe::egui::{
@@ -102,24 +104,18 @@ impl GameAccelApp {
             );
         });
 
-        // Inline Server Editor (Add / Edit Remote Server)
+        // Floating Server Editor Modal (Add / Edit Remote Server)
         if let Some(mut ed) = self.admin.server_editor.take() {
-            ui.add_space(10.0);
             let mut keep_open = true;
-            card_frame(p).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(if ed.editing_id.is_some() {
-                        "编辑远程服务端配置"
-                    } else {
-                        "添加远程服务端"
-                    })
-                    .size(FONT_SUB)
-                    .strong()
-                    .color(p.text_primary),
-                );
-                ui.add_space(8.0);
-
+            let mut save_clicked = false;
+            let mut delete_id: Option<String> = None;
+            let can_delete = ed.editing_id.is_some() && self.cfg.admin_servers.len() > 1;
+            let title = if ed.editing_id.is_some() {
+                "编辑远程服务端配置"
+            } else {
+                "添加远程服务端"
+            };
+            let dismissed = modal_dialog(ctx, "admin_server_editor_modal", title, 480.0, p, |ui| {
                 ui.columns(2, |cols| {
                     cols[0].add(
                         egui::Label::new(RichText::new("名称").size(FONT_XS).color(p.text_muted))
@@ -135,7 +131,7 @@ impl GameAccelApp {
                     styled_input(&mut cols[1], &mut ed.username, "admin", w1, false, p);
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.label(RichText::new("接口地址").size(FONT_XS).color(p.text_muted));
                 styled_input(
                     ui,
@@ -146,7 +142,7 @@ impl GameAccelApp {
                     p,
                 );
 
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui
                         .checkbox(&mut ed.via_tunnel, "经加密隧道访问")
@@ -158,68 +154,77 @@ impl GameAccelApp {
                     }
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    if primary_btn(ui, "保存服务端", p).clicked() {
-                        let name = ed.name.trim().to_string();
-                        let url = ed.base_url.trim().trim_end_matches('/').to_string();
-                        let username = if ed.username.trim().is_empty() {
-                            "admin".to_string()
-                        } else {
-                            ed.username.trim().to_string()
-                        };
-                        if name.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) {
-                            self.show_toast("请填写名称和以 http:// 或 https:// 开头的地址");
-                        } else {
-                            if let Some(eid) = &ed.editing_id {
-                                if let Some(existing) =
-                                    self.cfg.admin_servers.iter_mut().find(|s| s.id == *eid)
-                                {
-                                    existing.name = name;
-                                    existing.base_url = url;
-                                    existing.via_tunnel = ed.via_tunnel;
-                                    existing.username = username.clone();
-                                }
-                            } else {
-                                let new_id = format!("srv-{}", Local::now().timestamp_millis());
-                                self.cfg.admin_servers.push(AdminServerProfile {
-                                    id: new_id.clone(),
-                                    name,
-                                    base_url: url,
-                                    via_tunnel: ed.via_tunnel,
-                                    username: username.clone(),
-                                });
-                                self.cfg.active_admin_server_id = new_id;
-                                self.admin.clear_session();
-                            }
-                            self.admin.login_user = username;
-                            save_config(&self.cfg);
-                            self.show_toast("服务端配置已保存");
+                    if can_delete
+                        && let Some(eid) = &ed.editing_id
+                        && soft_btn(ui, "删除此服务端", p).clicked()
+                    {
+                        delete_id = Some(eid.clone());
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if primary_btn(ui, "保存服务端", p).clicked() {
+                            save_clicked = true;
+                        }
+                        if soft_btn(ui, "取消", p).clicked() {
                             keep_open = false;
                         }
-                    }
-                    if soft_btn(ui, "取消", p).clicked() {
-                        keep_open = false;
-                    }
-                    if let Some(eid) = &ed.editing_id
-                        && self.cfg.admin_servers.len() > 1
-                    {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if soft_btn(ui, "删除此服务端", p).clicked() {
-                                self.cfg.admin_servers.retain(|s| s.id != *eid);
-                                self.cfg.ensure_default_admin_server();
-                                save_config(&self.cfg);
-                                self.admin.clear_session();
-                                if let Some(s) = self.cfg.active_admin_server() {
-                                    self.admin.login_user = s.username.clone();
-                                }
-                                self.show_toast("已删除远程服务端配置");
-                                keep_open = false;
-                            }
-                        });
-                    }
+                    });
                 });
             });
+
+            if let Some(eid) = delete_id {
+                self.cfg.admin_servers.retain(|s| s.id != eid);
+                self.cfg.ensure_default_admin_server();
+                save_config(&self.cfg);
+                self.admin.clear_session();
+                if let Some(s) = self.cfg.active_admin_server() {
+                    self.admin.login_user = s.username.clone();
+                }
+                self.show_toast("已删除远程服务端配置");
+                keep_open = false;
+            } else if save_clicked {
+                let name = ed.name.trim().to_string();
+                let url = ed.base_url.trim().trim_end_matches('/').to_string();
+                let username = if ed.username.trim().is_empty() {
+                    "admin".to_string()
+                } else {
+                    ed.username.trim().to_string()
+                };
+                if name.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://"))
+                {
+                    self.show_toast("请填写名称和以 http:// 或 https:// 开头的地址");
+                } else {
+                    if let Some(eid) = &ed.editing_id {
+                        if let Some(existing) =
+                            self.cfg.admin_servers.iter_mut().find(|s| s.id == *eid)
+                        {
+                            existing.name = name;
+                            existing.base_url = url;
+                            existing.via_tunnel = ed.via_tunnel;
+                            existing.username = username.clone();
+                        }
+                    } else {
+                        let new_id = format!("srv-{}", Local::now().timestamp_millis());
+                        self.cfg.admin_servers.push(AdminServerProfile {
+                            id: new_id.clone(),
+                            name,
+                            base_url: url,
+                            via_tunnel: ed.via_tunnel,
+                            username: username.clone(),
+                        });
+                        self.cfg.active_admin_server_id = new_id;
+                        self.admin.clear_session();
+                    }
+                    self.admin.login_user = username;
+                    save_config(&self.cfg);
+                    self.show_toast("服务端配置已保存");
+                    keep_open = false;
+                }
+            } else if dismissed {
+                keep_open = false;
+            }
+
             if keep_open {
                 self.admin.server_editor = Some(ed);
             }
@@ -386,28 +391,17 @@ impl GameAccelApp {
                 });
             });
 
-            // Inline Create / Edit Link Form
+            // Floating Create / Edit Link Modal
             if let Some(mut ed) = self.admin.link_editor.take() {
-                ui.add_space(10.0);
                 let mut keep_open = true;
-                Frame::new()
-                    .fill(p.bg_card_alt)
-                    .stroke(Stroke::new(1.0_f32, p.border_subtle))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new(if ed.editing_id.is_some() {
-                                "编辑链接"
-                            } else {
-                                "新建链接"
-                            })
-                            .size(FONT_BODY)
-                            .strong()
-                            .color(p.text_primary),
-                        );
-                        ui.add_space(8.0);
+                let mut save_clicked = false;
+                let title = if ed.editing_id.is_some() {
+                    "编辑分享链接"
+                } else {
+                    "新建分享链接"
+                };
+                let dismissed =
+                    modal_dialog(ctx, "admin_link_editor_modal", title, 480.0, p, |ui| {
                         ui.columns(3, |cols| {
                             cols[0].add(
                                 egui::Label::new(
@@ -427,7 +421,14 @@ impl GameAccelApp {
                                 .truncate(),
                             );
                             let w1 = cols[1].available_width();
-                            styled_input(&mut cols[1], &mut ed.traffic_limit_gb, "不限", w1, false, p);
+                            styled_input(
+                                &mut cols[1],
+                                &mut ed.traffic_limit_gb,
+                                "不限",
+                                w1,
+                                false,
+                                p,
+                            );
 
                             cols[2].add(
                                 egui::Label::new(
@@ -438,52 +439,69 @@ impl GameAccelApp {
                                 .truncate(),
                             );
                             let w2 = cols[2].available_width();
-                            styled_input(&mut cols[2], &mut ed.expire_at, "YYYY-MM-DD", w2, false, p);
+                            styled_input(
+                                &mut cols[2],
+                                &mut ed.expire_at,
+                                "YYYY-MM-DD",
+                                w2,
+                                false,
+                                p,
+                            );
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
                         ui.checkbox(&mut ed.game_dup, "游戏小包双发");
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if primary_btn(ui, "保存", p).clicked() {
-                                let name = ed.name.trim().to_string();
-                                if name.is_empty() {
-                                    self.show_toast("请填写备注名称");
-                                } else {
-                                    let limit_str = ed.traffic_limit_gb.trim();
-                                    let limit = if limit_str.is_empty() {
-                                        None
-                                    } else {
-                                        match limit_str.parse::<f64>() {
-                                            Ok(v) if v > 0.0 => Some(v),
-                                            Ok(_) => None,
-                                            Err(_) => {
-                                                self.show_toast("流量上限格式无效，请输入数字");
-                                                self.admin.link_editor = Some(ed.clone());
-                                                return;
-                                            }
-                                        }
-                                    };
-                                    let exp = ed.expire_at.trim();
-                                    let expire_at = if exp.is_empty() {
-                                        None
-                                    } else {
-                                        Some(exp.to_string())
-                                    };
-                                    self.admin_save_link(
-                                        ed.editing_id.clone(),
-                                        name,
-                                        ed.game_dup,
-                                        limit,
-                                        expire_at,
-                                    );
-                                    keep_open = false;
-                                }
+                                save_clicked = true;
                             }
                             if soft_btn(ui, "取消", p).clicked() {
                                 keep_open = false;
                             }
                         });
                     });
+
+                if save_clicked {
+                    let name = ed.name.trim().to_string();
+                    if name.is_empty() {
+                        self.show_toast("请填写备注名称");
+                    } else {
+                        let limit_str = ed.traffic_limit_gb.trim();
+                        let parsed_limit = if limit_str.is_empty() {
+                            Ok(None)
+                        } else {
+                            match limit_str.parse::<f64>() {
+                                Ok(v) if v > 0.0 => Ok(Some(v)),
+                                Ok(_) => Ok(None),
+                                Err(_) => Err(()),
+                            }
+                        };
+                        match parsed_limit {
+                            Ok(limit) => {
+                                let exp = ed.expire_at.trim();
+                                let expire_at = if exp.is_empty() {
+                                    None
+                                } else {
+                                    Some(exp.to_string())
+                                };
+                                self.admin_save_link(
+                                    ed.editing_id.clone(),
+                                    name,
+                                    ed.game_dup,
+                                    limit,
+                                    expire_at,
+                                );
+                                keep_open = false;
+                            }
+                            Err(()) => {
+                                self.show_toast("流量上限格式无效，请输入数字");
+                            }
+                        }
+                    }
+                } else if dismissed {
+                    keep_open = false;
+                }
+
                 if keep_open && self.admin.link_editor.is_none() {
                     self.admin.link_editor = Some(ed);
                 }

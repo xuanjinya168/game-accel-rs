@@ -749,3 +749,68 @@ pub fn draw_traffic_sparkline(
         );
     }
 }
+
+/// Renders a centered floating modal dialog with a dimmed backdrop, Esc/backdrop/`×` close handling,
+/// and consistent card styling. Returns `true` if the user requested to close the modal.
+pub fn modal_dialog(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    width: f32,
+    p: ThemePalette,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut close_requested = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new((id, "backdrop")))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let resp = ui.allocate_response(screen.size(), Sense::click());
+            ui.painter()
+                .rect_filled(screen, 0.0, Color32::from_black_alpha(120));
+            if resp.clicked() {
+                close_requested = true;
+            }
+        });
+
+    let modal_frame = card_frame(p)
+        .inner_margin(Margin::same(20))
+        .shadow(egui::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(70),
+        });
+
+    egui::Window::new(title)
+        .id(egui::Id::new((id, "window")))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .title_bar(false)
+        .frame(modal_frame)
+        .min_width(width)
+        .max_width(width + 40.0)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(FONT_SUB)
+                        .strong()
+                        .color(p.text_primary),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if chip_btn(ui, "×", p, false).clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            add_contents(ui);
+        });
+
+    close_requested
+}

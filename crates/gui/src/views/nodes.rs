@@ -4,8 +4,8 @@ use crate::theme::{
     FONT_BODY, FONT_SM, FONT_SUB, FONT_XS, ThemePalette,
 };
 use crate::widgets::{
-    accent_chip_btn, card_frame, chip_btn, pill, primary_btn, soft_btn, styled_input,
-    styled_multiline,
+    accent_chip_btn, card_frame, chip_btn, modal_dialog, pill, primary_btn, soft_btn,
+    styled_input, styled_multiline,
 };
 use crate::{ConnState, GameAccelApp, NodeEditorState, ProbeState};
 use chrono::Local;
@@ -43,106 +43,144 @@ impl GameAccelApp {
 
         ui.add_space(10.0);
 
-        // Panel A: Import gacl:// / hysteria2:// or JSON text
+        // Panel A: Import gacl:// / hysteria2:// or JSON modal
         if self.import_panel_open {
-            card_frame(p).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("粘贴 gacl:// / hysteria2:// 分享链接（支持多行）或订阅 JSON")
-                        .size(FONT_BODY)
-                        .strong()
-                        .color(p.text_primary),
-                );
-                ui.add_space(6.0);
-                styled_multiline(
-                    ui,
-                    &mut self.import_text,
-                    "gacl://token@host:443?sni=host&dup=1#主力\nhysteria2://password@host:443/?sni=host#Hy2节点",
-                    3,
-                    p,
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if primary_btn(ui, "确认导入", p).clicked() {
-                        match parse_import_text(&self.import_text) {
-                            Ok(nodes) => {
-                                let total = nodes.len();
-                                let added = self.merge_imported_nodes(nodes, None);
-                                self.import_text.clear();
-                                self.import_panel_open = false;
-                                self.show_toast(format!(
-                                    "导入成功：解析 {total} 个节点（新增 {added}）"
-                                ));
-                            }
-                            Err(e) => {
-                                self.show_toast(format!("导入失败: {e:#}"));
-                            }
-                        }
-                    }
-                    if soft_btn(ui, "取消", p).clicked() {
-                        self.import_panel_open = false;
-                    }
-                });
-            });
-            ui.add_space(8.0);
-        }
-
-        // Panel B: Subscription URL fetch
-        if self.sub_panel_open {
-            card_frame(p).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("订阅链接（支持管理面板 JSON、gacl:// 或 hysteria2:// 列表）")
-                        .size(FONT_BODY)
-                        .strong()
-                        .color(p.text_primary),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 106.0).max(200.0);
-                    styled_input(
+            let ctx = ui.ctx().clone();
+            let mut close_import = false;
+            let mut do_import = false;
+            let dismissed = modal_dialog(
+                &ctx,
+                "import_nodes_modal",
+                "导入分享链接 / JSON",
+                520.0,
+                p,
+                |ui| {
+                    ui.label(
+                        RichText::new(
+                            "粘贴 gacl:// / hysteria2:// 分享链接（支持多行）或订阅 JSON",
+                        )
+                        .size(FONT_SM)
+                        .color(p.text_secondary),
+                    );
+                    ui.add_space(8.0);
+                    styled_multiline(
                         ui,
-                        &mut self.sub_url_input,
-                        "https://panel.example.com:9090/sub/your-token",
-                        w,
-                        false,
+                        &mut self.import_text,
+                        "gacl://token@host:443?sni=host&dup=1#主力\nhysteria2://password@host:443/?sni=host#Hy2节点",
+                        5,
                         p,
                     );
-                    ui.add_enabled_ui(!self.sub_loading, |ui| {
-                        let lbl = if self.sub_loading {
-                            "拉取中..."
-                        } else {
-                            "拉取订阅"
-                        };
-                        if primary_btn(ui, lbl, p).clicked() {
-                            let url = self.sub_url_input.clone();
-                            self.fetch_subscription(url);
+                    ui.add_space(14.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if primary_btn(ui, "确认导入", p).clicked() {
+                            do_import = true;
+                        }
+                        if soft_btn(ui, "取消", p).clicked() {
+                            close_import = true;
                         }
                     });
-                });
-                if !self.cfg.subscriptions.is_empty() {
-                    ui.add_space(6.0);
-                    let subs = self.cfg.subscriptions.clone();
-                    for sub in subs {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {} (更新: {})",
-                                    sub.name,
-                                    sub.url,
-                                    sub.last_updated.as_deref().unwrap_or("-")
-                                ))
-                                .size(FONT_SM)
-                                .color(p.text_secondary),
-                            );
-                            if chip_btn(ui, "刷新", p, false).clicked() {
-                                self.fetch_subscription(sub.url.clone());
-                            }
-                        });
+                },
+            );
+            if do_import {
+                match parse_import_text(&self.import_text) {
+                    Ok(nodes) => {
+                        let total = nodes.len();
+                        let added = self.merge_imported_nodes(nodes, None);
+                        self.import_text.clear();
+                        self.import_panel_open = false;
+                        self.show_toast(format!(
+                            "导入成功：解析 {total} 个节点（新增 {added}）"
+                        ));
+                    }
+                    Err(e) => {
+                        self.show_toast(format!("导入失败: {e:#}"));
                     }
                 }
-            });
-            ui.add_space(8.0);
+            } else if dismissed || close_import {
+                self.import_panel_open = false;
+            }
+        }
+
+        // Panel B: Subscription URL fetch modal
+        if self.sub_panel_open {
+            let ctx = ui.ctx().clone();
+            let mut fetch_url: Option<String> = None;
+            let mut close_sub = false;
+            let subs = self.cfg.subscriptions.clone();
+            let sub_loading = self.sub_loading;
+            let dismissed = modal_dialog(
+                &ctx,
+                "sub_url_modal",
+                "订阅 URL 同步",
+                520.0,
+                p,
+                |ui| {
+                    ui.label(
+                        RichText::new("支持管理面板 JSON、gacl:// 或 hysteria2:// 列表")
+                            .size(FONT_SM)
+                            .color(p.text_secondary),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - 106.0).max(200.0);
+                        styled_input(
+                            ui,
+                            &mut self.sub_url_input,
+                            "https://panel.example.com:9090/sub/your-token",
+                            w,
+                            false,
+                            p,
+                        );
+                        ui.add_enabled_ui(!sub_loading, |ui| {
+                            let lbl = if sub_loading { "拉取中..." } else { "拉取订阅" };
+                            if primary_btn(ui, lbl, p).clicked() {
+                                fetch_url = Some(self.sub_url_input.clone());
+                            }
+                        });
+                    });
+                    if !subs.is_empty() {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("已保存订阅")
+                                .size(FONT_XS)
+                                .color(p.text_muted),
+                        );
+                        ui.add_space(4.0);
+                        for sub in &subs {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "{} · {} (更新: {})",
+                                            sub.name,
+                                            sub.url,
+                                            sub.last_updated.as_deref().unwrap_or("-")
+                                        ))
+                                        .size(FONT_SM)
+                                        .color(p.text_secondary),
+                                    )
+                                    .truncate(),
+                                );
+                                if chip_btn(ui, "刷新", p, false).clicked() {
+                                    fetch_url = Some(sub.url.clone());
+                                }
+                            });
+                        }
+                    }
+                    ui.add_space(12.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if soft_btn(ui, "关闭", p).clicked() {
+                            close_sub = true;
+                        }
+                    });
+                },
+            );
+            if let Some(url) = fetch_url {
+                self.fetch_subscription(url);
+            }
+            if dismissed || close_sub {
+                self.sub_panel_open = false;
+            }
         }
 
         // Panel C: Node Add/Edit Floating Modal Dialog
@@ -150,209 +188,157 @@ impl GameAccelApp {
         let mut editor_cancel = false;
         if let Some(ed) = &mut self.node_editor {
             let ctx = ui.ctx().clone();
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                editor_cancel = true;
-            }
-
-            // Dimmed backdrop that blocks clicks behind the modal
-            let screen = ctx.screen_rect();
-            egui::Area::new(egui::Id::new("node_editor_backdrop"))
-                .order(egui::Order::Middle)
-                .fixed_pos(screen.min)
-                .show(&ctx, |ui| {
-                    let resp = ui.allocate_response(screen.size(), egui::Sense::click());
-                    ui.painter().rect_filled(
-                        screen,
-                        0.0,
-                        egui::Color32::from_black_alpha(120),
-                    );
-                    if resp.clicked() {
-                        editor_cancel = true;
-                    }
-                });
-
             let title = if ed.editing_id.is_some() {
                 "编辑节点"
             } else {
                 "新建节点"
             };
-            let modal_frame = card_frame(p)
-                .inner_margin(egui::Margin::same(20))
-                .shadow(egui::Shadow {
-                    offset: [0, 8],
-                    blur: 24,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(70),
-                });
-
-            egui::Window::new(title)
-                .id(egui::Id::new("node_editor_modal"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .collapsible(false)
-                .resizable(false)
-                .title_bar(false)
-                .frame(modal_frame)
-                .min_width(500.0)
-                .max_width(540.0)
-                .show(&ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(title)
-                                .size(FONT_SUB)
-                                .strong()
-                                .color(p.text_primary),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if chip_btn(ui, "×", p, false).clicked() {
-                                editor_cancel = true;
+            let dismissed = modal_dialog(&ctx, "node_editor_modal", title, 500.0, p, |ui| {
+                egui::Grid::new("node_editor_grid")
+                    .num_columns(2)
+                    .spacing([14.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("协议类型").size(FONT_BODY).color(p.text_secondary));
+                        ui.horizontal(|ui| {
+                            if accent_chip_btn(ui, "GACL", p, ed.protocol == NodeProtocol::Gacl)
+                                .clicked()
+                            {
+                                ed.protocol = NodeProtocol::Gacl;
+                            }
+                            if accent_chip_btn(
+                                ui,
+                                "Hysteria2",
+                                p,
+                                ed.protocol == NodeProtocol::Hysteria2,
+                            )
+                            .clicked()
+                            {
+                                ed.protocol = NodeProtocol::Hysteria2;
+                                ed.game_dup = false;
                             }
                         });
-                    });
-                    ui.add_space(12.0);
+                        ui.end_row();
 
-                    egui::Grid::new("node_editor_grid")
-                        .num_columns(2)
-                        .spacing([14.0, 10.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("协议类型").size(FONT_BODY).color(p.text_secondary));
-                            ui.horizontal(|ui| {
-                                if accent_chip_btn(ui, "GACL", p, ed.protocol == NodeProtocol::Gacl)
-                                    .clicked()
-                                {
-                                    ed.protocol = NodeProtocol::Gacl;
-                                }
-                                if accent_chip_btn(
-                                    ui,
-                                    "Hysteria2",
-                                    p,
-                                    ed.protocol == NodeProtocol::Hysteria2,
-                                )
-                                .clicked()
-                                {
-                                    ed.protocol = NodeProtocol::Hysteria2;
-                                    ed.game_dup = false;
-                                }
-                            });
-                            ui.end_row();
+                        ui.label(RichText::new("节点名称").size(FONT_BODY).color(p.text_secondary));
+                        styled_input(ui, &mut ed.name, "例如：美西游戏专线", 300.0, false, p);
+                        ui.end_row();
 
-                            ui.label(RichText::new("节点名称").size(FONT_BODY).color(p.text_secondary));
-                            styled_input(ui, &mut ed.name, "例如：美西游戏专线", 300.0, false, p);
-                            ui.end_row();
-
-                            ui.label(
-                                RichText::new("服务器 (IP / 域名:端口)")
-                                    .size(FONT_BODY)
-                                    .color(p.text_secondary),
-                            );
-                            styled_input(
-                                ui,
-                                &mut ed.server,
-                                "203.0.113.10:8443 或 hk1.example.com:8443",
-                                300.0,
-                                false,
-                                p,
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                RichText::new("TLS 域名 (SNI)")
-                                    .size(FONT_BODY)
-                                    .color(p.text_secondary),
-                            );
-                            styled_input(ui, &mut ed.sni, "node.example.com", 300.0, false, p);
-                            ui.end_row();
-
-                            ui.label(
-                                RichText::new("鉴权 Token")
-                                    .size(FONT_BODY)
-                                    .color(p.text_secondary),
-                            );
-                            ui.horizontal(|ui| {
-                                styled_input(
-                                    ui,
-                                    &mut ed.token,
-                                    "粘贴服务器生成的 Token",
-                                    244.0,
-                                    !ed.show_token,
-                                    p,
-                                );
-                                let lbl = if ed.show_token { "隐藏" } else { "显示" };
-                                if chip_btn(ui, lbl, p, false).clicked() {
-                                    ed.show_token = !ed.show_token;
-                                }
-                            });
-                            ui.end_row();
-
-                            ui.label(
-                                RichText::new("TCP Brutal 目标速率 (Mbps)")
-                                    .size(FONT_BODY)
-                                    .color(p.text_secondary),
-                            );
-                            styled_input(
-                                ui,
-                                &mut ed.brutal_mbps,
-                                "0 = 关闭 (默认 BBR)；仅作用于 TCP 通道",
-                                300.0,
-                                false,
-                                p,
-                            );
-                            ui.end_row();
-                        });
-
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ed.protocol == NodeProtocol::Gacl {
-                            icons::pill_toggle(ui, &mut ed.game_dup, p);
-                            ui.label(
-                                RichText::new("丢包自适应双发 (< 200B)")
-                                    .size(FONT_BODY)
-                                    .color(p.text_primary),
-                            );
-                            ui.add_space(16.0);
-                        }
-                        icons::pill_toggle(ui, &mut ed.insecure, p);
                         ui.label(
-                            RichText::new("允许自签证书")
+                            RichText::new("服务器 (IP / 域名:端口)")
                                 .size(FONT_BODY)
                                 .color(p.text_secondary),
                         );
+                        styled_input(
+                            ui,
+                            &mut ed.server,
+                            "203.0.113.10:8443 或 hk1.example.com:8443",
+                            300.0,
+                            false,
+                            p,
+                        );
+                        ui.end_row();
+
+                        ui.label(
+                            RichText::new("TLS 域名 (SNI)")
+                                .size(FONT_BODY)
+                                .color(p.text_secondary),
+                        );
+                        styled_input(ui, &mut ed.sni, "node.example.com", 300.0, false, p);
+                        ui.end_row();
+
+                        ui.label(
+                            RichText::new("鉴权 Token")
+                                .size(FONT_BODY)
+                                .color(p.text_secondary),
+                        );
+                        ui.horizontal(|ui| {
+                            styled_input(
+                                ui,
+                                &mut ed.token,
+                                "粘贴服务器生成的 Token",
+                                244.0,
+                                !ed.show_token,
+                                p,
+                            );
+                            let lbl = if ed.show_token { "隐藏" } else { "显示" };
+                            if chip_btn(ui, lbl, p, false).clicked() {
+                                ed.show_token = !ed.show_token;
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label(
+                            RichText::new("TCP Brutal 目标速率 (Mbps)")
+                                .size(FONT_BODY)
+                                .color(p.text_secondary),
+                        );
+                        styled_input(
+                            ui,
+                            &mut ed.brutal_mbps,
+                            "0 = 关闭 (默认 BBR)；仅作用于 TCP 通道",
+                            300.0,
+                            false,
+                            p,
+                        );
+                        ui.end_row();
                     });
-                    ui.add_space(14.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if primary_btn(ui, "保存节点", p).clicked() {
-                            let id = ed.editing_id.clone().unwrap_or_else(|| {
-                                format!("node-{}", Local::now().timestamp_millis())
-                            });
-                            let name = if ed.name.trim().is_empty() {
-                                format!("节点 {}", ed.server.trim())
-                            } else {
-                                ed.name.trim().to_string()
-                            };
-                            let brutal_mbps = ed
-                                .brutal_mbps
-                                .trim()
-                                .parse::<u32>()
-                                .unwrap_or(0)
-                                .min(1000);
-                            editor_save = Some(NodeProfile {
-                                id,
-                                name,
-                                server: ed.server.trim().to_string(),
-                                sni: ed.sni.trim().to_string(),
-                                token: ed.token.trim().to_string(),
-                                protocol: ed.protocol,
-                                game_dup: ed.protocol == NodeProtocol::Gacl && ed.game_dup,
-                                insecure: ed.insecure,
-                                brutal_mbps,
-                                source: None,
-                            });
-                        }
-                        if soft_btn(ui, "取消", p).clicked() {
-                            editor_cancel = true;
-                        }
-                    });
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ed.protocol == NodeProtocol::Gacl {
+                        icons::pill_toggle(ui, &mut ed.game_dup, p);
+                        ui.label(
+                            RichText::new("丢包自适应双发 (< 200B)")
+                                .size(FONT_BODY)
+                                .color(p.text_primary),
+                        );
+                        ui.add_space(16.0);
+                    }
+                    icons::pill_toggle(ui, &mut ed.insecure, p);
+                    ui.label(
+                        RichText::new("允许自签证书")
+                            .size(FONT_BODY)
+                            .color(p.text_secondary),
+                    );
                 });
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary_btn(ui, "保存节点", p).clicked() {
+                        let id = ed.editing_id.clone().unwrap_or_else(|| {
+                            format!("node-{}", Local::now().timestamp_millis())
+                        });
+                        let name = if ed.name.trim().is_empty() {
+                            format!("节点 {}", ed.server.trim())
+                        } else {
+                            ed.name.trim().to_string()
+                        };
+                        let brutal_mbps = ed
+                            .brutal_mbps
+                            .trim()
+                            .parse::<u32>()
+                            .unwrap_or(0)
+                            .min(1000);
+                        editor_save = Some(NodeProfile {
+                            id,
+                            name,
+                            server: ed.server.trim().to_string(),
+                            sni: ed.sni.trim().to_string(),
+                            token: ed.token.trim().to_string(),
+                            protocol: ed.protocol,
+                            game_dup: ed.protocol == NodeProtocol::Gacl && ed.game_dup,
+                            insecure: ed.insecure,
+                            brutal_mbps,
+                            source: None,
+                        });
+                    }
+                    if soft_btn(ui, "取消", p).clicked() {
+                        editor_cancel = true;
+                    }
+                });
+            });
+            if dismissed {
+                editor_cancel = true;
+            }
         }
 
         if let Some(saved) = editor_save {
