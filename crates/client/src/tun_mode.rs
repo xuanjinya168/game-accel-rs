@@ -1,8 +1,8 @@
-use crate::rules::{DOMESTIC_DNS, DnsRoute, Route, RouteMode, Router};
-use crate::socks5::{
+use crate::relay::{
     ClientStats, TUN_FLOW_MAX, TUN_FLOW_MIN, UdpDispatchMap, open_proxy_tcp_stream,
     relay_fast_open, reserve_flow_id, send_proxy_udp_packet,
 };
+use crate::rules::{DOMESTIC_DNS, DnsRoute, Route, RouteMode, Router};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
