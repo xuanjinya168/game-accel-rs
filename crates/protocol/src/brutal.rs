@@ -27,6 +27,7 @@ const MAX_CWND_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_RTT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const QUEUE_RTT_ABS_MARGIN: Duration = Duration::from_millis(40);
 const QUEUE_THROTTLE_FACTOR: f64 = 0.50;
+const PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
 const PERSISTENT_BACKOFF_MIN: Duration = Duration::from_millis(200);
 const PERSISTENT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
@@ -72,6 +73,8 @@ struct BrutalController {
     slots: [PktSlot; WINDOW_SLOTS],
     min_rtt: Option<Duration>,
     min_rtt_at: Instant,
+    probe_rtt_until: Option<Instant>,
+    probe_min_rtt: Option<Duration>,
     smoothed_rtt: Duration,
     backoff_until: Option<Instant>,
     cwnd: u64,
@@ -90,6 +93,8 @@ impl BrutalController {
             slots: [PktSlot::default(); WINDOW_SLOTS],
             min_rtt: None,
             min_rtt_at: now,
+            probe_rtt_until: None,
+            probe_min_rtt: None,
             smoothed_rtt: init_rtt,
             backoff_until: None,
             cwnd: init_cwnd,
@@ -141,6 +146,24 @@ impl BrutalController {
 
     fn record_rtt_sample(&mut self, now: Instant, sample: Duration) {
         self.smoothed_rtt = sample;
+
+        // If a bounded low-cwnd ProbeRTT window is active, collect the minimum RTT observed
+        // while draining the queue, and commit it only once the probe window finishes.
+        if let Some(until) = self.probe_rtt_until {
+            self.probe_min_rtt = Some(match self.probe_min_rtt {
+                Some(prev) => prev.min(sample),
+                None => sample,
+            });
+            if now >= until {
+                if let Some(probed) = self.probe_min_rtt.take() {
+                    self.min_rtt = Some(probed);
+                    self.min_rtt_at = now;
+                }
+                self.probe_rtt_until = None;
+            }
+            return;
+        }
+
         match self.min_rtt {
             None => {
                 self.min_rtt = Some(sample);
@@ -151,13 +174,16 @@ impl BrutalController {
                 self.min_rtt_at = now;
             }
             Some(_) => {
-                // Only refresh min_rtt upward when the path is NOT actively queuing,
-                // so sustained bufferbloat cannot raise the baseline and disable queue protection.
-                if !self.is_queuing()
-                    && now.saturating_duration_since(self.min_rtt_at) > MIN_RTT_REFRESH_INTERVAL
-                {
-                    self.min_rtt = Some(sample);
-                    self.min_rtt_at = now;
+                // Once min_rtt expires (> 30s without a lower sample), start a bounded low-cwnd
+                // ProbeRTT window rather than blindly overwriting min_rtt with a potentially
+                // queued sample (or staying stuck forever on an old route's lower RTT).
+                if now.saturating_duration_since(self.min_rtt_at) > MIN_RTT_REFRESH_INTERVAL {
+                    let probe_len = self
+                        .smoothed_rtt
+                        .max(PROBE_RTT_DURATION)
+                        .min(Duration::from_millis(500));
+                    self.probe_rtt_until = Some(now + probe_len);
+                    self.probe_min_rtt = None;
                 }
             }
         }
@@ -200,6 +226,12 @@ impl BrutalController {
                 return;
             }
             self.backoff_until = None;
+        }
+        if let Some(until) = self.probe_rtt_until
+            && now < until
+        {
+            self.cwnd = self.min_cwnd();
+            return;
         }
         let ack_rate = self.ack_rate(now);
         let queuing = self.is_queuing();
@@ -322,24 +354,56 @@ mod tests {
             "queue guard must shrink cwnd below clean path: {queued_cwnd} >= {clean_cwnd}"
         );
 
-        // Even after 35s of sustained queuing (> 30s refresh interval), min_rtt stays 50ms
-        // and queue protection remains active instead of resetting baseline to 200ms.
-        let t_later = t0 + Duration::from_secs(35);
-        ctrl.record_rtt_sample(t_later, Duration::from_millis(200));
+        // After 35s (> 30s refresh interval), a transient dip to 130ms under queuing enters
+        // ProbeRTT at min_cwnd instead of immediately raising min_rtt to 130ms.
+        let t_probe_start = t0 + Duration::from_secs(35);
+        ctrl.on_ack_sample(t_probe_start, 10_000, Duration::from_millis(130));
         assert_eq!(ctrl.min_rtt, Some(Duration::from_millis(50)));
-        assert!(ctrl.is_queuing());
+        assert_eq!(
+            ctrl.window(),
+            ctrl.min_cwnd(),
+            "expired min_rtt must enter low-cwnd ProbeRTT"
+        );
 
-        // Once queue drains to a moderate new route RTT (80ms <= 2*50 + 40 = 140ms),
-        // the expired 30s baseline can safely refresh to 80ms.
-        let t_drained = t_later + Duration::from_secs(1);
-        ctrl.record_rtt_sample(t_drained, Duration::from_millis(80));
+        // During the low-cwnd probe, the queue drains back to true unloaded 55ms RTT;
+        // once the probe finishes, min_rtt updates to 55ms (not the transient 130ms).
+        ctrl.on_ack_sample(
+            t_probe_start + Duration::from_millis(100),
+            10_000,
+            Duration::from_millis(55),
+        );
+        ctrl.on_ack_sample(
+            t_probe_start + Duration::from_millis(250),
+            10_000,
+            Duration::from_millis(60),
+        );
+        assert_eq!(ctrl.min_rtt, Some(Duration::from_millis(55)));
         assert!(!ctrl.is_queuing());
-        assert_eq!(ctrl.min_rtt, Some(Duration::from_millis(80)));
+        assert!(ctrl.window() > ctrl.min_cwnd());
+
+        // If the path later genuinely switches to an unloaded 200ms route (> 2*55 + 40 = 150ms),
+        // the next ProbeRTT after 30s observes 200ms at min_cwnd and cleanly adopts 200ms.
+        let t_reroute = t_probe_start + Duration::from_secs(35);
+        ctrl.on_ack_sample(t_reroute, 10_000, Duration::from_millis(200));
+        assert_eq!(ctrl.window(), ctrl.min_cwnd());
+        ctrl.on_ack_sample(
+            t_reroute + Duration::from_millis(100),
+            10_000,
+            Duration::from_millis(200),
+        );
+        ctrl.on_ack_sample(
+            t_reroute + Duration::from_millis(250),
+            10_000,
+            Duration::from_millis(205),
+        );
+        assert_eq!(ctrl.min_rtt, Some(Duration::from_millis(200)));
+        assert!(!ctrl.is_queuing());
 
         // 100% loss blackout: ack_rate clamped to MIN_ACK_RATE (never NaN / unbounded)
-        ctrl.slot_mut(t_drained).acked_bytes = 0;
-        ctrl.slot_mut(t_drained).lost_bytes = 100_000;
-        ctrl.refresh_cwnd(t_drained);
+        let t_loss = t_reroute + Duration::from_secs(1);
+        ctrl.slot_mut(t_loss).acked_bytes = 0;
+        ctrl.slot_mut(t_loss).lost_bytes = 100_000;
+        ctrl.refresh_cwnd(t_loss);
         assert!(ctrl.window() <= MAX_CWND_BYTES);
         assert!(ctrl.window() >= 1200 * MIN_CWND_PACKETS);
     }
