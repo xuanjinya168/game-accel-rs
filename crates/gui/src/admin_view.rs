@@ -454,13 +454,15 @@ impl GameAccelApp {
                         ui.add_space(10.0);
                         ui.checkbox(&mut ed.game_dup, "游戏小包双发");
                         ui.add_space(14.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if primary_btn(ui, "保存", p).clicked() {
-                                save_clicked = true;
-                            }
-                            if soft_btn(ui, "取消", p).clicked() {
-                                keep_open = false;
-                            }
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if primary_btn(ui, "保存", p).clicked() {
+                                    save_clicked = true;
+                                }
+                                if soft_btn(ui, "取消", p).clicked() {
+                                    keep_open = false;
+                                }
+                            });
                         });
                     });
 

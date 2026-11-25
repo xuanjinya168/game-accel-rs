@@ -790,11 +790,11 @@ pub fn modal_dialog(
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
+        .auto_sized()
         .title_bar(false)
         .frame(modal_frame)
-        .min_width(width)
-        .max_width(width + 40.0)
         .show(ctx, |ui| {
+            ui.set_width(width);
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(title)

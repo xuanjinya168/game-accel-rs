@@ -71,13 +71,15 @@ impl GameAccelApp {
                         p,
                     );
                     ui.add_space(14.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if primary_btn(ui, "确认导入", p).clicked() {
-                            do_import = true;
-                        }
-                        if soft_btn(ui, "取消", p).clicked() {
-                            close_import = true;
-                        }
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if primary_btn(ui, "确认导入", p).clicked() {
+                                do_import = true;
+                            }
+                            if soft_btn(ui, "取消", p).clicked() {
+                                close_import = true;
+                            }
+                        });
                     });
                 },
             );
@@ -172,10 +174,12 @@ impl GameAccelApp {
                         }
                     }
                     ui.add_space(12.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if soft_btn(ui, "关闭", p).clicked() {
-                            close_sub = true;
-                        }
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if soft_btn(ui, "关闭", p).clicked() {
+                                close_sub = true;
+                            }
+                        });
                     });
                 },
             );
@@ -306,38 +310,40 @@ impl GameAccelApp {
                     );
                 });
                 ui.add_space(14.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if primary_btn(ui, "保存节点", p).clicked() {
-                        let id = ed.editing_id.clone().unwrap_or_else(|| {
-                            format!("node-{}", Local::now().timestamp_millis())
-                        });
-                        let name = if ed.name.trim().is_empty() {
-                            format!("节点 {}", ed.server.trim())
-                        } else {
-                            ed.name.trim().to_string()
-                        };
-                        let brutal_mbps = ed
-                            .brutal_mbps
-                            .trim()
-                            .parse::<u32>()
-                            .unwrap_or(0)
-                            .min(1000);
-                        editor_save = Some(NodeProfile {
-                            id,
-                            name,
-                            server: ed.server.trim().to_string(),
-                            sni: ed.sni.trim().to_string(),
-                            token: ed.token.trim().to_string(),
-                            protocol: ed.protocol,
-                            game_dup: ed.protocol == NodeProtocol::Gacl && ed.game_dup,
-                            insecure: ed.insecure,
-                            brutal_mbps,
-                            source: None,
-                        });
-                    }
-                    if soft_btn(ui, "取消", p).clicked() {
-                        editor_cancel = true;
-                    }
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_btn(ui, "保存节点", p).clicked() {
+                            let id = ed.editing_id.clone().unwrap_or_else(|| {
+                                format!("node-{}", Local::now().timestamp_millis())
+                            });
+                            let name = if ed.name.trim().is_empty() {
+                                format!("节点 {}", ed.server.trim())
+                            } else {
+                                ed.name.trim().to_string()
+                            };
+                            let brutal_mbps = ed
+                                .brutal_mbps
+                                .trim()
+                                .parse::<u32>()
+                                .unwrap_or(0)
+                                .min(1000);
+                            editor_save = Some(NodeProfile {
+                                id,
+                                name,
+                                server: ed.server.trim().to_string(),
+                                sni: ed.sni.trim().to_string(),
+                                token: ed.token.trim().to_string(),
+                                protocol: ed.protocol,
+                                game_dup: ed.protocol == NodeProtocol::Gacl && ed.game_dup,
+                                insecure: ed.insecure,
+                                brutal_mbps,
+                                source: None,
+                            });
+                        }
+                        if soft_btn(ui, "取消", p).clicked() {
+                            editor_cancel = true;
+                        }
+                    });
                 });
             });
             if dismissed {
