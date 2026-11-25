@@ -119,6 +119,24 @@ pub struct AuthTicket {
     pub counters: Arc<LiveCounters>,
 }
 
+/// RAII guard for a registered QUIC connection; guarantees unregistration on any exit path.
+pub struct ConnGuard {
+    counters: Arc<LiveCounters>,
+    cid: u64,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.counters.active_conns.remove(&self.cid);
+        self.counters
+            .online_conns
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LinkView {
     pub id: String,
@@ -191,7 +209,7 @@ pub struct UpdateNodeSettingsInput {
 
 enum LogOp {
     Line(String),
-    Truncate(std::sync::mpsc::SyncSender<()>),
+    Truncate(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
 }
 
 pub struct AppState {
@@ -308,8 +326,8 @@ impl AppState {
                             }
                         }
                         LogOp::Truncate(ack) => {
-                            let _ = std::fs::write(&log_path_bg, b"");
-                            let _ = ack.send(());
+                            let res = std::fs::write(&log_path_bg, b"").map_err(|e| e.to_string());
+                            let _ = ack.send(res);
                         }
                     }
                 }
@@ -520,13 +538,20 @@ impl AppState {
         }
     }
 
-    pub fn clear_access_logs(&self) {
-        if let Ok(mut ring) = self.access_logs.lock() {
-            ring.clear();
-        }
+    pub fn clear_access_logs(&self) -> Result<()> {
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-        if self.log_tx.send(LogOp::Truncate(ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        self.log_tx
+            .send(LogOp::Truncate(ack_tx))
+            .map_err(|_| anyhow::anyhow!("access log writer stopped"))?;
+        match ack_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(())) => {
+                if let Ok(mut ring) = self.access_logs.lock() {
+                    ring.clear();
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => bail!("清空磁盘访问日志失败: {e}"),
+            Err(_) => bail!("清空磁盘访问日志超时"),
         }
     }
 
@@ -651,7 +676,8 @@ impl AppState {
 
     /// Re-verify under `config.read()` that the link is still active with the same token
     /// before registering `conn`, closing the race window between auth and revocation/reset.
-    pub fn register_conn(&self, ticket: &AuthTicket, conn: quinn::Connection) -> Option<u64> {
+    /// Returns an RAII `ConnGuard` that automatically unregisters on drop (including early `?` exits).
+    pub fn register_conn(&self, ticket: &AuthTicket, conn: quinn::Connection) -> Option<ConnGuard> {
         let cfg = self.config.read().expect("config read lock");
         let link = cfg.links.iter().find(|l| l.id == ticket.link_id)?;
         if !constant_time_eq(&link.token, &ticket.token)
@@ -662,18 +688,10 @@ impl AppState {
         let cid = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         ticket.counters.active_conns.insert(cid, conn);
         ticket.counters.online_conns.fetch_add(1, Ordering::Relaxed);
-        Some(cid)
-    }
-
-    pub fn unregister_conn(&self, ticket: &AuthTicket, cid: u64) {
-        ticket.counters.active_conns.remove(&cid);
-        ticket
-            .counters
-            .online_conns
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            })
-            .ok();
+        Some(ConnGuard {
+            counters: ticket.counters.clone(),
+            cid,
+        })
     }
 
     // ---------- Panel Queries & CRUD ----------
@@ -815,7 +833,7 @@ impl AppState {
     }
 
     pub fn reset_link_traffic(&self, id: &str) -> Result<LinkView> {
-        let view = self.mutate_and_save(|cfg| {
+        let updated_link = self.mutate_and_save(|cfg| {
             let idx = cfg
                 .links
                 .iter()
@@ -823,14 +841,14 @@ impl AppState {
                 .context("link not found")?;
             cfg.links[idx].tx_bytes = 0;
             cfg.links[idx].rx_bytes = 0;
-            let cloned = cfg.links[idx].clone();
-            Ok(self.to_link_view(cfg, &cloned))
+            Ok(cfg.links[idx].clone())
         })?;
         if let Some(c) = self.live.get(id) {
             c.tx_bytes.store(0, Ordering::Relaxed);
             c.rx_bytes.store(0, Ordering::Relaxed);
         }
-        Ok(view)
+        let cfg = self.config.read().expect("config read lock");
+        Ok(self.to_link_view(&cfg, &updated_link))
     }
 
     pub fn delete_link(&self, id: &str) -> Result<()> {
@@ -1222,6 +1240,20 @@ mod tests {
         );
         assert_eq!(state.list_links().len(), before_count);
         assert_eq!(state.live.len(), before_count);
+
+        // Unblock temp dir and verify reset_link_traffic returns zeroed counters immediately
+        std::fs::remove_dir_all(&tmp_blocker).unwrap();
+        let link_id = state.list_links()[0].id.clone();
+        state.live.get(&link_id).unwrap().tx_bytes.store(123, Ordering::Relaxed);
+        let reset_view = state.reset_link_traffic(&link_id).unwrap();
+        assert_eq!(reset_view.tx_bytes, 0);
+        assert_eq!(reset_view.rx_bytes, 0);
+
+        // Blocking access.log must cause clear_access_logs to return Err
+        let log_blocker = dir.join("access.log");
+        let _ = std::fs::remove_file(&log_blocker);
+        std::fs::create_dir_all(&log_blocker).unwrap();
+        assert!(state.clear_access_logs().is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -322,8 +322,10 @@ async fn clear_logs_handler(State(state): State<Arc<AppState>>, headers: HeaderM
     if let Err(resp) = require_auth(&headers, &state) {
         return resp;
     }
-    state.clear_access_logs();
-    Json(serde_json::json!({ "ok": true })).into_response()
+    match state.clear_access_logs() {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
 }
 
 async fn toggle_logs_handler(

@@ -297,7 +297,7 @@ async fn handle_connection(
         }
     };
 
-    let Some(cid) = state.register_conn(&ticket, conn.clone()) else {
+    let Some(_conn_guard) = state.register_conn(&ticket, conn.clone()) else {
         conn.close(0u32.into(), b"revoked");
         anyhow::bail!("link '{}' revoked before registration", ticket.link_name);
     };
@@ -369,7 +369,6 @@ async fn handle_connection(
     }
 
     dgram_task.abort();
-    state.unregister_conn(&ticket, cid);
     Ok(())
 }
 
