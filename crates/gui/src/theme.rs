@@ -223,8 +223,13 @@ pub fn configure_fonts(ctx: &egui::Context) {
     ];
     for path in cn_candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            let prop_data = Arc::new(FontData::from_owned(bytes.clone()));
-            fonts.font_data.insert("cn_font".to_owned(), prop_data);
+            // Microsoft YaHei has generous top ascender/line-gap metrics in egui;
+            // shift slightly upward so CJK labels sit optically centered in buttons & pills.
+            let mut prop_data = FontData::from_owned(bytes.clone());
+            prop_data.tweak.y_offset_factor = -0.10;
+            fonts
+                .font_data
+                .insert("cn_font".to_owned(), Arc::new(prop_data));
             fonts
                 .families
                 .entry(FontFamily::Proportional)
