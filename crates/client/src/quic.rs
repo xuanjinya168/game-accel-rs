@@ -88,7 +88,11 @@ pub(crate) fn bind_tuned_udp_socket(
     Ok(sock.into())
 }
 
-pub(crate) fn build_client_config(insecure: bool, is_udp_lane: bool) -> Result<ClientConfig> {
+pub(crate) fn build_client_config(
+    insecure: bool,
+    is_udp_lane: bool,
+    brutal_mbps: u32,
+) -> Result<ClientConfig> {
     let mut tls_config = if insecure {
         rustls::ClientConfig::builder()
             .dangerous()
@@ -124,7 +128,14 @@ pub(crate) fn build_client_config(insecure: bool, is_udp_lane: bool) -> Result<C
     }
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
     transport.max_idle_timeout(Some(MAX_IDLE_TIMEOUT.try_into()?));
-    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // Brutal is strictly restricted to the bulk TCP lane; the game UDP lane always uses BBR.
+    if !is_udp_lane && brutal_mbps > 0 {
+        transport.congestion_controller_factory(Arc::new(
+            protocol::brutal::BrutalConfig::new(brutal_mbps),
+        ));
+    } else {
+        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
 
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)

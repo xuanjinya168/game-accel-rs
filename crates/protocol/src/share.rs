@@ -42,6 +42,9 @@ pub struct NodeProfile {
     pub game_dup: bool,
     #[serde(default)]
     pub insecure: bool,
+    /// Optional Brutal congestion-control rate cap in Mbps for the TCP lane (0 = BBR default).
+    #[serde(default)]
+    pub brutal_mbps: u32,
     #[serde(default)]
     pub source: Option<String>,
 }
@@ -192,6 +195,7 @@ impl NodeProfile {
             protocol,
             game_dup,
             insecure,
+            brutal_mbps: 0,
             source: None,
         })
     }
@@ -301,6 +305,7 @@ mod tests {
             protocol: NodeProtocol::Gacl,
             game_dup: true,
             insecure: false,
+            brutal_mbps: 0,
             source: None,
         };
         let uri = node.to_share_uri();

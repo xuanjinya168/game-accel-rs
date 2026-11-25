@@ -169,6 +169,7 @@ pub fn load_config() -> AppConfig {
             protocol: protocol::share::NodeProtocol::Gacl,
             game_dup: old.game_dup,
             insecure: old.insecure,
+            brutal_mbps: 0,
             source: None,
         };
         let proxy_mode = if old.enable_tun {

@@ -74,6 +74,10 @@ struct Args {
     /// Optional static web root directory served over HTTP/3 to unauthenticated probes/browsers
     #[arg(long)]
     masquerade_dir: Option<PathBuf>,
+
+    /// Optional Brutal congestion-control rate cap in Mbps for downstream traffic (0 = BBR default)
+    #[arg(long, default_value_t = 0)]
+    brutal_mbps: u32,
 }
 
 const INTERNAL_PANEL_HOST: &str = "panel.gacl.local";
@@ -198,8 +202,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    let server_config =
-        build_server_config(args.cert.as_deref(), args.key.as_deref(), &args.dev_domain)?;
+    let server_config = build_server_config(
+        args.cert.as_deref(),
+        args.key.as_deref(),
+        &args.dev_domain,
+        args.brutal_mbps,
+    )?;
     let udp_sock = bind_tuned_udp_socket(args.listen)?;
     let endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -582,7 +590,7 @@ mod tests {
         })
         .unwrap();
 
-        let server_cfg = build_server_config(None, None, "localhost").unwrap();
+        let server_cfg = build_server_config(None, None, "localhost", 0).unwrap();
         let server_ep = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = server_ep.local_addr().unwrap();
 
@@ -682,7 +690,7 @@ mod tests {
         })
         .unwrap();
 
-        let server_cfg = build_server_config(None, None, "localhost").unwrap();
+        let server_cfg = build_server_config(None, None, "localhost", 0).unwrap();
         let server_ep = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = server_ep.local_addr().unwrap();
 

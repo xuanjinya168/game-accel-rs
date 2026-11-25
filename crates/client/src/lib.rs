@@ -43,6 +43,8 @@ pub struct ClientOptions {
     pub game_dup: bool,
     pub enable_tun: bool,
     pub insecure: bool,
+    /// Optional Brutal congestion-control rate cap in Mbps for the TCP lane only (0 = BBR).
+    pub brutal_mbps: u32,
     /// Split-routing mode, shared live with the UI (applies to new connections).
     pub route_mode: Arc<RouteModeCell>,
     /// Optional directory whose `direct-list.txt` / `proxy-list.txt` / `geoip-cn.txt`
@@ -104,8 +106,8 @@ pub async fn run_client_with_shutdown(
     // - `tcp_ep` / `tcp_conn`: carries bulk TCP streams (web, video, downloads)
     // - `udp_ep` / `udp_conn`: carries ONLY game/voice UDP datagrams on its own socket & cwnd,
     //   preventing TCP downloads or BBR ProbeRTT from bloating game ping or falsely triggering dual-send.
-    let tcp_config = build_client_config(opts.insecure, false)?;
-    let udp_config = build_client_config(opts.insecure, true)?;
+    let tcp_config = build_client_config(opts.insecure, false, opts.brutal_mbps)?;
+    let udp_config = build_client_config(opts.insecure, true, 0)?;
 
     let bind_addr = unspecified_bind_for(server_addr);
     let mut tcp_endpoint = Endpoint::new(
@@ -129,12 +131,18 @@ pub async fn run_client_with_shutdown(
         udp_ep.close(0u32.into(), reason);
     };
 
+    let cc_label = if opts.brutal_mbps > 0 {
+        format!("TCP=Brutal {}M / UDP=BBR", opts.brutal_mbps.clamp(1, 1000))
+    } else {
+        "TCP/UDP 拥塞隔离".to_string()
+    };
     emit(format!(
-        "正在建立双通道连接 [{}] quic://{} -> {} (SNI={}，TCP/UDP 拥塞隔离)...",
+        "正在建立双通道连接 [{}] quic://{} -> {} (SNI={}，{})...",
         opts.protocol.label(),
         opts.server,
         server_addr,
-        opts.server_name
+        opts.server_name,
+        cc_label
     ));
 
     // Parallel Handshake + Auth for both lanes with 8s per-attempt timeout, instant cancel,
@@ -490,7 +498,7 @@ pub async fn probe_node_rtt(
     protocol: NodeProtocol,
 ) -> Result<u64> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let client_config = build_client_config(insecure, true)?;
+    let client_config = build_client_config(insecure, true, 0)?;
 
     let fut = async {
         let server_addr = resolve_server_addr(server).await?;
@@ -529,6 +537,7 @@ mod tests {
             game_dup: false,
             enable_tun: false,
             insecure: true,
+            brutal_mbps: 0,
             route_mode: RouteModeCell::new(crate::rules::RouteMode::Rule),
             rules_dir: None,
         };
@@ -713,6 +722,7 @@ mod tests {
             game_dup: false,
             enable_tun: false,
             insecure: true,
+            brutal_mbps: 0,
             route_mode: RouteModeCell::new(crate::rules::RouteMode::Global),
             rules_dir: None,
         };

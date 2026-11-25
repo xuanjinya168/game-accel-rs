@@ -92,6 +92,7 @@ pub(crate) struct NodeEditorState {
     pub(crate) protocol: NodeProtocol,
     pub(crate) game_dup: bool,
     pub(crate) insecure: bool,
+    pub(crate) brutal_mbps: String,
     pub(crate) show_token: bool,
 }
 
@@ -106,6 +107,7 @@ impl NodeEditorState {
             protocol: NodeProtocol::Gacl,
             game_dup: true,
             insecure: false,
+            brutal_mbps: "0".to_string(),
             show_token: true,
         }
     }
@@ -120,6 +122,7 @@ impl NodeEditorState {
             protocol: n.protocol,
             game_dup: n.game_dup,
             insecure: n.insecure,
+            brutal_mbps: n.brutal_mbps.to_string(),
             show_token: false,
         }
     }

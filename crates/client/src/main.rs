@@ -37,6 +37,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     insecure: bool,
 
+    /// Optional Brutal congestion-control rate cap in Mbps for TCP lane only (0 = BBR default)
+    #[arg(long, default_value_t = 0)]
+    brutal_mbps: u32,
+
     /// Routing mode: rule (split CN direct / rest proxied), global, or direct
     #[arg(long, default_value = "rule", value_parser = parse_route_mode)]
     route: RouteMode,
@@ -86,6 +90,7 @@ async fn main() -> Result<()> {
             game_dup: args.game_dup,
             enable_tun: args.tun,
             insecure: args.insecure,
+            brutal_mbps: args.brutal_mbps,
             route_mode: RouteModeCell::new(args.route),
             rules_dir: args.rules_dir,
         },

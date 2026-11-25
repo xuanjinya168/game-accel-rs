@@ -220,6 +220,7 @@ impl GameAccelApp {
             game_dup: node.game_dup,
             enable_tun: self.cfg.proxy_mode == ProxyMode::Tun,
             insecure: node.insecure,
+            brutal_mbps: node.brutal_mbps,
             route_mode: self.route_mode_cell.clone(),
             rules_dir: Some(storage::config_dir().join("rules")),
         };

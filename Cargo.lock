@@ -3017,6 +3017,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "quinn",
+ "quinn-proto",
  "serde",
  "serde_json",
  "tokio",

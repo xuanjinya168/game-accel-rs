@@ -30,6 +30,7 @@ pub(crate) fn build_server_config(
     cert_path: Option<&std::path::Path>,
     key_path: Option<&std::path::Path>,
     dev_domain: &str,
+    brutal_mbps: u32,
 ) -> Result<ServerConfig> {
     let (certs, key) = match (cert_path, key_path) {
         (Some(c_path), Some(k_path)) => {
@@ -88,7 +89,17 @@ pub(crate) fn build_server_config(
     transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
     transport.max_idle_timeout(Some(MAX_IDLE_TIMEOUT.try_into()?));
-    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    if brutal_mbps > 0 {
+        info!(
+            "server congestion control: Brutal ({} Mbps cap, queue-guarded)",
+            brutal_mbps.clamp(1, 1000)
+        );
+        transport.congestion_controller_factory(Arc::new(
+            protocol::brutal::BrutalConfig::new(brutal_mbps),
+        ));
+    } else {
+        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
 
     server_config.transport_config(Arc::new(transport));
     Ok(server_config)

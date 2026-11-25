@@ -236,6 +236,21 @@ impl GameAccelApp {
                             }
                         });
                         ui.end_row();
+
+                        ui.label(
+                            RichText::new("TCP Brutal 限速 (Mbps)")
+                                .size(FONT_BODY)
+                                .color(p.text_secondary),
+                        );
+                        styled_input(
+                            ui,
+                            &mut ed.brutal_mbps,
+                            "0 = 关闭 (默认 BBR)；仅作用于 TCP 通道",
+                            300.0,
+                            false,
+                            p,
+                        );
+                        ui.end_row();
                     });
 
                 ui.add_space(10.0);
@@ -267,6 +282,12 @@ impl GameAccelApp {
                         } else {
                             ed.name.trim().to_string()
                         };
+                        let brutal_mbps = ed
+                            .brutal_mbps
+                            .trim()
+                            .parse::<u32>()
+                            .unwrap_or(0)
+                            .min(1000);
                         editor_save = Some(NodeProfile {
                             id,
                             name,
@@ -276,6 +297,7 @@ impl GameAccelApp {
                             protocol: ed.protocol,
                             game_dup: ed.protocol == NodeProtocol::Gacl && ed.game_dup,
                             insecure: ed.insecure,
+                            brutal_mbps,
                             source: None,
                         });
                     }
@@ -451,6 +473,9 @@ impl GameAccelApp {
                             }
                             if node.protocol == NodeProtocol::Gacl && node.game_dup {
                                 meta.push_str("  ·  自适应双发");
+                            }
+                            if node.brutal_mbps > 0 {
+                                meta.push_str(&format!("  ·  Brutal {}M", node.brutal_mbps));
                             }
                             ui.label(
                                 RichText::new(meta)

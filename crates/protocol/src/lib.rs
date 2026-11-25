@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod brutal;
 pub mod dedup;
 pub mod frame;
 pub mod hy2;

@@ -971,6 +971,7 @@ fn build_node_profile(cfg: &PanelConfig, link: &LinkRecord) -> NodeProfile {
         protocol: protocol::share::NodeProtocol::Gacl,
         game_dup: link.game_dup,
         insecure: cfg.insecure,
+        brutal_mbps: 0,
         source: None,
     }
 }
