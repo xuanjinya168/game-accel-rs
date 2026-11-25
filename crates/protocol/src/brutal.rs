@@ -149,15 +149,23 @@ impl BrutalController {
         self.smoothed_rtt > threshold
     }
 
-    fn record_rtt_sample(&mut self, now: Instant, sent: Instant, sample: Duration) {
-        self.smoothed_rtt = sample;
+    fn record_rtt_sample(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        smoothed_rtt: Duration,
+        packet_rtt: Duration,
+    ) {
+        self.smoothed_rtt = smoothed_rtt;
 
-        // If a bounded low-cwnd ProbeRTT window is active, only accept RTT samples from
-        // packets sent AFTER the probe began (when cwnd was already clamped to min_cwnd).
+        // If a bounded low-cwnd ProbeRTT window is active, only accept per-packet RTT samples
+        // from packets sent AFTER the probe began (when cwnd was already clamped to min_cwnd),
+        // avoiding pre-probe EWMA lag in `smoothed_rtt`.
         // If the probe window expires without any qualified sample, keep the old min_rtt,
         // exit ProbeRTT, and retry after a short cooldown.
         if let (Some(probe_start), Some(until)) = (self.probe_started_at, self.probe_rtt_until) {
             if sent >= probe_start {
+                let sample = packet_rtt.max(Duration::from_millis(1));
                 self.probe_min_rtt = Some(match self.probe_min_rtt {
                     Some(prev) => prev.min(sample),
                     None => sample,
@@ -179,11 +187,11 @@ impl BrutalController {
 
         match self.min_rtt {
             None => {
-                self.min_rtt = Some(sample);
+                self.min_rtt = Some(smoothed_rtt);
                 self.min_rtt_at = now;
             }
-            Some(m) if sample <= m => {
-                self.min_rtt = Some(sample);
+            Some(m) if smoothed_rtt <= m => {
+                self.min_rtt = Some(smoothed_rtt);
                 self.min_rtt_at = now;
                 self.probe_retry_after = None;
             }
@@ -263,8 +271,9 @@ impl BrutalController {
             self.mtu,
         );
     }
-    fn on_ack_sample(&mut self, now: Instant, sent: Instant, bytes: u64, rtt_sample: Duration) {
-        self.record_rtt_sample(now, sent, rtt_sample);
+    fn on_ack_sample(&mut self, now: Instant, sent: Instant, bytes: u64, smoothed_rtt: Duration) {
+        let packet_rtt = now.saturating_duration_since(sent);
+        self.record_rtt_sample(now, sent, smoothed_rtt, packet_rtt);
         let slot = self.slot_mut(now);
         slot.acked_bytes = slot.acked_bytes.saturating_add(bytes);
         self.refresh_cwnd(now);
@@ -343,7 +352,12 @@ mod tests {
         assert_eq!(cfg.target_bps(), 10_000_000);
         let mut ctrl = BrutalController::new(cfg.target_bps(), t0, 1200);
         let init_win = ctrl.initial_window();
-        ctrl.record_rtt_sample(t0, t0, Duration::from_millis(50));
+        ctrl.record_rtt_sample(
+            t0,
+            t0,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        );
 
         // Clean path: 10 MB/s * 0.05s * 1.5 = 750_000 bytes
         ctrl.slot_mut(t0).acked_bytes = 100_000;
@@ -364,7 +378,12 @@ mod tests {
         // Persistent bottleneck queuing (RTT jumps from 50ms -> 200ms > 2*50 + 40 = 140ms):
         // queue guard uses min_rtt (50ms) * 0.5x * 1.0 BDP = 250_000 bytes, genuinely < clean_cwnd
         let t_queue = t0 + Duration::from_secs(1);
-        ctrl.record_rtt_sample(t_queue, t_queue - Duration::from_millis(200), Duration::from_millis(200));
+        ctrl.record_rtt_sample(
+            t_queue,
+            t_queue - Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
         ctrl.refresh_cwnd(t_queue);
         let queued_cwnd = ctrl.window();
         assert_eq!(queued_cwnd, 250_000);
@@ -401,11 +420,26 @@ mod tests {
             Some(Duration::from_millis(50)),
             "pre-probe ACKs must not overwrite min_rtt"
         );
-        assert!(ctrl.window() > ctrl.min_cwnd(), "ProbeRTT must exit after deadline");
+        assert!(
+            ctrl.window() > ctrl.min_cwnd(),
+            "ProbeRTT must exit after deadline"
+        );
 
-        // Scenario B: After the 5s retry cooldown, the path has genuinely switched to an unloaded
-        // 200ms route. ProbeRTT lasts 2*200ms = 400ms; a packet sent AFTER probe start completes
-        // its 200ms RTT under min_cwnd and cleanly updates min_rtt to 200ms.
+        // During the 5s retry cooldown, ACKs must NOT prematurely restart ProbeRTT.
+        ctrl.on_ack_sample(
+            t_probe_a + Duration::from_secs(2),
+            t_probe_a + Duration::from_millis(1850),
+            10_000,
+            Duration::from_millis(150),
+        );
+        assert!(
+            ctrl.probe_rtt_until.is_none(),
+            "cooldown must prevent immediate ProbeRTT restart"
+        );
+
+        // Scenario B: After the 5s retry cooldown, ProbeRTT uses per-packet `now - sent` RTT
+        // rather than lagging `smoothed_rtt` (e.g. smoothed_rtt still 200ms while post-probe
+        // packet actually completed in 60ms -> min_rtt adopts 60ms, not 200ms).
         let t_probe_b = t_probe_a + Duration::from_secs(6);
         ctrl.on_ack_sample(
             t_probe_b,
@@ -414,22 +448,26 @@ mod tests {
             Duration::from_millis(200),
         );
         assert_eq!(ctrl.window(), ctrl.min_cwnd());
-        // Qualified packet sent at t_probe_b + 50ms, ACKed at t_probe_b + 250ms (RTT 200ms)
+        // Post-probe packet sent at t_probe_b + 50ms, ACKed at t_probe_b + 110ms (packet RTT = 60ms)
+        // even though EWMA smoothed_rtt is still lagging at 180ms.
         ctrl.on_ack_sample(
-            t_probe_b + Duration::from_millis(250),
+            t_probe_b + Duration::from_millis(110),
             t_probe_b + Duration::from_millis(50),
             10_000,
-            Duration::from_millis(200),
+            Duration::from_millis(180),
         );
-        // Probe completes at t_probe_b + 450ms (>= 400ms) with another qualified packet
+        // Probe completes at t_probe_b + 450ms (>= 400ms) with another post-probe packet (70ms).
         ctrl.on_ack_sample(
             t_probe_b + Duration::from_millis(450),
-            t_probe_b + Duration::from_millis(245),
+            t_probe_b + Duration::from_millis(380),
             10_000,
-            Duration::from_millis(205),
+            Duration::from_millis(150),
         );
-        assert_eq!(ctrl.min_rtt, Some(Duration::from_millis(200)));
-        assert!(!ctrl.is_queuing());
+        assert_eq!(
+            ctrl.min_rtt,
+            Some(Duration::from_millis(60)),
+            "ProbeRTT must adopt per-packet RTT rather than lagging smoothed_rtt"
+        );
         assert!(ctrl.window() > ctrl.min_cwnd());
 
         // 100% loss blackout: ack_rate clamped to MIN_ACK_RATE (never NaN / unbounded)
