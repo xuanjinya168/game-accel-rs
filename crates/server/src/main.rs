@@ -297,10 +297,12 @@ async fn handle_connection(
         }
     };
 
+    let Some(cid) = state.register_conn(&ticket, conn.clone()) else {
+        conn.close(0u32.into(), b"revoked");
+        anyhow::bail!("link '{}' revoked before registration", ticket.link_name);
+    };
     auth_send.write_all(&[AUTH_OK]).await?;
     let _ = auth_send.finish();
-
-    let cid = state.register_conn(&ticket, conn.clone());
     info!(
         "client {} authenticated as link '{}' ({})",
         conn.remote_address(),

@@ -107,9 +107,13 @@ pub fn disable_system_proxy() -> Result<()> {
         if let Some(p) = prev {
             if let Some(srv) = &p.server {
                 let _ = run_reg(&["add", REG_KEY, "/v", "ProxyServer", "/t", "REG_SZ", "/d", srv, "/f"]);
+            } else {
+                let _ = run_reg(&["delete", REG_KEY, "/v", "ProxyServer", "/f"]);
             }
             if let Some(ov) = &p.override_list {
                 let _ = run_reg(&["add", REG_KEY, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", ov, "/f"]);
+            } else {
+                let _ = run_reg(&["delete", REG_KEY, "/v", "ProxyOverride", "/f"]);
             }
             let en = if p.enabled { "1" } else { "0" };
             run_reg(&["add", REG_KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", en, "/f"])?;

@@ -176,7 +176,11 @@ pub(crate) async fn handle_hy2_connection(
         client_ip, ticket.link_name
     );
 
-    let cid = state.register_conn(&ticket, conn.clone());
+    let Some(cid) = state.register_conn(&ticket, conn.clone()) else {
+        conn.close(0u32.into(), b"revoked");
+        uni_task.abort();
+        bail!("link '{}' revoked before registration", ticket.link_name);
+    };
     let res = run_hy2_session(conn, &ticket, state.clone(), client_ip, panel_route).await;
 
     uni_task.abort();

@@ -16,8 +16,8 @@ pub fn generate_random_str(len: usize) -> String {
         .collect()
 }
 
-/// Length-hiding constant-time equality: hashes both inputs to fixed 32-byte SHA-256 digests
-/// and folds all 32 bytes without short-circuiting so neither content nor length leaks via timing.
+/// Constant-time digest comparison: hashes both inputs with SHA-256 and folds all 32 bytes
+/// without short-circuiting so byte-by-byte content differences do not leak via early exit.
 pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let da = digest::digest(&digest::SHA256, a.as_bytes());
     let db = digest::digest(&digest::SHA256, b.as_bytes());

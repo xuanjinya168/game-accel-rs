@@ -115,6 +115,7 @@ impl LiveCounters {
 pub struct AuthTicket {
     pub link_id: String,
     pub link_name: String,
+    pub(crate) token: String,
     pub counters: Arc<LiveCounters>,
 }
 
@@ -190,7 +191,7 @@ pub struct UpdateNodeSettingsInput {
 
 enum LogOp {
     Line(String),
-    Truncate,
+    Truncate(std::sync::mpsc::SyncSender<()>),
 }
 
 pub struct AppState {
@@ -306,8 +307,9 @@ impl AppState {
                                 let _ = writeln!(f, "{line}");
                             }
                         }
-                        LogOp::Truncate => {
+                        LogOp::Truncate(ack) => {
                             let _ = std::fs::write(&log_path_bg, b"");
+                            let _ = ack.send(());
                         }
                     }
                 }
@@ -331,8 +333,7 @@ impl AppState {
         Ok((state, newly_generated_pass))
     }
 
-    fn write_snapshot_atomic(&self, snapshot: &PanelConfig) -> Result<()> {
-        let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+    fn write_snapshot_unlocked(&self, snapshot: &PanelConfig) -> Result<()> {
         if let Some(parent) = self.data_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -350,18 +351,32 @@ impl AppState {
         Ok(())
     }
 
-    pub fn sync_and_save(&self) -> Result<()> {
-        let snapshot = {
-            let mut cfg = self.config.write().expect("config write lock");
-            for link in &mut cfg.links {
-                if let Some(c) = self.live.get(&link.id) {
-                    link.tx_bytes = c.tx_bytes.load(Ordering::Relaxed);
-                    link.rx_bytes = c.rx_bytes.load(Ordering::Relaxed);
+    /// Serialize snapshot generation + disk persistence + in-memory commit under `save_lock`.
+    /// If disk persistence fails, neither `self.config` nor caller side-effects are committed.
+    fn mutate_and_save<F, R>(&self, mutate: F) -> Result<R>
+    where
+        F: FnOnce(&mut PanelConfig) -> Result<R>,
+    {
+        let _save_guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut candidate = {
+            let cfg = self.config.read().expect("config read lock");
+            let mut c = cfg.clone();
+            for link in &mut c.links {
+                if let Some(live) = self.live.get(&link.id) {
+                    link.tx_bytes = live.tx_bytes.load(Ordering::Relaxed);
+                    link.rx_bytes = live.rx_bytes.load(Ordering::Relaxed);
                 }
             }
-            cfg.clone()
+            c
         };
-        self.write_snapshot_atomic(&snapshot)
+        let result = mutate(&mut candidate)?;
+        self.write_snapshot_unlocked(&candidate)?;
+        *self.config.write().expect("config write lock") = candidate;
+        Ok(result)
+    }
+
+    pub fn sync_and_save(&self) -> Result<()> {
+        self.mutate_and_save(|_| Ok(()))
     }
 
     /// Periodically called by the background flush task: disconnects any active sessions
@@ -401,17 +416,10 @@ impl AppState {
     }
 
     pub fn set_access_log_enabled(&self, enabled: bool) -> Result<bool> {
-        let prev = self.access_log_enabled.load(Ordering::Relaxed);
-        let snapshot = {
-            let mut cfg = self.config.write().expect("config write lock");
+        self.mutate_and_save(|cfg| {
             cfg.access_log_enabled = enabled;
-            cfg.clone()
-        };
-        if let Err(e) = self.write_snapshot_atomic(&snapshot) {
-            let mut cfg = self.config.write().expect("config write lock");
-            cfg.access_log_enabled = prev;
-            return Err(e);
-        }
+            Ok(())
+        })?;
         self.access_log_enabled.store(enabled, Ordering::Relaxed);
         Ok(enabled)
     }
@@ -516,7 +524,10 @@ impl AppState {
         if let Ok(mut ring) = self.access_logs.lock() {
             ring.clear();
         }
-        let _ = self.log_tx.try_send(LogOp::Truncate);
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        if self.log_tx.send(LogOp::Truncate(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        }
     }
 
     // ---------- Auth & Sessions (Web Panel) ----------
@@ -596,15 +607,15 @@ impl AppState {
         if new_pass.len() < 6 {
             bail!("新密码长度至少 6 位");
         }
-        {
-            let mut cfg = self.config.write().expect("config write lock");
+        self.mutate_and_save(|cfg| {
             if !verify_password(old_pass, &cfg.admin_pass) {
                 bail!("原密码不正确");
             }
             cfg.admin_pass = hash_password(new_pass);
-        }
+            Ok(())
+        })?;
         self.sessions.clear();
-        self.sync_and_save()
+        Ok(())
     }
 
     // ---------- QUIC Data-Plane Token Auth & Live Tracking ----------
@@ -628,6 +639,7 @@ impl AppState {
             "active" => Ok(AuthTicket {
                 link_id: link.id.clone(),
                 link_name: link.name.clone(),
+                token: link.token.clone(),
                 counters,
             }),
             "disabled" => bail!("link '{}' is disabled", link.name),
@@ -637,11 +649,20 @@ impl AppState {
         }
     }
 
-    pub fn register_conn(&self, ticket: &AuthTicket, conn: quinn::Connection) -> u64 {
+    /// Re-verify under `config.read()` that the link is still active with the same token
+    /// before registering `conn`, closing the race window between auth and revocation/reset.
+    pub fn register_conn(&self, ticket: &AuthTicket, conn: quinn::Connection) -> Option<u64> {
+        let cfg = self.config.read().expect("config read lock");
+        let link = cfg.links.iter().find(|l| l.id == ticket.link_id)?;
+        if !constant_time_eq(&link.token, &ticket.token)
+            || evaluate_link_status(link, &ticket.counters) != "active"
+        {
+            return None;
+        }
         let cid = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         ticket.counters.active_conns.insert(cid, conn);
         ticket.counters.online_conns.fetch_add(1, Ordering::Relaxed);
-        cid
+        Some(cid)
     }
 
     pub fn unregister_conn(&self, ticket: &AuthTicket, cid: u64) {
@@ -724,23 +745,19 @@ impl AppState {
             created_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
         };
 
+        let view = self.mutate_and_save(|cfg| {
+            cfg.links.push(record.clone());
+            Ok(self.to_link_view(cfg, &record))
+        })?;
         self.live
             .insert(record.id.clone(), Arc::new(LiveCounters::default()));
-
-        let view = {
-            let mut cfg = self.config.write().expect("config write lock");
-            cfg.links.push(record.clone());
-            self.to_link_view(&cfg, &record)
-        };
-        self.sync_and_save()?;
         info!("panel created link '{}' (id={})", view.name, view.id);
         Ok(view)
     }
 
     pub fn update_link(&self, id: &str, input: UpdateLinkInput) -> Result<LinkView> {
-        let mut kick_needed = false;
-        let view = {
-            let mut cfg = self.config.write().expect("config write lock");
+        let (view, kick_needed) = self.mutate_and_save(|cfg| {
+            let mut kick = false;
             let idx = cfg
                 .links
                 .iter()
@@ -755,7 +772,7 @@ impl AppState {
             }
             if let Some(enabled) = input.enabled {
                 if link.enabled && !enabled {
-                    kick_needed = true;
+                    kick = true;
                 }
                 link.enabled = enabled;
             }
@@ -769,20 +786,19 @@ impl AppState {
                 link.expire_at = exp.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             }
             let cloned = link.clone();
-            self.to_link_view(&cfg, &cloned)
-        };
+            Ok((self.to_link_view(cfg, &cloned), kick))
+        })?;
 
         if kick_needed
-            && let Some(c) = self.live.get(id) {
-                c.kick_all();
-            }
-        self.sync_and_save()?;
+            && let Some(c) = self.live.get(id)
+        {
+            c.kick_all();
+        }
         Ok(view)
     }
 
     pub fn reset_link_token(&self, id: &str) -> Result<LinkView> {
-        let view = {
-            let mut cfg = self.config.write().expect("config write lock");
+        let view = self.mutate_and_save(|cfg| {
             let idx = cfg
                 .links
                 .iter()
@@ -790,22 +806,16 @@ impl AppState {
                 .context("link not found")?;
             cfg.links[idx].token = generate_random_str(24);
             let cloned = cfg.links[idx].clone();
-            self.to_link_view(&cfg, &cloned)
-        };
+            Ok(self.to_link_view(cfg, &cloned))
+        })?;
         if let Some(c) = self.live.get(id) {
             c.kick_all();
         }
-        self.sync_and_save()?;
         Ok(view)
     }
 
     pub fn reset_link_traffic(&self, id: &str) -> Result<LinkView> {
-        if let Some(c) = self.live.get(id) {
-            c.tx_bytes.store(0, Ordering::Relaxed);
-            c.rx_bytes.store(0, Ordering::Relaxed);
-        }
-        let view = {
-            let mut cfg = self.config.write().expect("config write lock");
+        let view = self.mutate_and_save(|cfg| {
             let idx = cfg
                 .links
                 .iter()
@@ -814,39 +824,41 @@ impl AppState {
             cfg.links[idx].tx_bytes = 0;
             cfg.links[idx].rx_bytes = 0;
             let cloned = cfg.links[idx].clone();
-            self.to_link_view(&cfg, &cloned)
-        };
-        self.sync_and_save()?;
+            Ok(self.to_link_view(cfg, &cloned))
+        })?;
+        if let Some(c) = self.live.get(id) {
+            c.tx_bytes.store(0, Ordering::Relaxed);
+            c.rx_bytes.store(0, Ordering::Relaxed);
+        }
         Ok(view)
     }
 
     pub fn delete_link(&self, id: &str) -> Result<()> {
-        if let Some((_, c)) = self.live.remove(id) {
-            c.kick_all();
-        }
-        {
-            let mut cfg = self.config.write().expect("config write lock");
+        self.mutate_and_save(|cfg| {
             let before = cfg.links.len();
             cfg.links.retain(|l| l.id != id);
             if cfg.links.len() == before {
                 bail!("link not found");
             }
+            Ok(())
+        })?;
+        if let Some((_, c)) = self.live.remove(id) {
+            c.kick_all();
         }
-        self.sync_and_save()
+        Ok(())
     }
 
     pub fn update_node_settings(&self, input: UpdateNodeSettingsInput) -> Result<OverviewView> {
         if input.public_host.trim().is_empty() || input.udp_port == 0 {
             bail!("公网地址和端口不能为空");
         }
-        {
-            let mut cfg = self.config.write().expect("config write lock");
+        self.mutate_and_save(|cfg| {
             cfg.public_host = input.public_host.trim().to_string();
             cfg.udp_port = input.udp_port;
             cfg.sni = input.sni.trim().to_string();
             cfg.insecure = input.insecure;
-        }
-        self.sync_and_save()?;
+            Ok(())
+        })?;
         Ok(self.overview())
     }
 
@@ -1195,6 +1207,21 @@ mod tests {
         assert!(state.set_access_log_enabled(false).is_err());
         assert!(state.is_access_log_enabled());
         assert!(state.config.read().unwrap().access_log_enabled);
+
+        // Creating a link when persistence fails must NOT add it to memory or live map
+        let before_count = state.list_links().len();
+        assert!(
+            state
+                .create_link(CreateLinkInput {
+                    name: "should-not-stick".to_string(),
+                    game_dup: true,
+                    traffic_limit_gb: None,
+                    expire_at: None,
+                })
+                .is_err()
+        );
+        assert_eq!(state.list_links().len(), before_count);
+        assert_eq!(state.live.len(), before_count);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
