@@ -56,6 +56,7 @@ struct NatEntry {
     dual_stack: bool,
     meta: Arc<NatMeta>,
     dedup: Mutex<DedupWindow>,
+    seen_full: AtomicBool,
     seen_targets: Mutex<HashSet<String>>,
     recv_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -145,18 +146,17 @@ impl FullConeNat {
             return Ok(());
         }
 
-        let (host_str, target_str, dst) = match frame.addr {
-            TargetAddr::Ip(addr) => (addr.ip().to_string(), addr.to_string(), addr),
+        let (domain_host, dst) = match frame.addr {
+            TargetAddr::Ip(addr) => (None, addr),
             TargetAddr::Domain(host, port) => {
-                let target_s = format!("{host}:{port}");
                 let resolved = crate::dns::resolve(&host, port)
                     .await?
                     .into_iter()
                     .find(|a| entry.dual_stack || a.is_ipv4());
                 match resolved {
-                    Some(addr) => (host, target_s, addr),
+                    Some(addr) => (Some(host), addr),
                     None => {
-                        warn!("failed to resolve udp target {}", target_s);
+                        warn!("failed to resolve udp target {host}:{port}");
                         return Ok(());
                     }
                 }
@@ -178,28 +178,43 @@ impl FullConeNat {
             .tx_bytes
             .fetch_add(sent as u64, Ordering::Relaxed);
 
-        let should_log = {
-            let mut seen = entry.seen_targets.lock().unwrap_or_else(|e| e.into_inner());
-            if seen.len() < 64 && !seen.contains(&target_str) {
-                seen.insert(target_str.clone());
-                true
-            } else {
-                false
+        // Zero-allocation fast path: skip string formatting and lock once access logging
+        // is disabled or this flow has already logged its cap of 64 distinct targets.
+        if self.state.is_access_log_enabled() && !entry.seen_full.load(Ordering::Relaxed) {
+            let (host_str, target_str) = match domain_host {
+                Some(h) => {
+                    let t = format!("{h}:{}", dst.port());
+                    (h, t)
+                }
+                None => (dst.ip().to_string(), dst.to_string()),
+            };
+            let should_log = {
+                let mut seen = entry.seen_targets.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() >= 64 {
+                    entry.seen_full.store(true, Ordering::Relaxed);
+                    false
+                } else {
+                    let inserted = seen.insert(target_str.clone());
+                    if seen.len() >= 64 {
+                        entry.seen_full.store(true, Ordering::Relaxed);
+                    }
+                    inserted
+                }
+            };
+            if should_log {
+                self.state.record_access_log(
+                    &self.link_id,
+                    &self.link_name,
+                    &self.client_ip,
+                    "UDP",
+                    extract_root_domain(&host_str),
+                    target_str,
+                    sent as u64,
+                    0,
+                    0,
+                    "ok",
+                );
             }
-        };
-        if should_log {
-            self.state.record_access_log(
-                &self.link_id,
-                &self.link_name,
-                &self.client_ip,
-                "UDP",
-                extract_root_domain(&host_str),
-                target_str,
-                sent as u64,
-                0,
-                0,
-                "ok",
-            );
         }
         Ok(())
     }
@@ -229,6 +244,7 @@ impl FullConeNat {
             dual_stack,
             meta: meta.clone(),
             dedup: Mutex::new(DedupWindow::new()),
+            seen_full: AtomicBool::new(false),
             seen_targets: Mutex::new(HashSet::new()),
             recv_task: Mutex::new(None),
         });

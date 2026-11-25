@@ -13,7 +13,7 @@ use crate::store::{AppState, InitParams, LiveCounters};
 use anyhow::{Context, Result};
 use clap::Parser;
 use protocol::auth::{AUTH_ERR, AUTH_MAGIC, AUTH_OK, read_auth_request_after_magic};
-use protocol::frame::{TargetAddr, UdpFrame};
+use protocol::frame::{ATYP_DOMAIN, TargetAddr};
 use protocol::pacer::UdpDupPacer;
 use protocol::sniff::{extract_root_domain, sniff_first_packet};
 use quinn::Endpoint;
@@ -162,12 +162,13 @@ async fn main() -> Result<()> {
         info!("============================================================");
     }
 
-    // Periodic 15s traffic counter persistence task
+    // Periodic 15s traffic counter persistence + online quota/expiry enforcement
     let flush_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         loop {
             tick.tick().await;
+            flush_state.enforce_limits_and_kick();
             if let Err(e) = flush_state.sync_and_save() {
                 warn!("failed to flush traffic counters: {:#}", e);
             }
@@ -324,10 +325,9 @@ async fn handle_connection(
     let resolve_slots = Arc::new(tokio::sync::Semaphore::new(32));
     let dgram_task = tokio::spawn(async move {
         while let Ok(data) = dgram_conn.read_datagram().await {
-            let needs_resolve = matches!(
-                UdpFrame::decode(data.clone()).map(|f| f.addr),
-                Ok(TargetAddr::Domain(..))
-            );
+            // Wire format: [flow_id:2][seq:2][flags:1][atyp:1]... — inspect ATYP byte directly
+            // without decoding the frame twice on the UDP game hot path.
+            let needs_resolve = data.get(5) == Some(&ATYP_DOMAIN);
             if needs_resolve {
                 match resolve_slots.clone().try_acquire_owned() {
                     Ok(permit) => {

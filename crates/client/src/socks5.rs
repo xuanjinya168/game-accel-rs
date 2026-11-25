@@ -275,7 +275,15 @@ async fn handle_udp_associate(
             };
 
             let is_v6_ip = matches!(dst, TargetAddr::Ip(SocketAddr::V6(_)));
-            if !is_v6_ip && router.decide(&dst).await == Route::Direct {
+            let is_direct = if is_v6_ip {
+                false
+            } else {
+                match &dst {
+                    TargetAddr::Ip(a) => router.decide_ip_sync(a.ip()) == Route::Direct,
+                    TargetAddr::Domain(..) => router.decide(&dst).await == Route::Direct,
+                }
+            };
+            if is_direct {
                 if direct.is_none() {
                     match router.dialer.bind_udp_v4() {
                         Ok(s) => {

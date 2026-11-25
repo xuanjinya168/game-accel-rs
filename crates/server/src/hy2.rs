@@ -14,7 +14,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use protocol::frame::TargetAddr;
 use protocol::hy2::{
-    HY2_TCP_STREAM_TYPE, decode_hy2_udp_message, encode_h3_control_stream,
+    HY2_TCP_STREAM_TYPE, Hy2UdpReassembler, decode_hy2_udp_message, encode_h3_control_stream,
     encode_hy2_udp_datagrams, header_val, parse_hy2_addr, read_h3_headers, write_h3_response,
     write_varint,
 };
@@ -26,7 +26,7 @@ use protocol::unix_now_secs as now_secs;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -394,26 +394,20 @@ async fn handle_hy2_tcp_stream(
 // Hysteria2 UDP Datagram Relay (with fragmentation & reassembly)
 // ============================================================================
 
-struct FragState {
-    packet_id: u16,
-    frag_count: u8,
-    addr: String,
-    frags: Vec<Option<Vec<u8>>>,
-    received: u8,
-}
-
 struct Hy2UdpSession {
     socket: Arc<UdpSocket>,
     dual_stack: bool,
     last_active: Arc<AtomicU64>,
-    frag: Mutex<Option<FragState>>,
+    seen_full: AtomicBool,
     seen_targets: Mutex<HashSet<String>>,
     rx_task: JoinHandle<()>,
 }
 
 struct Hy2UdpManager {
     conn: quinn::Connection,
+    closed: AtomicBool,
     sessions: Arc<DashMap<u32, Arc<Hy2UdpSession>>>,
+    reasm: Mutex<Hy2UdpReassembler>,
     counters: Arc<LiveCounters>,
     state: Arc<AppState>,
     link_id: String,
@@ -459,7 +453,9 @@ impl Hy2UdpManager {
         });
         Self {
             conn,
+            closed: AtomicBool::new(false),
             sessions,
+            reasm: Mutex::new(Hy2UdpReassembler::default()),
             counters,
             state,
             link_id,
@@ -471,6 +467,7 @@ impl Hy2UdpManager {
     }
 
     fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.reaper.abort();
         let keys: Vec<u32> = self.sessions.iter().map(|e| *e.key()).collect();
         for k in keys {
@@ -481,6 +478,9 @@ impl Hy2UdpManager {
     }
 
     async fn handle_datagram(&self, raw: Bytes) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let msg = decode_hy2_udp_message(&raw)?;
         if msg.frag_count == 0 || msg.frag_id >= msg.frag_count {
             return Ok(());
@@ -489,72 +489,33 @@ impl Hy2UdpManager {
         let session = self.get_or_create_session(msg.session_id)?;
         session.last_active.store(now_secs(), Ordering::Relaxed);
 
-        let (addr_str, payload): (String, Vec<u8>) = if msg.frag_count == 1 {
-            (msg.addr, msg.data.to_vec())
+        let (addr_str, payload): (String, Bytes) = if msg.frag_count == 1 {
+            (msg.addr, Bytes::copy_from_slice(msg.data))
         } else {
-            let mut guard = session.frag.lock().expect("hy2 frag lock");
-            let needs_reset = guard
-                .as_ref()
-                .is_none_or(|f| f.packet_id != msg.packet_id || f.frag_count != msg.frag_count);
-            if needs_reset {
-                *guard = Some(FragState {
-                    packet_id: msg.packet_id,
-                    frag_count: msg.frag_count,
-                    addr: msg.addr.clone(),
-                    frags: vec![None; msg.frag_count as usize],
-                    received: 0,
-                });
-            }
-            let st = guard.as_mut().unwrap();
-            let idx = msg.frag_id as usize;
-            if st.frags[idx].is_none() {
-                st.frags[idx] = Some(msg.data.to_vec());
-                st.received += 1;
-            }
-            if st.received < st.frag_count {
+            let assembled = {
+                let mut reasm = self.reasm.lock().unwrap_or_else(|e| e.into_inner());
+                reasm.push(msg)
+            };
+            let Some((_, _, addr_s, data)) = assembled else {
                 return Ok(());
-            }
-            let done = guard.take().unwrap();
-            let mut assembled = Vec::new();
-            for part in done.frags.into_iter().flatten() {
-                assembled.extend_from_slice(&part);
-            }
-            (done.addr, assembled)
+            };
+            (addr_s, data)
         };
 
         let target = parse_hy2_addr(&addr_str)?;
-        let (log_host, dst) = match target {
-            TargetAddr::Ip(addr) => (addr.ip().to_string(), addr),
+        let (domain_host, dst) = match target {
+            TargetAddr::Ip(addr) => (None, addr),
             TargetAddr::Domain(host, port) => {
                 let resolved = dns::resolve(&host, port)
                     .await?
                     .into_iter()
                     .find(|a| session.dual_stack || a.is_ipv4());
                 match resolved {
-                    Some(addr) => (host, addr),
+                    Some(addr) => (Some(host), addr),
                     None => bail!("no address for {addr_str}"),
                 }
             }
         };
-
-        let is_new_target = {
-            let mut seen = session.seen_targets.lock().expect("hy2 seen lock");
-            seen.len() < 64 && seen.insert(addr_str.clone())
-        };
-        if is_new_target {
-            self.state.record_access_log(
-                &self.link_id,
-                &self.link_name,
-                &self.client_ip,
-                "UDP",
-                extract_root_domain(&log_host),
-                addr_str,
-                payload.len() as u64,
-                0,
-                0,
-                "ok",
-            );
-        }
 
         let send_addr = match (session.dual_stack, dst) {
             (true, SocketAddr::V4(v4)) => {
@@ -567,10 +528,44 @@ impl Hy2UdpManager {
         self.counters
             .tx_bytes
             .fetch_add(sent as u64, Ordering::Relaxed);
+
+        if self.state.is_access_log_enabled() && !session.seen_full.load(Ordering::Relaxed) {
+            let is_new_target = {
+                let mut seen = session.seen_targets.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() >= 64 {
+                    session.seen_full.store(true, Ordering::Relaxed);
+                    false
+                } else {
+                    let inserted = seen.insert(addr_str.clone());
+                    if seen.len() >= 64 {
+                        session.seen_full.store(true, Ordering::Relaxed);
+                    }
+                    inserted
+                }
+            };
+            if is_new_target {
+                let log_host = domain_host.unwrap_or_else(|| dst.ip().to_string());
+                self.state.record_access_log(
+                    &self.link_id,
+                    &self.link_name,
+                    &self.client_ip,
+                    "UDP",
+                    extract_root_domain(&log_host),
+                    addr_str,
+                    sent as u64,
+                    0,
+                    0,
+                    "ok",
+                );
+            }
+        }
         Ok(())
     }
 
     fn get_or_create_session(&self, session_id: u32) -> Result<Arc<Hy2UdpSession>> {
+        if self.closed.load(Ordering::Acquire) {
+            bail!("hy2 udp manager closed");
+        }
         if let Some(existing) = self.sessions.get(&session_id) {
             return Ok(existing.clone());
         }
@@ -605,7 +600,7 @@ impl Hy2UdpManager {
             socket,
             dual_stack,
             last_active,
-            frag: Mutex::new(None),
+            seen_full: AtomicBool::new(false),
             seen_targets: Mutex::new(HashSet::new()),
             rx_task,
         });
@@ -616,6 +611,10 @@ impl Hy2UdpManager {
                 Ok(o.get().clone())
             }
             dashmap::mapref::entry::Entry::Vacant(v) => {
+                if self.closed.load(Ordering::Acquire) {
+                    entry.rx_task.abort();
+                    bail!("hy2 udp manager closed");
+                }
                 v.insert(entry.clone());
                 Ok(entry)
             }

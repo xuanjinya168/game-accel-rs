@@ -18,6 +18,7 @@ use tracing::info;
 
 const MAX_MEM_ACCESS_LOGS: usize = 500;
 const MAX_ACCESS_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB rotation
+const ACCESS_LOG_QUEUE_CAP: usize = 1024;
 
 const SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
 const LOGIN_MAX_FAILURES: u32 = 10;
@@ -187,9 +188,13 @@ pub struct UpdateNodeSettingsInput {
     pub insecure: bool,
 }
 
+enum LogOp {
+    Line(String),
+    Truncate,
+}
+
 pub struct AppState {
     data_path: PathBuf,
-    access_log_path: PathBuf,
     pub config: RwLock<PanelConfig>,
     pub live: DashMap<String, Arc<LiveCounters>>,
     sessions: DashMap<String, Instant>,
@@ -198,7 +203,8 @@ pub struct AppState {
     next_log_id: AtomicU64,
     access_log_enabled: AtomicBool,
     access_logs: Mutex<VecDeque<AccessLogEntry>>,
-    log_file_lock: Mutex<()>,
+    log_tx: std::sync::mpsc::SyncSender<LogOp>,
+    save_lock: Mutex<()>,
     started_at: Instant,
 }
 
@@ -278,9 +284,37 @@ impl AppState {
             .map(|p| p.join("access.log"))
             .unwrap_or_else(|| PathBuf::from("access.log"));
 
+        let (log_tx, log_rx) = std::sync::mpsc::sync_channel::<LogOp>(ACCESS_LOG_QUEUE_CAP);
+        let log_path_bg = access_log_path;
+        let _ = std::thread::Builder::new()
+            .name("access-log-writer".to_string())
+            .spawn(move || {
+                while let Ok(op) = log_rx.recv() {
+                    match op {
+                        LogOp::Line(line) => {
+                            if let Ok(meta) = std::fs::metadata(&log_path_bg)
+                                && meta.len() >= MAX_ACCESS_LOG_FILE_BYTES
+                            {
+                                let old = log_path_bg.with_extension("log.old");
+                                let _ = std::fs::rename(&log_path_bg, old);
+                            }
+                            if let Ok(mut f) = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&log_path_bg)
+                            {
+                                let _ = writeln!(f, "{line}");
+                            }
+                        }
+                        LogOp::Truncate => {
+                            let _ = std::fs::write(&log_path_bg, b"");
+                        }
+                    }
+                }
+            });
+
         let state = Arc::new(Self {
             data_path: params.data_path,
-            access_log_path,
             config: RwLock::new(cfg),
             live,
             sessions: DashMap::new(),
@@ -289,11 +323,31 @@ impl AppState {
             next_log_id: AtomicU64::new(1),
             access_log_enabled: AtomicBool::new(access_log_enabled),
             access_logs: Mutex::new(VecDeque::with_capacity(MAX_MEM_ACCESS_LOGS)),
-            log_file_lock: Mutex::new(()),
+            log_tx,
+            save_lock: Mutex::new(()),
             started_at: Instant::now(),
         });
         state.sync_and_save()?;
         Ok((state, newly_generated_pass))
+    }
+
+    fn write_snapshot_atomic(&self, snapshot: &PanelConfig) -> Result<()> {
+        let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(parent) = self.data_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = self.data_path.with_extension("json.tmp");
+        let text = serde_json::to_string_pretty(snapshot)?;
+        std::fs::write(&tmp, text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &self.data_path)?;
+        Ok(())
     }
 
     pub fn sync_and_save(&self) -> Result<()> {
@@ -307,40 +361,58 @@ impl AppState {
             }
             cfg.clone()
         };
+        self.write_snapshot_atomic(&snapshot)
+    }
 
-        if let Some(parent) = self.data_path.parent()
-            && !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+    /// Periodically called by the background flush task: disconnects any active sessions
+    /// belonging to links that are now disabled, expired, or over their traffic quota.
+    pub fn enforce_limits_and_kick(&self) {
+        let to_kick: Vec<String> = {
+            let cfg = self.config.read().expect("config read lock");
+            cfg.links
+                .iter()
+                .filter_map(|link| {
+                    let counters = self.live.get(&link.id)?;
+                    let status = evaluate_link_status(link, counters.value());
+                    if status != "active" && counters.online_conns.load(Ordering::Relaxed) > 0 {
+                        Some(link.id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        for link_id in to_kick {
+            if let Some(c) = self.live.get(&link_id) {
+                info!("kicking active connections for over-quota/expired/disabled link {link_id}");
+                c.kick_all();
             }
-        let tmp = self.data_path.with_extension("json.tmp");
-        let text = serde_json::to_string_pretty(&snapshot)?;
-        std::fs::write(&tmp, text)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
         }
-        std::fs::rename(&tmp, &self.data_path)?;
-        Ok(())
     }
 
     pub fn data_path(&self) -> &Path {
         &self.data_path
     }
 
-    // ---------- Access Logging (Ring Buffer + 10MB Rotating File) ----------
+    // ---------- Access Logging (Ring Buffer + Async 10MB Rotating File) ----------
 
     pub fn is_access_log_enabled(&self) -> bool {
         self.access_log_enabled.load(Ordering::Relaxed)
     }
 
     pub fn set_access_log_enabled(&self, enabled: bool) -> Result<bool> {
-        self.access_log_enabled.store(enabled, Ordering::Relaxed);
-        {
+        let prev = self.access_log_enabled.load(Ordering::Relaxed);
+        let snapshot = {
             let mut cfg = self.config.write().expect("config write lock");
             cfg.access_log_enabled = enabled;
+            cfg.clone()
+        };
+        if let Err(e) = self.write_snapshot_atomic(&snapshot) {
+            let mut cfg = self.config.write().expect("config write lock");
+            cfg.access_log_enabled = prev;
+            return Err(e);
         }
-        self.sync_and_save()?;
+        self.access_log_enabled.store(enabled, Ordering::Relaxed);
         Ok(enabled)
     }
 
@@ -363,15 +435,18 @@ impl AppState {
         }
         let id = self.next_log_id.fetch_add(1, Ordering::Relaxed);
         let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let line = format!(
+            "[{time}] [{status}] [{proto}] user=\"{link_name}\" ip={client_ip} root={root_domain} target={target} tx={tx_bytes} rx={rx_bytes} dur={duration_ms}ms"
+        );
         let entry = AccessLogEntry {
             id,
-            time: time.clone(),
+            time,
             link_id: link_id.to_string(),
             link_name: link_name.to_string(),
             client_ip: client_ip.to_string(),
             proto: proto.to_string(),
-            root_domain: root_domain.clone(),
-            target: target.clone(),
+            root_domain,
+            target,
             tx_bytes,
             rx_bytes,
             duration_ms,
@@ -386,24 +461,9 @@ impl AppState {
             ring.push_back(entry);
         }
 
-        // Persist compact line to rotating access.log (10 MB cap)
-        if let Ok(_guard) = self.log_file_lock.lock() {
-            if let Ok(meta) = std::fs::metadata(&self.access_log_path)
-                && meta.len() >= MAX_ACCESS_LOG_FILE_BYTES {
-                    let old = self.access_log_path.with_extension("log.old");
-                    let _ = std::fs::rename(&self.access_log_path, old);
-                }
-            if let Ok(mut f) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.access_log_path)
-            {
-                let _ = writeln!(
-                    f,
-                    "[{time}] [{status}] [{proto}] user=\"{link_name}\" ip={client_ip} root={root_domain} target={target} tx={tx_bytes} rx={rx_bytes} dur={duration_ms}ms"
-                );
-            }
-        }
+        // Non-blocking enqueue to dedicated writer thread; drops log line if saturated
+        // so disk I/O can never stall the UDP/TCP forwarding hot path.
+        let _ = self.log_tx.try_send(LogOp::Line(line));
     }
 
     pub fn query_access_logs(
@@ -456,9 +516,7 @@ impl AppState {
         if let Ok(mut ring) = self.access_logs.lock() {
             ring.clear();
         }
-        if let Ok(_guard) = self.log_file_lock.lock() {
-            let _ = std::fs::write(&self.access_log_path, b"");
-        }
+        let _ = self.log_tx.try_send(LogOp::Truncate);
     }
 
     // ---------- Auth & Sessions (Web Panel) ----------
@@ -1112,5 +1170,32 @@ mod tests {
         assert!(state.check_login_throttle(ip).is_ok());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_failure_rolls_back_access_log_flag() {
+        let dir = std::env::temp_dir().join(format!("gacl-rollback-{}", generate_random_str(8)));
+        let data_path = dir.join("data.json");
+        let (state, _) = AppState::load_or_init(InitParams {
+            data_path: data_path.clone(),
+            seed_token: "tok".to_string(),
+            public_host: "127.0.0.1".to_string(),
+            udp_port: 8443,
+            sni: "localhost".to_string(),
+            insecure: true,
+            initial_panel_pass: Some("pass123".to_string()),
+        })
+        .unwrap();
+        assert!(state.is_access_log_enabled());
+
+        // Block writes to `data.json.tmp` by creating a directory at that exact path
+        let tmp_blocker = data_path.with_extension("json.tmp");
+        std::fs::create_dir_all(&tmp_blocker).unwrap();
+
+        assert!(state.set_access_log_enabled(false).is_err());
+        assert!(state.is_access_log_enabled());
+        assert!(state.config.read().unwrap().access_log_enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

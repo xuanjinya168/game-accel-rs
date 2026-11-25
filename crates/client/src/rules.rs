@@ -411,6 +411,22 @@ impl Router {
         }
     }
 
+    /// Synchronous fast-path routing verdict for an already-resolved IP target
+    /// (avoids async state-machine overhead on the UDP game packet hot path).
+    pub fn decide_ip_sync(&self, ip: IpAddr) -> Route {
+        match self.mode.get() {
+            RouteMode::Global => {
+                if is_local_ip(ip) {
+                    Route::Direct
+                } else {
+                    Route::Proxy
+                }
+            }
+            RouteMode::Direct => Route::Direct,
+            RouteMode::Rule => self.decide_ip(ip),
+        }
+    }
+
     fn decide_ip(&self, ip: IpAddr) -> Route {
         if is_local_ip(ip) {
             return Route::Direct;

@@ -460,7 +460,7 @@ pub async fn run_tun_mode(
                             DnsRoute::Proxy => None,
                         }
                     } else if remote_dst.is_ipv4()
-                        && router_udp.decide(&TargetAddr::Ip(remote_dst)).await == Route::Direct
+                        && router_udp.decide_ip_sync(remote_dst.ip()) == Route::Direct
                     {
                         Some((remote_dst, None))
                     } else {

@@ -1,5 +1,7 @@
 use bytes::Bytes;
 use quinn::{Connection, SendDatagramError};
+use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,6 +14,31 @@ const ADAPTIVE_HOLD_DURATION: Duration = Duration::from_secs(15);
 const MIN_LOST_PACKETS_TO_TRIGGER: u64 = 2;
 const LOSS_RATIO_THRESHOLD: f64 = 0.005; // 0.5%
 const PACER_QUEUE_CAP: usize = 2048;
+
+struct ScheduledDup {
+    due: Instant,
+    seq: u64,
+    pkt: Bytes,
+}
+
+impl PartialEq for ScheduledDup {
+    fn eq(&self, other: &Self) -> bool {
+        self.due == other.due && self.seq == other.seq
+    }
+}
+impl Eq for ScheduledDup {}
+
+impl PartialOrd for ScheduledDup {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScheduledDup {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.due.cmp(&other.due).then_with(|| self.seq.cmp(&other.seq))
+    }
+}
 
 /// Deterministic loss-adaptive dual-send controller.
 ///
@@ -80,8 +107,11 @@ impl UdpDupPacer {
             let mut loss_tick = tokio::time::interval(LOSS_SAMPLE_INTERVAL);
             loss_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut policy = AdaptiveDupPolicy::new();
+            let mut heap: BinaryHeap<Reverse<ScheduledDup>> = BinaryHeap::new();
+            let mut order_seq: u64 = 0;
 
             loop {
+                let next_due = heap.peek().map(|r| r.0.due);
                 tokio::select! {
                     _ = loss_tick.tick() => {
                         if conn.close_reason().is_some() {
@@ -106,14 +136,28 @@ impl UdpDupPacer {
                         if conn.close_reason().is_some() {
                             break;
                         }
-                        let now = Instant::now();
-                        if due > now {
-                            tokio::time::sleep_until(due).await;
+                        if heap.len() < PACER_QUEUE_CAP {
+                            order_seq = order_seq.wrapping_add(1);
+                            heap.push(Reverse(ScheduledDup { due, seq: order_seq, pkt }));
                         }
-                        match conn.send_datagram(pkt) {
-                            Ok(()) => {}
-                            Err(SendDatagramError::ConnectionLost(_)) => break,
-                            Err(e) => debug!("dup datagram skipped: {e}"),
+                    }
+                    _ = async {
+                        match next_due {
+                            Some(due) => tokio::time::sleep_until(due).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        let now = Instant::now();
+                        while let Some(top) = heap.peek() {
+                            if top.0.due > now {
+                                break;
+                            }
+                            let item = heap.pop().expect("peeked").0;
+                            match conn.send_datagram(item.pkt) {
+                                Ok(()) => {}
+                                Err(SendDatagramError::ConnectionLost(_)) => return,
+                                Err(e) => debug!("dup datagram skipped: {e}"),
+                            }
                         }
                     }
                 }
@@ -218,5 +262,23 @@ mod tests {
 
         // Once 15s clean window elapses -> disengages automatically
         assert!(!p.update(700, 3, t1 + Duration::from_secs(16)));
+    }
+
+    #[test]
+    fn pacer_heap_orders_earliest_due_first() {
+        let t0 = Instant::now();
+        let mut heap: BinaryHeap<Reverse<ScheduledDup>> = BinaryHeap::new();
+        heap.push(Reverse(ScheduledDup {
+            due: t0 + Duration::from_millis(5),
+            seq: 1,
+            pkt: Bytes::from_static(b"late"),
+        }));
+        heap.push(Reverse(ScheduledDup {
+            due: t0 + Duration::from_millis(2),
+            seq: 2,
+            pkt: Bytes::from_static(b"early"),
+        }));
+        assert_eq!(heap.pop().unwrap().0.pkt, Bytes::from_static(b"early"));
+        assert_eq!(heap.pop().unwrap().0.pkt, Bytes::from_static(b"late"));
     }
 }
