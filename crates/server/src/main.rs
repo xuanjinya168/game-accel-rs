@@ -1,4 +1,5 @@
 mod dns;
+mod hy2;
 mod nat;
 mod panel;
 mod sniff;
@@ -9,7 +10,7 @@ use crate::sniff::{extract_root_domain, sniff_first_packet};
 use crate::store::{AppState, InitParams, LiveCounters};
 use anyhow::{Context, Result};
 use clap::Parser;
-use protocol::auth::{AUTH_ERR, AUTH_OK, read_auth_request};
+use protocol::auth::{AUTH_ERR, AUTH_MAGIC, AUTH_OK, read_auth_request_after_magic};
 use protocol::frame::{TargetAddr, UdpFrame};
 use protocol::pacer::UdpDupPacer;
 use protocol::{
@@ -77,20 +78,20 @@ struct Args {
 }
 
 const INTERNAL_PANEL_HOST: &str = "panel.gacl.local";
-const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERNAL_PANEL_TUN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
 
 /// Maps authenticated tunnel-only panel aliases (`panel.gacl.local`, `198.18.0.1`,
 /// or `public_host:panel_port` / `sni:panel_port`) to the loopback Web Admin Panel
 /// so port 9090 never needs to be exposed on the public internet.
 #[derive(Clone)]
-struct PanelRoute {
+pub(crate) struct PanelRoute {
     local_addr: SocketAddr,
     state: Arc<AppState>,
 }
 
 impl PanelRoute {
-    fn resolve_target(&self, target: &TargetAddr) -> Option<SocketAddr> {
+    pub(crate) fn resolve_target(&self, target: &TargetAddr) -> Option<SocketAddr> {
         let panel_port = self.local_addr.port();
         match target {
             TargetAddr::Domain(host, port) => {
@@ -317,7 +318,28 @@ async fn handle_connection(
     panel_route: Option<Arc<PanelRoute>>,
 ) -> Result<()> {
     let (mut auth_send, mut auth_recv) = conn.accept_bi().await.context("accept auth stream")?;
-    let client_token = match read_auth_request(&mut auth_recv).await {
+    let mut first_four = [0u8; 4];
+    auth_recv
+        .read_exact(&mut first_four)
+        .await
+        .context("read protocol prefix")?;
+
+    // Dual-protocol dispatch on the same QUIC/ALPN-h3 port:
+    // - `GACL` prefix => native game-accel-rs client
+    // - anything else => HTTP/3 Hysteria2 auth (Shadowrocket / Clash / sing-box)
+    if &first_four != AUTH_MAGIC {
+        return hy2::handle_hy2_connection(
+            conn,
+            first_four,
+            auth_send,
+            auth_recv,
+            state,
+            panel_route,
+        )
+        .await;
+    }
+
+    let client_token = match read_auth_request_after_magic(&mut auth_recv).await {
         Ok(t) => t,
         Err(e) => {
             let _ = auth_send.write_all(&[AUTH_ERR]).await;
@@ -725,6 +747,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hysteria2_auth_tcp_and_udp_end_to_end() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let data_path = std::env::temp_dir().join(format!(
+            "game-accel-hy2-e2e-{}.json",
+            store::generate_random_str(8)
+        ));
+        let (state, _) = AppState::load_or_init(InitParams {
+            data_path: data_path.clone(),
+            seed_token: "hy2-test-token-999".to_string(),
+            public_host: "127.0.0.1".to_string(),
+            udp_port: 8443,
+            sni: "localhost".to_string(),
+            insecure: true,
+            initial_panel_pass: Some("testpass123".to_string()),
+        })
+        .unwrap();
+
+        let server_cfg = build_server_config(None, None, "localhost").unwrap();
+        let server_ep = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+
+        let ep_bg = server_ep.clone();
+        let st_bg = state.clone();
+        tokio::spawn(async move {
+            if let Some(inc) = ep_bg.accept().await
+                && let Ok(conn) = inc.await
+            {
+                let _ = handle_connection(conn, st_bg, None).await;
+            }
+        });
+
+        let mut tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TestSkipVerify))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        let mut client_ep = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_ep.set_default_client_config(ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(tls).unwrap(),
+        )));
+
+        let conn = client_ep
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+
+        // 1. Send HTTP/3 POST /auth with Hysteria-Auth header
+        let (mut auth_send, mut auth_recv) = conn.open_bi().await.unwrap();
+        let mut qpack = bytes::BytesMut::new();
+        qpack.extend_from_slice(&[0x00, 0x00, 0xD4]); // RIC=0, DB=0, Indexed static 20 (POST)
+        // Literal name ref static 1 (:path = "/auth")
+        qpack.extend_from_slice(&[0x51, 0x05]);
+        qpack.extend_from_slice(b"/auth");
+        // Literal name "hysteria-auth" (len 13 => 0x27, 0x06) + value "hy2-test-token-999" (len 18)
+        qpack.extend_from_slice(&[0x27, 0x06]);
+        qpack.extend_from_slice(b"hysteria-auth");
+        qpack.extend_from_slice(&[18]);
+        qpack.extend_from_slice(b"hy2-test-token-999");
+
+        let mut h3_frame = bytes::BytesMut::new();
+        hy2::encode_varint(0x01, &mut h3_frame);
+        hy2::encode_varint(qpack.len() as u64, &mut h3_frame);
+        h3_frame.extend_from_slice(&qpack);
+        auth_send.write_all(&h3_frame).await.unwrap();
+        let _ = auth_send.finish();
+
+        // Read HTTP/3 233 Auth OK response
+        let resp_bytes = auth_recv.read_to_end(4096).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        assert!(resp_str.contains("233"), "expected 233 auth ok, got {resp_str:?}");
+        assert!(resp_str.contains("hysteria-udp"), "expected hysteria-udp header");
+
+        // 2. Hysteria2 TCP proxy (0x401) -> local TCP echo server
+        let tcp_echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = tcp_echo.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf).await {
+                    let _ = s.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        let (mut tcp_send, mut tcp_recv) = conn.open_bi().await.unwrap();
+        let mut tcp_req = bytes::BytesMut::new();
+        hy2::encode_varint(0x401, &mut tcp_req);
+        let addr_s = tcp_addr.to_string();
+        hy2::encode_varint(addr_s.len() as u64, &mut tcp_req);
+        tcp_req.extend_from_slice(addr_s.as_bytes());
+        hy2::encode_varint(0, &mut tcp_req); // padding len 0
+        tcp_send.write_all(&tcp_req).await.unwrap();
+        tcp_send.write_all(b"hello-hy2-tcp").await.unwrap();
+
+        let status = tcp_recv.read_u8().await.unwrap();
+        assert_eq!(status, 0x00, "hy2 tcp dial status must be OK");
+        let msg_len = hy2::read_varint(&mut tcp_recv).await.unwrap();
+        assert_eq!(msg_len, 0);
+        let pad_len = hy2::read_varint(&mut tcp_recv).await.unwrap();
+        assert_eq!(pad_len, 0);
+        let mut echoed = [0u8; 13];
+        tcp_recv.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"hello-hy2-tcp");
+
+        // 3. Hysteria2 UDP datagram relay -> local UDP echo server
+        let udp_echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            if let Ok((n, peer)) = udp_echo.recv_from(&mut buf).await {
+                let _ = udp_echo.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        let mut dgram = bytes::BytesMut::new();
+        dgram.extend_from_slice(&77u32.to_be_bytes()); // session_id
+        dgram.extend_from_slice(&1u16.to_be_bytes()); // packet_id
+        dgram.extend_from_slice(&[0u8, 1u8]); // frag_id=0, frag_count=1
+        let udp_s = udp_addr.to_string();
+        hy2::encode_varint(udp_s.len() as u64, &mut dgram);
+        dgram.extend_from_slice(udp_s.as_bytes());
+        dgram.extend_from_slice(b"hello-hy2-udp");
+        conn.send_datagram(dgram.freeze()).unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(3), conn.read_datagram())
+            .await
+            .expect("udp reply timeout")
+            .unwrap();
+        assert_eq!(u32::from_be_bytes([reply[0], reply[1], reply[2], reply[3]]), 77);
+        assert!(reply.ends_with(b"hello-hy2-udp"));
+
+        conn.close(0u32.into(), b"done");
+        client_ep.close(0u32.into(), b"done");
+        server_ep.close(0u32.into(), b"done");
+        let _ = std::fs::remove_file(&data_path);
+    }
+
+    #[tokio::test]
     async fn fast_open_pipelined_payload_and_failed_dial() {
         let (ep, conn, data_path) = spawn_loopback_quic().await;
 
@@ -762,6 +923,8 @@ mod tests {
         ep.close(0u32.into(), b"done");
         let _ = std::fs::remove_file(&data_path);
     }
+
+
 
     #[tokio::test]
     async fn full_cone_nat_concurrent_creation_no_race() {
@@ -816,6 +979,8 @@ mod tests {
         ep.close(0u32.into(), b"done");
         let _ = std::fs::remove_file(&data_path);
     }
+
+
 
     #[test]
     fn panel_route_resolves_only_allowed_aliases() {

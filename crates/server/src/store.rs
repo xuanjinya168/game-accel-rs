@@ -239,6 +239,7 @@ pub struct LinkView {
     pub online_conns: u64,
     pub created_at: String,
     pub share_uri: String,
+    pub hy2_uri: String,
     pub status: String, // "active" | "disabled" | "expired" | "over_limit"
 }
 
@@ -955,6 +956,7 @@ impl AppState {
         let online = counters.online_conns.load(Ordering::Relaxed);
         let status = evaluate_link_status(link, &counters);
         let share_uri = build_node_profile(cfg, link).to_share_uri();
+        let hy2_uri = build_hy2_uri(cfg, link);
 
         LinkView {
             id: link.id.clone(),
@@ -969,9 +971,42 @@ impl AppState {
             online_conns: online,
             created_at: link.created_at.clone(),
             share_uri,
+            hy2_uri,
             status,
         }
     }
+}
+
+fn percent_encode_uri(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn build_hy2_uri(cfg: &PanelConfig, link: &LinkRecord) -> String {
+    let host = if cfg.public_host.contains(':') && !cfg.public_host.starts_with('[') {
+        format!("[{}]", cfg.public_host)
+    } else {
+        cfg.public_host.clone()
+    };
+    let sni = percent_encode_uri(&cfg.sni);
+    let name = percent_encode_uri(&link.name);
+    let insecure = if cfg.insecure { 1 } else { 0 };
+    format!(
+        "hysteria2://{}@{}:{}/?sni={}&insecure={}#{}",
+        percent_encode_uri(&link.token),
+        host,
+        cfg.udp_port,
+        sni,
+        insecure,
+        name
+    )
 }
 
 fn build_node_profile(cfg: &PanelConfig, link: &LinkRecord) -> NodeProfile {

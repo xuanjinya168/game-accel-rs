@@ -21,15 +21,23 @@ pub async fn write_auth_request<W: AsyncWrite + Unpin>(writer: &mut W, token: &s
 }
 
 pub async fn read_auth_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<String> {
-    let mut header = [0u8; 6];
-    reader.read_exact(&mut header).await.context("read auth header")?;
-    if &header[0..4] != AUTH_MAGIC {
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).await.context("read auth magic")?;
+    if &magic != AUTH_MAGIC {
         bail!("invalid auth magic");
     }
-    if header[4] != PROTOCOL_VERSION {
-        bail!("unsupported protocol version: {}", header[4]);
+    read_auth_request_after_magic(reader).await
+}
+
+/// Read the remainder of a GACL auth request after the 4-byte `AUTH_MAGIC` prefix
+/// has already been consumed (used by dual-protocol servers dispatching GACL vs Hysteria2).
+pub async fn read_auth_request_after_magic<R: AsyncRead + Unpin>(reader: &mut R) -> Result<String> {
+    let mut header = [0u8; 2];
+    reader.read_exact(&mut header).await.context("read auth header")?;
+    if header[0] != PROTOCOL_VERSION {
+        bail!("unsupported protocol version: {}", header[0]);
     }
-    let token_len = header[5] as usize;
+    let token_len = header[1] as usize;
     let mut token_buf = vec![0u8; token_len];
     reader
         .read_exact(&mut token_buf)

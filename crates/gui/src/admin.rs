@@ -34,6 +34,8 @@ pub(crate) struct LinkView {
     #[allow(dead_code)]
     pub created_at: String,
     pub share_uri: String,
+    #[serde(default)]
+    pub hy2_uri: String,
     pub status: String,
 }
 

@@ -99,8 +99,10 @@ for l in d.get("links", []):
     name = urllib.parse.quote(l["name"])
     sni = urllib.parse.quote(d["sni"])
     uri = f"gacl://{l['token']}@{d['public_host']}:{d['udp_port']}?sni={sni}&dup={dup}&insecure={ins}#{name}"
+    hy2 = f"hysteria2://{l['token']}@{d['public_host']}:{d['udp_port']}/?sni={sni}&insecure={ins}#{name}"
     print(f"[{st}] {l['name']}")
-    print(f"  {uri}")
+    print(f"  GACL: {uri}")
+    print(f"  HY2 : {hy2}")
 PY
   fi
 }

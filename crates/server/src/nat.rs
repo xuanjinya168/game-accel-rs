@@ -22,7 +22,7 @@ const NAT_SOCKET_BUFFER: usize = 2 * 1024 * 1024;
 /// Bind a per-flow NAT socket. Prefers one dual-stack `[::]:0` socket so both IPv4
 /// and IPv6 targets work (and the Full Cone mapping stays a single port); falls back
 /// to IPv4-only on hosts without IPv6. Returns `(socket, is_dual_stack)`.
-fn bind_nat_socket() -> std::io::Result<(std::net::UdpSocket, bool)> {
+pub(crate) fn bind_nat_socket() -> std::io::Result<(std::net::UdpSocket, bool)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let build = |domain: Domain, addr: SocketAddr| -> std::io::Result<std::net::UdpSocket> {
         let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;

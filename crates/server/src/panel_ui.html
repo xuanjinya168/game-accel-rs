@@ -635,6 +635,7 @@ function renderLinks(links) {
         </div>
         <div class="link-actions" data-id="${esc(l.id)}">
           <button class="btn btn-sm btn-primary" data-act="copy-share">复制 gacl://</button>
+          <button class="btn btn-sm" data-act="copy-hy2">复制 hy2://</button>
           <button class="btn btn-sm" data-act="copy-sub">复制订阅</button>
           <button class="btn btn-sm" data-act="toggle">${l.enabled ? '禁用' : '启用'}</button>
           <button class="btn btn-sm" data-act="edit">编辑</button>
@@ -659,6 +660,9 @@ document.getElementById('linkList').addEventListener('click', e => {
   switch (btn.dataset.act) {
     case 'copy-share':
       if (l) copyText(l.share_uri, 'gacl:// 分享链接');
+      break;
+    case 'copy-hy2':
+      if (l && l.hy2_uri) copyText(l.hy2_uri, 'hysteria2:// 节点链接（小火箭/Clash 通用）');
       break;
     case 'copy-sub':
       if (l) copyText(`${window.location.origin}/sub/${encodeURIComponent(l.token)}`, '订阅 URL');

@@ -593,6 +593,10 @@ impl GameAccelApp {
                                     ctx.copy_text(l.share_uri.clone());
                                     self.show_toast("已复制 gacl:// 分享链接");
                                 }
+                                if !l.hy2_uri.is_empty() && chip_btn(ui, "复制 hy2://", p, false).clicked() {
+                                    ctx.copy_text(l.hy2_uri.clone());
+                                    self.show_toast("已复制 hysteria2:// 链接（小火箭/Clash 通用）");
+                                }
                                 if chip_btn(ui, "复制订阅", p, false).clicked() {
                                     ctx.copy_text(format!("{sub_base}/sub/{}", l.token));
                                     self.show_toast("已复制订阅 URL");
