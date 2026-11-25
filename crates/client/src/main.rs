@@ -37,7 +37,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     insecure: bool,
 
-    /// Optional Brutal congestion-control rate cap in Mbps for TCP lane only (0 = BBR default)
+    /// Optional Brutal congestion-control target rate in Mbps for TCP lane only (0 = BBR default)
     #[arg(long, default_value_t = 0)]
     brutal_mbps: u32,
 

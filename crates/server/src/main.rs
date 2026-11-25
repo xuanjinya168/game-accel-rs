@@ -75,7 +75,7 @@ struct Args {
     #[arg(long)]
     masquerade_dir: Option<PathBuf>,
 
-    /// Optional Brutal congestion-control rate cap in Mbps for downstream traffic (0 = BBR default)
+    /// Optional Brutal congestion-control target rate in Mbps for server listener QUIC transport (0 = BBR default; applies to all QUIC connections on this listener)
     #[arg(long, default_value_t = 0)]
     brutal_mbps: u32,
 }

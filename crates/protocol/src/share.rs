@@ -72,17 +72,22 @@ impl NodeProfile {
         let name_enc = percent_encode(&self.name);
         let sni_enc = percent_encode(&self.sni);
         let token_enc = percent_encode(&self.token);
+        let brutal_q = if self.brutal_mbps > 0 {
+            format!("&brutal={}", self.brutal_mbps.min(1000))
+        } else {
+            String::new()
+        };
         match self.protocol {
             NodeProtocol::Gacl => {
                 let dup = if self.game_dup { "1" } else { "0" };
                 format!(
-                    "{SHARE_SCHEME}{token_enc}@{}?sni={sni_enc}&dup={dup}&insecure={insecure}#{name_enc}",
+                    "{SHARE_SCHEME}{token_enc}@{}?sni={sni_enc}&dup={dup}&insecure={insecure}{brutal_q}#{name_enc}",
                     self.server.trim()
                 )
             }
             NodeProtocol::Hysteria2 => {
                 format!(
-                    "{HY2_SCHEME}{token_enc}@{}/?sni={sni_enc}&insecure={insecure}#{name_enc}",
+                    "{HY2_SCHEME}{token_enc}@{}/?sni={sni_enc}&insecure={insecure}{brutal_q}#{name_enc}",
                     self.server.trim()
                 )
             }
@@ -144,6 +149,7 @@ impl NodeProfile {
             .unwrap_or_else(|| "localhost".to_string());
         let mut game_dup = protocol == NodeProtocol::Gacl;
         let mut insecure = false;
+        let mut brutal_mbps: u32 = 0;
 
         if let Some(q) = query {
             for pair in q.split('&') {
@@ -162,6 +168,11 @@ impl NodeProfile {
                         }
                         "insecure" => {
                             insecure = matches!(v, "1" | "true" | "yes");
+                        }
+                        "brutal" | "brutal_mbps" => {
+                            if let Ok(m) = v.parse::<u32>() {
+                                brutal_mbps = m.min(1000);
+                            }
                         }
                         "obfs" if protocol == NodeProtocol::Hysteria2 => {
                             let decoded = percent_decode(v)?;
@@ -195,7 +206,7 @@ impl NodeProfile {
             protocol,
             game_dup,
             insecure,
-            brutal_mbps: 0,
+            brutal_mbps,
             source: None,
         })
     }
@@ -318,6 +329,15 @@ mod tests {
         assert_eq!(parsed.token, node.token);
         assert_eq!(parsed.game_dup, node.game_dup);
         assert_eq!(parsed.insecure, node.insecure);
+        assert_eq!(parsed.brutal_mbps, 0);
+        assert!(!uri.contains("brutal="));
+
+        let mut brutal_node = node;
+        brutal_node.brutal_mbps = 120;
+        let brutal_uri = brutal_node.to_share_uri();
+        assert!(brutal_uri.contains("&brutal=120"));
+        let parsed_brutal = NodeProfile::from_share_uri(&brutal_uri).unwrap();
+        assert_eq!(parsed_brutal.brutal_mbps, 120);
     }
 
     #[test]

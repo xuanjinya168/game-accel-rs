@@ -238,7 +238,7 @@ impl GameAccelApp {
                         ui.end_row();
 
                         ui.label(
-                            RichText::new("TCP Brutal 限速 (Mbps)")
+                            RichText::new("TCP Brutal 目标速率 (Mbps)")
                                 .size(FONT_BODY)
                                 .color(p.text_secondary),
                         );

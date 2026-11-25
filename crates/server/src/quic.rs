@@ -91,7 +91,7 @@ pub(crate) fn build_server_config(
     transport.max_idle_timeout(Some(MAX_IDLE_TIMEOUT.try_into()?));
     if brutal_mbps > 0 {
         info!(
-            "server congestion control: Brutal ({} Mbps cap, queue-guarded)",
+            "server congestion control: Brutal ({} Mbps target, queue-guarded; applies to listener QUIC transport)",
             brutal_mbps.clamp(1, 1000)
         );
         transport.congestion_controller_factory(Arc::new(
