@@ -34,7 +34,7 @@ esac
 
 rand_str() {
   local len="${1:-20}"
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$len"
+  (tr -dc 'A-Za-z0-9' </dev/urandom || true) | head -c "$len"
 }
 
 detect_public_ip() {
