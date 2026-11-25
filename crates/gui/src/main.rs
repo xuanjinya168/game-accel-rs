@@ -17,7 +17,7 @@ use chrono::Local;
 use client::socks5::ClientStats;
 use client::{ClientOptions, probe_node_rtt, run_client_with_shutdown};
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Stroke, Vec2};
-use protocol::share::{NodeProfile, parse_import_text};
+use protocol::share::{NodeProfile, NodeProtocol, parse_import_text};
 use reconnect::{ReconnectPolicy, is_retryable_connect_error};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -90,6 +90,7 @@ pub(crate) struct NodeEditorState {
     pub(crate) server: String,
     pub(crate) sni: String,
     pub(crate) token: String,
+    pub(crate) protocol: NodeProtocol,
     pub(crate) game_dup: bool,
     pub(crate) insecure: bool,
     pub(crate) show_token: bool,
@@ -103,6 +104,7 @@ impl NodeEditorState {
             server: String::new(),
             sni: String::new(),
             token: String::new(),
+            protocol: NodeProtocol::Gacl,
             game_dup: true,
             insecure: false,
             show_token: true,
@@ -116,6 +118,7 @@ impl NodeEditorState {
             server: n.server.clone(),
             sni: n.sni.clone(),
             token: n.token.clone(),
+            protocol: n.protocol,
             game_dup: n.game_dup,
             insecure: n.insecure,
             show_token: false,
@@ -466,6 +469,7 @@ impl GameAccelApp {
             server_name: node.sni.trim().to_string(),
             listen,
             token: node.token.trim().to_string(),
+            protocol: node.protocol,
             game_dup: node.game_dup,
             enable_tun: self.cfg.proxy_mode == ProxyMode::Tun,
             insecure: node.insecure,
@@ -527,9 +531,15 @@ impl GameAccelApp {
         self.probes.insert(node.id.clone(), ProbeState::Probing);
         let ev_tx = self.event_tx.clone();
         self.rt.spawn(async move {
-            let res = probe_node_rtt(&server, node.sni.trim(), node.token.trim(), node.insecure)
-                .await
-                .map_err(|e| format!("{e:#}"));
+            let res = probe_node_rtt(
+                &server,
+                node.sni.trim(),
+                node.token.trim(),
+                node.insecure,
+                node.protocol,
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
             let _ = ev_tx.send(AsyncEvent::ProbeResult {
                 node_id: node.id,
                 result: res,

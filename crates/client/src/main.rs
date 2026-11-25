@@ -3,6 +3,7 @@ use clap::Parser;
 use client::rules::{RouteMode, RouteModeCell};
 use client::socks5::ClientStats;
 use client::{ClientOptions, run_client_with_shutdown};
+use protocol::share::NodeProtocol;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -23,6 +24,10 @@ struct Args {
     #[arg(short, long, default_value = "dev-secret-token")]
     token: String,
 
+    /// Transport protocol: gacl or hysteria2 (hy2)
+    #[arg(long, default_value = "gacl", value_parser = parse_protocol)]
+    protocol: NodeProtocol,
+
     #[arg(long, default_value_t = true)]
     game_dup: bool,
 
@@ -39,6 +44,14 @@ struct Args {
     /// Directory with direct-list.txt / proxy-list.txt / geoip-cn.txt overriding built-in rules
     #[arg(long)]
     rules_dir: Option<std::path::PathBuf>,
+}
+
+fn parse_protocol(s: &str) -> Result<NodeProtocol, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "gacl" => Ok(NodeProtocol::Gacl),
+        "hy2" | "hysteria2" => Ok(NodeProtocol::Hysteria2),
+        other => Err(format!("unknown protocol '{other}' (gacl|hy2|hysteria2)")),
+    }
 }
 
 fn parse_route_mode(s: &str) -> Result<RouteMode, String> {
@@ -69,6 +82,7 @@ async fn main() -> Result<()> {
             server_name: args.server_name,
             listen: args.listen,
             token: args.token,
+            protocol: args.protocol,
             game_dup: args.game_dup,
             enable_tun: args.tun,
             insecure: args.insecure,

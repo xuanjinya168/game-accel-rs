@@ -1016,6 +1016,7 @@ fn build_node_profile(cfg: &PanelConfig, link: &LinkRecord) -> NodeProfile {
         server: format!("{}:{}", cfg.public_host, cfg.udp_port),
         sni: cfg.sni.clone(),
         token: link.token.clone(),
+        protocol: protocol::share::NodeProtocol::Gacl,
         game_dup: link.game_dup,
         insecure: cfg.insecure,
         source: None,

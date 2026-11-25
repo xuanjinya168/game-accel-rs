@@ -18,7 +18,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, PointerButton, Pos2,
     RichText, ScrollArea, Sense, Stroke, Vec2,
 };
-use protocol::share::{NodeProfile, parse_import_text};
+use protocol::share::{NodeProfile, NodeProtocol, parse_import_text};
 use std::sync::atomic::Ordering;
 
 impl GameAccelApp {
@@ -1051,12 +1051,12 @@ impl GameAccelApp {
 
         ui.add_space(10.0);
 
-        // Panel A: Import gacl:// or JSON text
+        // Panel A: Import gacl:// / hysteria2:// or JSON text
         if self.import_panel_open {
             card_frame(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("粘贴 gacl:// 分享链接（支持多行）或订阅 JSON")
+                    RichText::new("粘贴 gacl:// / hysteria2:// 分享链接（支持多行）或订阅 JSON")
                         .size(FONT_BODY)
                         .strong()
                         .color(p.text_primary),
@@ -1065,7 +1065,7 @@ impl GameAccelApp {
                 styled_multiline(
                     ui,
                     &mut self.import_text,
-                    "gacl://your-token@node.example.com:8443?sni=node.example.com&dup=1#主力节点",
+                    "gacl://token@host:443?sni=host&dup=1#主力\nhysteria2://password@host:443/?sni=host#Hy2节点",
                     3,
                     p,
                 );
@@ -1100,7 +1100,7 @@ impl GameAccelApp {
             card_frame(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("订阅链接（支持后端管理面板下发的 JSON 或 gacl:// 列表）")
+                    RichText::new("订阅链接（支持管理面板 JSON、gacl:// 或 hysteria2:// 列表）")
                         .size(FONT_BODY)
                         .strong()
                         .color(p.text_primary),
@@ -1176,6 +1176,27 @@ impl GameAccelApp {
                     .num_columns(2)
                     .spacing([14.0, 8.0])
                     .show(ui, |ui| {
+                        ui.label(RichText::new("协议类型").size(FONT_BODY).color(p.text_secondary));
+                        ui.horizontal(|ui| {
+                            if accent_chip_btn(ui, "GACL", p, ed.protocol == NodeProtocol::Gacl)
+                                .clicked()
+                            {
+                                ed.protocol = NodeProtocol::Gacl;
+                            }
+                            if accent_chip_btn(
+                                ui,
+                                "Hysteria2",
+                                p,
+                                ed.protocol == NodeProtocol::Hysteria2,
+                            )
+                            .clicked()
+                            {
+                                ed.protocol = NodeProtocol::Hysteria2;
+                                ed.game_dup = false;
+                            }
+                        });
+                        ui.end_row();
+
                         ui.label(RichText::new("节点名称").size(FONT_BODY).color(p.text_secondary));
                         styled_input(ui, &mut ed.name, "例如：美西游戏专线", 300.0, false, p);
                         ui.end_row();
@@ -1227,13 +1248,15 @@ impl GameAccelApp {
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    icons::pill_toggle(ui, &mut ed.game_dup, p);
-                    ui.label(
-                        RichText::new("丢包自适应双发 (< 200B)")
-                            .size(FONT_BODY)
-                            .color(p.text_primary),
-                    );
-                    ui.add_space(16.0);
+                    if ed.protocol == NodeProtocol::Gacl {
+                        icons::pill_toggle(ui, &mut ed.game_dup, p);
+                        ui.label(
+                            RichText::new("丢包自适应双发 (< 200B)")
+                                .size(FONT_BODY)
+                                .color(p.text_primary),
+                        );
+                        ui.add_space(16.0);
+                    }
                     icons::pill_toggle(ui, &mut ed.insecure, p);
                     ui.label(
                         RichText::new("允许自签证书")
@@ -1258,7 +1281,8 @@ impl GameAccelApp {
                             server: ed.server.trim().to_string(),
                             sni: ed.sni.trim().to_string(),
                             token: ed.token.trim().to_string(),
-                            game_dup: ed.game_dup,
+                            protocol: ed.protocol,
+                            game_dup: ed.protocol == NodeProtocol::Gacl && ed.game_dup,
                             insecure: ed.insecure,
                             source: None,
                         });
@@ -1357,6 +1381,11 @@ impl GameAccelApp {
                                     .strong()
                                     .color(p.text_primary),
                             );
+                            if node.protocol == NodeProtocol::Hysteria2 {
+                                pill(ui, "HY2", p.accent_soft, p.accent);
+                            } else {
+                                pill(ui, "GACL", p.tag_bg, p.text_muted);
+                            }
 
                             if let Some(ps) = self.probes.get(&node.id) {
                                 match ps {
@@ -1428,7 +1457,7 @@ impl GameAccelApp {
                             if !node.insecure {
                                 meta.push_str("  ·  TLS 1.3");
                             }
-                            if node.game_dup {
+                            if node.protocol == NodeProtocol::Gacl && node.game_dup {
                                 meta.push_str("  ·  自适应双发");
                             }
                             ui.label(

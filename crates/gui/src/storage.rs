@@ -166,6 +166,7 @@ pub fn load_config() -> AppConfig {
             server: old.server_addr,
             sni: old.server_name,
             token: old.token,
+            protocol: protocol::share::NodeProtocol::Gacl,
             game_dup: old.game_dup,
             insecure: old.insecure,
             source: None,

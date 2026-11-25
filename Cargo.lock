@@ -549,6 +549,7 @@ dependencies = [
  "netstack-smoltcp",
  "protocol",
  "quinn",
+ "rcgen",
  "rustls",
  "serde",
  "socket2",

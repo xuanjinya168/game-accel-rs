@@ -10,6 +10,7 @@ use protocol::frame::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, FLAG_GAME_MODE, TargetAddr, UdpFrame,
 };
 use protocol::pacer::{UdpDupPacer, send_datagram_checked};
+use protocol::share::NodeProtocol;
 use quinn::Connection;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -99,6 +100,7 @@ pub async fn run_mixed_proxy_server(
     udp_conn: Connection,
     pacer: UdpDupPacer,
     udp_dispatch: UdpDispatchMap,
+    protocol: NodeProtocol,
     game_dup: bool,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -144,7 +146,8 @@ pub async fn run_mixed_proxy_server(
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
                     if let Err(e) = handle_mixed_client(
-                        stream, tcp_conn, udp_conn, pacer, dispatch, next_flow_id, game_dup, stats, router,
+                        stream, tcp_conn, udp_conn, pacer, dispatch, next_flow_id, protocol,
+                        game_dup, stats, router,
                     )
                     .await
                     {
@@ -165,6 +168,7 @@ async fn handle_mixed_client(
     pacer: UdpDupPacer,
     udp_dispatch: UdpDispatchMap,
     next_flow_id: Arc<AtomicU16>,
+    protocol: NodeProtocol,
     game_dup: bool,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -176,11 +180,20 @@ async fn handle_mixed_client(
     }
     if first[0] == 0x05 {
         handle_socks5_client(
-            stream, tcp_conn, udp_conn, pacer, udp_dispatch, next_flow_id, game_dup, stats, router,
+            stream,
+            tcp_conn,
+            udp_conn,
+            pacer,
+            udp_dispatch,
+            next_flow_id,
+            protocol,
+            game_dup,
+            stats,
+            router,
         )
         .await
     } else {
-        handle_http_proxy_client(stream, tcp_conn, stats, router).await
+        handle_http_proxy_client(stream, tcp_conn, protocol, stats, router).await
     }
 }
 
@@ -188,6 +201,7 @@ async fn handle_mixed_client(
 async fn handle_http_proxy_client(
     mut client: TcpStream,
     conn: Connection,
+    protocol: NodeProtocol,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
@@ -273,8 +287,7 @@ async fn handle_http_proxy_client(
         return relay_direct(&router, client, &target, ok_reply, &upstream_preamble, fail).await;
     }
 
-    let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
-    target.write_tcp_open(&mut quic_send).await?;
+    let (mut quic_send, quic_recv) = open_proxy_tcp_stream(&conn, protocol, &target).await?;
     // Fast-open: answer the client right away instead of waiting a full tunnel RTT for
     // the server's dial status; the first payload travels with the open request.
     if let Some(reply) = ok_reply {
@@ -286,7 +299,7 @@ async fn handle_http_proxy_client(
             .tx_bytes
             .fetch_add(upstream_preamble.len() as u64, Ordering::Relaxed);
     }
-    relay_fast_open(client, quic_send, quic_recv, stats, fail_reply).await
+    relay_fast_open(client, quic_send, quic_recv, protocol, stats, fail_reply).await
 }
 
 /// DIRECT outbound: dial `target` from this machine (pinned to physical NIC when TUN is
@@ -363,18 +376,90 @@ fn parse_http_url(url: &str) -> Result<(TargetAddr, String)> {
     Ok((target, path.to_string()))
 }
 
+/// Open a proxied TCP bidirectional QUIC stream and write the protocol-specific
+/// open header (`GACL` or Hysteria2 `0x401`).
+pub(crate) async fn open_proxy_tcp_stream(
+    conn: &Connection,
+    protocol: NodeProtocol,
+    target: &TargetAddr,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
+    match protocol {
+        NodeProtocol::Gacl => target.write_tcp_open(&mut quic_send).await?,
+        NodeProtocol::Hysteria2 => {
+            protocol::hy2::write_hy2_tcp_request(&mut quic_send, target, 0).await?;
+        }
+    }
+    Ok((quic_send, quic_recv))
+}
+
+/// Encode and send a proxied UDP packet on `conn` using either `GACL` (`UdpFrame` + optional
+/// game dual-send) or `Hysteria2` (with automatic fragmentation when larger than `max_dgram`).
+/// Returns `false` if the QUIC connection is closed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_proxy_udp_packet(
+    protocol: NodeProtocol,
+    conn: &Connection,
+    pacer: &UdpDupPacer,
+    flow_id: u16,
+    seq: u16,
+    is_game_pkt: bool,
+    dst: TargetAddr,
+    payload: Bytes,
+) -> bool {
+    match protocol {
+        NodeProtocol::Gacl => {
+            let flags = if is_game_pkt { FLAG_GAME_MODE } else { 0 };
+            let frame = UdpFrame {
+                flow_id,
+                seq,
+                flags,
+                addr: dst,
+                payload,
+            };
+            if let Ok(encoded) = frame.encode() {
+                if !send_datagram_checked(conn, encoded.clone()) {
+                    return false;
+                }
+                if is_game_pkt {
+                    pacer.schedule_dup(encoded);
+                }
+            }
+            true
+        }
+        NodeProtocol::Hysteria2 => {
+            let max_dgram = conn.max_datagram_size().unwrap_or(1150);
+            let addr_str = dst.to_host_port();
+            let pkts = protocol::hy2::encode_hy2_udp_datagrams(
+                flow_id as u32,
+                seq,
+                &addr_str,
+                &payload,
+                max_dgram,
+            );
+            for pkt in pkts {
+                if !send_datagram_checked(conn, pkt) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
 /// Fast-open TCP relay over an already-opened QUIC stream whose open header has been
 /// written but whose dial status has NOT been awaited.
 ///
 /// The local side was already told "connected", so the application's first bytes (TLS
 /// ClientHello, HTTP request) are pipelined behind the open header instead of waiting
-/// one full tunnel RTT for the server's status byte. The status byte is consumed at
+/// one full tunnel RTT for the server's status byte. The status header is consumed at
 /// the head of the downstream: on failure the local connection is closed (after an
-/// optional protocol-specific `fail_reply`). Wire-compatible with existing servers.
+/// optional protocol-specific `fail_reply`).
 pub(crate) async fn relay_fast_open<S>(
     stream: S,
     mut quic_send: quinn::SendStream,
     mut quic_recv: quinn::RecvStream,
+    protocol: NodeProtocol,
     stats: Arc<ClientStats>,
     fail_reply: Option<&'static [u8]>,
 ) -> Result<()>
@@ -392,7 +477,14 @@ where
 
     let stats_d = stats.clone();
     let d = tokio::spawn(async move {
-        let ok = matches!(quic_recv.read_u8().await, Ok(AUTH_OK));
+        let ok = match protocol {
+            NodeProtocol::Gacl => matches!(quic_recv.read_u8().await, Ok(AUTH_OK)),
+            NodeProtocol::Hysteria2 => {
+                protocol::hy2::read_hy2_tcp_response(&mut quic_recv)
+                    .await
+                    .is_ok()
+            }
+        };
         if ok {
             let _ =
                 protocol::io::copy_with_counter(&mut quic_recv, &mut s_write, &stats_d.rx_bytes).await;
@@ -426,6 +518,7 @@ async fn handle_socks5_client(
     pacer: UdpDupPacer,
     udp_dispatch: UdpDispatchMap,
     next_flow_id: Arc<AtomicU16>,
+    protocol: NodeProtocol,
     game_dup: bool,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -448,7 +541,7 @@ async fn handle_socks5_client(
     let target = read_socks5_addr(&mut client, req[3]).await?;
 
     match cmd {
-        0x01 => handle_tcp_connect(client, tcp_conn, target, stats, router).await,
+        0x01 => handle_tcp_connect(client, tcp_conn, protocol, target, stats, router).await,
         0x03 => {
             handle_udp_associate(
                 client,
@@ -456,6 +549,7 @@ async fn handle_socks5_client(
                 pacer,
                 udp_dispatch,
                 next_flow_id,
+                protocol,
                 game_dup,
                 stats,
                 router,
@@ -474,6 +568,7 @@ async fn handle_socks5_client(
 async fn handle_tcp_connect(
     mut client: TcpStream,
     conn: Connection,
+    protocol: NodeProtocol,
     target: TargetAddr,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -485,13 +580,12 @@ async fn handle_tcp_connect(
         return relay_direct(&router, client, &target, Some(SOCKS_OK), &[], Some(SOCKS_HOST_UNREACHABLE)).await;
     }
 
-    let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
-    target.write_tcp_open(&mut quic_send).await?;
+    let (quic_send, quic_recv) = open_proxy_tcp_stream(&conn, protocol, &target).await?;
 
     // Fast-open: report success immediately; the dial status is checked in the relay.
     client.write_all(SOCKS_OK).await?;
 
-    relay_fast_open(client, quic_send, quic_recv, stats, None)
+    relay_fast_open(client, quic_send, quic_recv, protocol, stats, None)
         .await
         .with_context(|| format!("tcp to {}", target.to_host_port()))
 }
@@ -503,6 +597,7 @@ async fn handle_udp_associate(
     pacer: UdpDupPacer,
     udp_dispatch: UdpDispatchMap,
     next_flow_id: Arc<AtomicU16>,
+    protocol: NodeProtocol,
     game_dup: bool,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -598,27 +693,24 @@ async fn handle_udp_associate(
 
             let cur_seq = seq;
             seq = seq.wrapping_add(1);
-            let flags = if game_dup { FLAG_GAME_MODE } else { 0 };
             let payload_len = payload.len();
+            let is_game_pkt = game_dup && payload_len < 200;
 
-            let frame = UdpFrame {
+            if !send_proxy_udp_packet(
+                protocol,
+                &conn_out,
+                &pacer,
                 flow_id,
-                seq: cur_seq,
-                flags,
-                addr: dst,
+                cur_seq,
+                is_game_pkt,
+                dst,
                 payload,
-            };
-            if let Ok(encoded) = frame.encode() {
-                if !send_datagram_checked(&conn_out, encoded.clone()) {
-                    break;
-                }
-                stats_tx
-                    .tx_bytes
-                    .fetch_add(payload_len as u64, Ordering::Relaxed);
-                if game_dup && payload_len < 200 {
-                    pacer.schedule_dup(encoded);
-                }
+            ) {
+                break;
             }
+            stats_tx
+                .tx_bytes
+                .fetch_add(payload_len as u64, Ordering::Relaxed);
         }
     });
 
@@ -628,7 +720,7 @@ async fn handle_udp_associate(
     let rx_task = tokio::spawn(async move {
         let mut dedup = DedupWindow::new();
         while let Some(frame) = rx.recv().await {
-            if !dedup.check_and_insert(frame.seq) {
+            if protocol == NodeProtocol::Gacl && !dedup.check_and_insert(frame.seq) {
                 continue;
             }
             let Some(peer) = *peer_addr_reader.read().await else {

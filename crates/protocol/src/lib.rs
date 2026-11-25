@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod dedup;
 pub mod frame;
+pub mod hy2;
 pub mod io;
 pub mod pacer;
 pub mod share;

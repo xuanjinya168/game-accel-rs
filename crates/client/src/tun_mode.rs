@@ -1,6 +1,7 @@
 use crate::rules::{DOMESTIC_DNS, DnsRoute, Route, RouteMode, Router};
 use crate::socks5::{
-    ClientStats, TUN_FLOW_MAX, TUN_FLOW_MIN, UdpDispatchMap, relay_fast_open, reserve_flow_id,
+    ClientStats, TUN_FLOW_MAX, TUN_FLOW_MIN, UdpDispatchMap, open_proxy_tcp_stream,
+    relay_fast_open, reserve_flow_id, send_proxy_udp_packet,
 };
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -9,8 +10,9 @@ use futures_util::{SinkExt, StreamExt};
 use netstack_smoltcp::StackBuilder;
 use protocol::TUN_MTU;
 use protocol::dedup::DedupWindow;
-use protocol::frame::{FLAG_GAME_MODE, TargetAddr, UdpFrame};
-use protocol::pacer::{UdpDupPacer, send_datagram_checked};
+use protocol::frame::{TargetAddr, UdpFrame};
+use protocol::pacer::UdpDupPacer;
+use protocol::share::NodeProtocol;
 use quinn::Connection;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Command;
@@ -277,6 +279,7 @@ pub async fn run_tun_mode(
     udp_conn: Connection,
     pacer: UdpDupPacer,
     udp_dispatch: UdpDispatchMap,
+    protocol: NodeProtocol,
     game_dup: bool,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -397,7 +400,7 @@ pub async fn run_tun_mode(
                 let stats = stats.clone();
                 let router = router.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_tun_tcp(stream, conn, stats, router).await {
+                    if let Err(e) = handle_tun_tcp(stream, conn, protocol, stats, router).await {
                         debug!("tun tcp ended: {:#}", e);
                     }
                 });
@@ -553,7 +556,7 @@ pub async fn run_tun_mode(
                     let rx_handle = tokio::spawn(async move {
                         let mut dedup = DedupWindow::new();
                         while let Some(frame) = f_rx.recv().await {
-                            if !dedup.check_and_insert(frame.seq) {
+                            if protocol == NodeProtocol::Gacl && !dedup.check_and_insert(frame.seq) {
                                 continue;
                             }
                             last_active_rx.store(now_secs(), Ordering::Relaxed);
@@ -592,27 +595,22 @@ pub async fn run_tun_mode(
                 // Enable game dual-send only for small non-DNS, non-QUIC-443 UDP packets
                 let is_game_pkt =
                     game_dup && payload_len < 200 && remote_dst.port() != 53 && remote_dst.port() != 443;
-                let flags = if is_game_pkt { FLAG_GAME_MODE } else { 0 };
 
-                let frame = UdpFrame {
-                    flow_id: session.flow_id,
+                if !send_proxy_udp_packet(
+                    protocol,
+                    &conn_out,
+                    &pacer_tx,
+                    session.flow_id,
                     seq,
-                    flags,
-                    addr: TargetAddr::Ip(remote_dst),
-                    payload: payload_bytes,
-                };
-                if let Ok(encoded) = frame.encode() {
-                    if !send_datagram_checked(&conn_out, encoded.clone()) {
-                        break;
-                    }
-                    stats_tx
-                        .tx_bytes
-                        .fetch_add(payload_len as u64, Ordering::Relaxed);
-
-                    if is_game_pkt {
-                        pacer_tx.schedule_dup(encoded);
-                    }
+                    is_game_pkt,
+                    TargetAddr::Ip(remote_dst),
+                    payload_bytes,
+                ) {
+                    break;
                 }
+                stats_tx
+                    .tx_bytes
+                    .fetch_add(payload_len as u64, Ordering::Relaxed);
             }
         });
 
@@ -668,6 +666,7 @@ pub async fn run_tun_mode(
 async fn handle_tun_tcp(
     mut stream: netstack_smoltcp::TcpStream,
     conn: Connection,
+    protocol: NodeProtocol,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
@@ -716,8 +715,8 @@ async fn handle_tun_tcp(
         return Ok(());
     }
 
-    let (mut quic_send, quic_recv) = conn.open_bi().await.context("open quic bi stream")?;
-    TargetAddr::Ip(dst).write_tcp_open(&mut quic_send).await?;
+    let (mut quic_send, quic_recv) =
+        open_proxy_tcp_stream(&conn, protocol, &TargetAddr::Ip(dst)).await?;
     if !first_chunk.is_empty() {
         quic_send.write_all(&first_chunk).await?;
         stats
@@ -727,7 +726,7 @@ async fn handle_tun_tcp(
 
     // Fast-open: the smoltcp handshake with the app is already complete, so start
     // relaying immediately; the server's dial status is checked inside the relay.
-    relay_fast_open(stream, quic_send, quic_recv, stats, None)
+    relay_fast_open(stream, quic_send, quic_recv, protocol, stats, None)
         .await
         .with_context(|| format!("tcp to {dst}"))
 }

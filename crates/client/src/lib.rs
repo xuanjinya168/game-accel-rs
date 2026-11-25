@@ -10,7 +10,12 @@ use anyhow::{Context, Result, bail};
 use dashmap::DashMap;
 use protocol::auth::{AUTH_OK, write_auth_request};
 use protocol::frame::UdpFrame;
+use protocol::hy2::{
+    Hy2UdpReassembler, decode_hy2_udp_message, encode_h3_control_stream, header_val,
+    parse_hy2_addr, read_h3_headers, write_h3_auth_request,
+};
 use protocol::pacer::UdpDupPacer;
+use protocol::share::NodeProtocol;
 use protocol::{
     ALPN_PROTOCOL, DATAGRAM_RECV_BUFFER, DATAGRAM_SEND_BUFFER, DEFAULT_INITIAL_MTU,
     KEEP_ALIVE_INTERVAL, MAX_IDLE_TIMEOUT,
@@ -35,6 +40,7 @@ pub struct ClientOptions {
     pub server_name: String,
     pub listen: SocketAddr,
     pub token: String,
+    pub protocol: NodeProtocol,
     pub game_dup: bool,
     pub enable_tun: bool,
     pub insecure: bool,
@@ -173,8 +179,11 @@ pub async fn run_client_with_shutdown(
     };
 
     emit(format!(
-        "正在建立双通道连接 quic://{} -> {} (SNI={}，TCP/UDP 拥塞隔离)...",
-        opts.server, server_addr, opts.server_name
+        "正在建立双通道连接 [{}] quic://{} -> {} (SNI={}，TCP/UDP 拥塞隔离)...",
+        opts.protocol.label(),
+        opts.server,
+        server_addr,
+        opts.server_name
     ));
 
     // Parallel Handshake + Auth for both lanes with 8s per-attempt timeout, instant cancel,
@@ -195,11 +204,23 @@ pub async fn run_client_with_shutdown(
         }
 
         let attempt_fut = async {
-            let (tcp_conn, udp_conn) = tokio::try_join!(
-                connect_and_auth(&tcp_endpoint, server_addr, &opts.server_name, &opts.token),
-                connect_and_auth(&udp_endpoint, server_addr, &opts.server_name, &opts.token),
+            let (tcp_authed, udp_authed) = tokio::try_join!(
+                connect_and_auth(
+                    &tcp_endpoint,
+                    server_addr,
+                    &opts.server_name,
+                    &opts.token,
+                    opts.protocol,
+                ),
+                connect_and_auth(
+                    &udp_endpoint,
+                    server_addr,
+                    &opts.server_name,
+                    &opts.token,
+                    opts.protocol,
+                ),
             )?;
-            Ok::<(quinn::Connection, quinn::Connection), anyhow::Error>((tcp_conn, udp_conn))
+            Ok::<(AuthedConn, AuthedConn), anyhow::Error>((tcp_authed, udp_authed))
         };
 
         let outcome = tokio::select! {
@@ -232,10 +253,14 @@ pub async fn run_client_with_shutdown(
         }
     }
 
-    let Some((tcp_conn, udp_conn)) = connected_pair else {
+    let Some((tcp_authed, udp_authed)) = connected_pair else {
         close_endpoints(&tcp_endpoint, &udp_endpoint, b"connect_failed");
         return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("连接失败")));
     };
+    let tcp_conn = tcp_authed.conn.clone();
+    let udp_conn = udp_authed.conn.clone();
+    // Keep HTTP/3 control streams & uni-stream drainers alive for the session lifetime.
+    let _authed_guards = (tcp_authed, udp_authed);
 
     if *shutdown_rx.borrow() {
         tcp_conn.close(0u32.into(), b"cancelled");
@@ -249,7 +274,8 @@ pub async fn run_client_with_shutdown(
         .rtt_ms
         .store(udp_conn.rtt().as_millis() as u64, Ordering::Relaxed);
     emit(format!(
-        "双通道已连接并认证成功 ({}，游戏 UDP 通道初始 RTT {} ms)",
+        "双通道已连接并认证成功 [{}] ({}，游戏 UDP 通道初始 RTT {} ms)",
+        opts.protocol.label(),
         server_addr,
         udp_conn.rtt().as_millis()
     ));
@@ -287,16 +313,42 @@ pub async fn run_client_with_shutdown(
     let udp_dispatch: UdpDispatchMap = Arc::new(DashMap::new());
     let dispatch_clone = udp_dispatch.clone();
     let dgram_conn = udp_conn.clone();
+    let dgram_proto = opts.protocol;
     let dgram_task = tokio::spawn(async move {
+        let mut hy2_reasm = Hy2UdpReassembler::default();
         loop {
             match dgram_conn.read_datagram().await {
-                Ok(raw) => match UdpFrame::decode(raw) {
-                    Ok(frame) => {
-                        if let Some(tx) = dispatch_clone.get(&frame.flow_id) {
-                            let _ = tx.try_send(frame);
+                Ok(raw) => match dgram_proto {
+                    NodeProtocol::Gacl => match UdpFrame::decode(raw) {
+                        Ok(frame) => {
+                            if let Some(tx) = dispatch_clone.get(&frame.flow_id) {
+                                let _ = tx.try_send(frame);
+                            }
                         }
-                    }
-                    Err(e) => warn!("invalid udp frame from server: {:#}", e),
+                        Err(e) => warn!("invalid udp frame from server: {:#}", e),
+                    },
+                    NodeProtocol::Hysteria2 => match decode_hy2_udp_message(&raw) {
+                        Ok(msg) => {
+                            if let Some((sid, pid, addr_str, payload)) = hy2_reasm.push(msg) {
+                                match parse_hy2_addr(&addr_str) {
+                                    Ok(addr) => {
+                                        let flow_id = sid as u16;
+                                        if let Some(tx) = dispatch_clone.get(&flow_id) {
+                                            let _ = tx.try_send(UdpFrame {
+                                                flow_id,
+                                                seq: pid,
+                                                flags: 0,
+                                                addr,
+                                                payload,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => warn!("invalid hy2 udp addr from server: {:#}", e),
+                                }
+                            }
+                        }
+                        Err(e) => warn!("invalid hy2 udp datagram from server: {:#}", e),
+                    },
                 },
                 Err(_) => break,
             }
@@ -330,7 +382,8 @@ pub async fn run_client_with_shutdown(
         let tun_log_tx = log_tx.clone();
         let tun_shutdown = shutdown_rx.clone();
         let tun_router = router.clone();
-        let game_dup = opts.game_dup;
+        let game_dup = opts.game_dup && opts.protocol == NodeProtocol::Gacl;
+        let tun_proto = opts.protocol;
         let tun_err_tx = log_tx.clone();
         Some(tokio::spawn(async move {
             let res = tun_mode::run_tun_mode(
@@ -339,6 +392,7 @@ pub async fn run_client_with_shutdown(
                 tun_udp_conn,
                 tun_pacer,
                 tun_dispatch,
+                tun_proto,
                 game_dup,
                 tun_stats,
                 tun_router,
@@ -365,7 +419,8 @@ pub async fn run_client_with_shutdown(
         udp_conn.clone(),
         pacer,
         udp_dispatch,
-        opts.game_dup,
+        opts.protocol,
+        opts.game_dup && opts.protocol == NodeProtocol::Gacl,
         stats.clone(),
         router,
         log_tx.clone(),
@@ -392,27 +447,89 @@ pub async fn run_client_with_shutdown(
     res
 }
 
+struct AuthedConn {
+    conn: quinn::Connection,
+    _h3_ctrl: Option<quinn::SendStream>,
+    _h3_uni_drain: Option<AbortOnDrop>,
+}
+
 async fn connect_and_auth(
     endpoint: &Endpoint,
     server: SocketAddr,
     server_name: &str,
     token: &str,
-) -> Result<quinn::Connection> {
+    protocol: NodeProtocol,
+) -> Result<AuthedConn> {
     let conn = endpoint
         .connect(server, server_name)?
         .await
         .context("QUIC 握手失败")?;
-    let (mut auth_send, mut auth_recv) = conn.open_bi().await.context("打开鉴权流失败")?;
-    write_auth_request(&mut auth_send, token)
-        .await
-        .context("发送鉴权请求失败")?;
-    let _ = auth_send.finish();
-    let resp = auth_recv.read_u8().await.context("读取鉴权响应失败")?;
-    if resp != AUTH_OK {
-        conn.close(0u32.into(), b"auth_failed");
-        bail!("{ERR_AUTH_REJECTED} (code={resp})");
+
+    match protocol {
+        NodeProtocol::Gacl => {
+            let (mut auth_send, mut auth_recv) =
+                conn.open_bi().await.context("打开鉴权流失败")?;
+            write_auth_request(&mut auth_send, token)
+                .await
+                .context("发送鉴权请求失败")?;
+            let _ = auth_send.finish();
+            let resp = auth_recv.read_u8().await.context("读取鉴权响应失败")?;
+            if resp != AUTH_OK {
+                conn.close(0u32.into(), b"auth_failed");
+                bail!("{ERR_AUTH_REJECTED} (code={resp})");
+            }
+            Ok(AuthedConn {
+                conn,
+                _h3_ctrl: None,
+                _h3_uni_drain: None,
+            })
+        }
+        NodeProtocol::Hysteria2 => {
+            // 1. Open HTTP/3 client control stream (empty SETTINGS) and keep it open.
+            let mut ctrl_send = conn.open_uni().await.context("打开 HTTP/3 控制流失败")?;
+            ctrl_send
+                .write_all(&encode_h3_control_stream())
+                .await
+                .context("发送 HTTP/3 SETTINGS 失败")?;
+
+            // Drain server's unidirectional HTTP/3 control / QPACK streams.
+            let uni_conn = conn.clone();
+            let uni_drain = AbortOnDrop(tokio::spawn(async move {
+                while let Ok(mut uni) = uni_conn.accept_uni().await {
+                    tokio::spawn(async move {
+                        let mut sink = [0u8; 512];
+                        while let Ok(Some(n)) = uni.read(&mut sink).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }));
+
+            // 2. Send HTTP/3 POST /auth with `hysteria-auth` header.
+            let (mut auth_send, mut auth_recv) =
+                conn.open_bi().await.context("打开 Hy2 鉴权流失败")?;
+            write_h3_auth_request(&mut auth_send, token, "game-accel-hy2-client")
+                .await
+                .context("发送 Hy2 鉴权请求失败")?;
+            let _ = auth_send.finish();
+
+            let headers = read_h3_headers(&mut auth_recv)
+                .await
+                .context("读取 Hy2 鉴权响应失败")?;
+            let status = header_val(&headers, ":status").unwrap_or("unknown");
+            if status != "233" {
+                conn.close(0u32.into(), b"auth_failed");
+                bail!("{ERR_AUTH_REJECTED} (Hy2 HTTP/3 status={status})");
+            }
+            Ok(AuthedConn {
+                conn,
+                _h3_ctrl: Some(ctrl_send),
+                _h3_uni_drain: Some(uni_drain),
+            })
+        }
     }
-    Ok(conn)
 }
 
 /// Probe a node with a real QUIC + token authentication handshake (4s timeout)
@@ -422,6 +539,7 @@ pub async fn probe_node_rtt(
     server_name: &str,
     token: &str,
     insecure: bool,
+    protocol: NodeProtocol,
 ) -> Result<u64> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client_config = build_client_config(insecure, true)?;
@@ -430,20 +548,11 @@ pub async fn probe_node_rtt(
         let server_addr = resolve_server_addr(server).await?;
         let mut endpoint = Endpoint::client(unspecified_bind_for(server_addr))?;
         endpoint.set_default_client_config(client_config);
-        let conn = endpoint
-            .connect(server_addr, server_name)?
-            .await
-            .context("QUIC handshake failed")?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_auth_request(&mut send, token).await?;
-        let _ = send.finish();
-        let resp = recv.read_u8().await.context("read auth response")?;
-        let rtt_ms = conn.rtt().as_millis() as u64;
-        conn.close(0u32.into(), b"probe_done");
+        let authed =
+            connect_and_auth(&endpoint, server_addr, server_name, token, protocol).await?;
+        let rtt_ms = authed.conn.rtt().as_millis() as u64;
+        authed.conn.close(0u32.into(), b"probe_done");
         endpoint.close(0u32.into(), b"probe_done");
-        if resp != AUTH_OK {
-            bail!("鉴权失败 (code={resp})");
-        }
         Ok::<u64, anyhow::Error>(rtt_ms)
     };
 
@@ -575,6 +684,7 @@ mod tests {
             server_name: "localhost".to_string(),
             listen: "127.0.0.1:0".parse().unwrap(),
             token: "t".to_string(),
+            protocol: NodeProtocol::Gacl,
             game_dup: false,
             enable_tun: false,
             insecure: true,
@@ -611,5 +721,217 @@ mod tests {
         let resolved = resolve_server_addr("localhost:8443").await.unwrap();
         assert_eq!(resolved.port(), 8443);
         assert!(resolved.ip().is_loopback());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hy2_client_end_to_end_auth_tcp_and_udp_loopback() {
+        use protocol::hy2::{
+            HY2_TCP_STREAM_TYPE, decode_hy2_udp_message, encode_hy2_udp_datagrams, read_varint,
+            write_h3_response,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // 1. Generate self-signed cert for local QUIC Hysteria2 test server
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+        );
+        let mut tls_srv = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        tls_srv.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        let quic_srv = quinn::crypto::rustls::QuicServerConfig::try_from(tls_srv).unwrap();
+        let mut srv_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_srv));
+        let mut transport = TransportConfig::default();
+        transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
+        srv_cfg.transport_config(Arc::new(transport));
+
+        let srv_ep =
+            Endpoint::server(srv_cfg, "127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let srv_addr = srv_ep.local_addr().unwrap();
+
+        // Spawn minimal Hysteria2 server handling Auth, 0x401 TCP echo, and UDP echo
+        let srv_task = tokio::spawn(async move {
+            while let Some(incoming) = srv_ep.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    let _ctrl = conn.open_uni().await.ok().map(|mut s| {
+                        let bytes = encode_h3_control_stream();
+                        tokio::spawn(async move {
+                            let _ = s.write_all(&bytes).await;
+                            std::future::pending::<()>().await;
+                        })
+                    });
+                    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                        return;
+                    };
+                    let Ok(headers) = read_h3_headers(&mut recv).await else {
+                        return;
+                    };
+                    let ok = header_val(&headers, ":method") == Some("POST")
+                        && header_val(&headers, ":path") == Some("/auth")
+                        && header_val(&headers, "hysteria-auth") == Some("hy2-test-token");
+                    if !ok {
+                        let _ = write_h3_response(&mut send, "404", &[]).await;
+                        let _ = send.finish();
+                        return;
+                    }
+                    let _ = write_h3_response(
+                        &mut send,
+                        "233",
+                        &[("hysteria-udp", "true"), ("hysteria-cc-rx", "auto")],
+                    )
+                    .await;
+                    let _ = send.finish();
+
+                    // UDP echo loop
+                    let udp_conn = conn.clone();
+                    let udp_task = tokio::spawn(async move {
+                        while let Ok(raw) = udp_conn.read_datagram().await {
+                            if let Ok(msg) = decode_hy2_udp_message(&raw) {
+                                let pkts = encode_hy2_udp_datagrams(
+                                    msg.session_id,
+                                    0, // intentionally 0 to verify client doesn't dedup-drop Hy2 replies
+                                    &msg.addr,
+                                    msg.data,
+                                    1150,
+                                );
+                                for p in pkts {
+                                    let _ = udp_conn.send_datagram(p);
+                                }
+                            }
+                        }
+                    });
+
+                    // TCP 0x401 echo loop
+                    while let Ok((mut ts, mut tr)) = conn.accept_bi().await {
+                        tokio::spawn(async move {
+                            if read_varint(&mut tr).await.ok() != Some(HY2_TCP_STREAM_TYPE) {
+                                return;
+                            }
+                            let Ok(alen) = read_varint(&mut tr).await else { return };
+                            let mut abuf = vec![0u8; alen as usize];
+                            if tr.read_exact(&mut abuf).await.is_err() {
+                                return;
+                            }
+                            let Ok(plen) = read_varint(&mut tr).await else { return };
+                            if plen > 0 {
+                                let mut pbuf = vec![0u8; plen as usize];
+                                if tr.read_exact(&mut pbuf).await.is_err() {
+                                    return;
+                                }
+                            }
+                            // TCPResponse OK: status=0, msg_len=0, pad_len=0
+                            if ts.write_all(&[0x00, 0x00, 0x00]).await.is_err() {
+                                return;
+                            }
+                            let mut buf = [0u8; 1024];
+                            while let Ok(Some(n)) = tr.read(&mut buf).await {
+                                if n == 0 || ts.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = ts.finish();
+                        });
+                    }
+                    udp_task.abort();
+                });
+            }
+        });
+
+        // 2. Probe valid & invalid tokens over Hysteria2
+        let srv_str = srv_addr.to_string();
+        probe_node_rtt(&srv_str, "localhost", "hy2-test-token", true, NodeProtocol::Hysteria2)
+            .await
+            .expect("valid hy2 probe should succeed");
+        let bad_err = probe_node_rtt(&srv_str, "localhost", "wrong-token", true, NodeProtocol::Hysteria2)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{bad_err:#}").contains(ERR_AUTH_REJECTED),
+            "expected ERR_AUTH_REJECTED, got: {bad_err:#}"
+        );
+
+        // 3. Start full client in Hysteria2 + Global mode and test SOCKS5 TCP + UDP echo
+        let free_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let stats = Arc::new(ClientStats::default());
+        let opts = ClientOptions {
+            server: srv_str,
+            server_name: "localhost".to_string(),
+            listen: free_port,
+            token: "hy2-test-token".to_string(),
+            protocol: NodeProtocol::Hysteria2,
+            game_dup: false,
+            enable_tun: false,
+            insecure: true,
+            route_mode: RouteModeCell::new(crate::rules::RouteMode::Global),
+            rules_dir: None,
+        };
+        let client_stats = stats.clone();
+        let client_task = tokio::spawn(run_client_with_shutdown(opts, client_stats, None, shut_rx));
+
+        // Wait until connected & listening
+        for _ in 0..40 {
+            if stats.connected.load(Ordering::Relaxed)
+                && tokio::net::TcpStream::connect(free_port).await.is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(stats.connected.load(Ordering::Relaxed));
+
+        // 3a. SOCKS5 TCP CONNECT -> echo through Hysteria2 0x401 stream
+        let mut s5 = tokio::net::TcpStream::connect(free_port).await.unwrap();
+        s5.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greet = [0u8; 2];
+        s5.read_exact(&mut greet).await.unwrap();
+        assert_eq!(greet, [0x05, 0x00]);
+        // CONNECT 1.1.1.1:80
+        s5.write_all(&[0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80]).await.unwrap();
+        let mut rep = [0u8; 10];
+        s5.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00);
+        s5.write_all(b"hello-hy2-tcp").await.unwrap();
+        let mut echo = [0u8; 13];
+        s5.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"hello-hy2-tcp");
+        drop(s5);
+
+        // 3b. SOCKS5 UDP ASSOCIATE -> send TWO packets (server replies with packet_id=0 for both)
+        let mut ctrl = tokio::net::TcpStream::connect(free_port).await.unwrap();
+        ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        ctrl.read_exact(&mut greet).await.unwrap();
+        ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        ctrl.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00);
+        let udp_relay = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(rep[4], rep[5], rep[6], rep[7])),
+            u16::from_be_bytes([rep[8], rep[9]]),
+        );
+        let local_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for msg in [b"hy2-udp-1", b"hy2-udp-2"] {
+            let mut pkt = vec![0x00, 0x00, 0x00, 0x01, 8, 8, 8, 8, 0, 53];
+            pkt.extend_from_slice(msg);
+            local_udp.send_to(&pkt, udp_relay).await.unwrap();
+            let mut rbuf = [0u8; 256];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(2), local_udp.recv_from(&mut rbuf))
+                .await
+                .expect("udp echo timeout")
+                .unwrap();
+            assert_eq!(&rbuf[10..n], msg);
+        }
+
+        let _ = shut_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_task).await;
+        srv_task.abort();
     }
 }
