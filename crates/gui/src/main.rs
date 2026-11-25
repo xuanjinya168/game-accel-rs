@@ -1420,8 +1420,8 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
-            .with_inner_size([960.0, 740.0])
-            .with_min_inner_size([820.0, 620.0])
+            .with_inner_size([1040.0, 800.0])
+            .with_min_inner_size([860.0, 660.0])
             .with_icon(Arc::new(build_app_icon())),
         centered: true,
         persist_window: false,
