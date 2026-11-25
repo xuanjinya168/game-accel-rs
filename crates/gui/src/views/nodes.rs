@@ -204,7 +204,7 @@ impl GameAccelApp {
                                 .color(p.text_primary),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if chip_btn(ui, "✕", p, false).clicked() {
+                            if chip_btn(ui, "×", p, false).clicked() {
                                 editor_cancel = true;
                             }
                         });
