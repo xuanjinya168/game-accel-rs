@@ -5,9 +5,10 @@
 ## 架构与特性
 
 ### 1. 传输与协议 (`crates/protocol`)
-- **QUIC 传输**：基于 `quinn` + `rustls` (TLS 1.3)，启用 BBR 拥塞控制与 `initial_mtu = 1200` 防止路径分片。
+- **QUIC 双协议传输**：基于 `quinn` + `rustls` (TLS 1.3)，同一 UDP 端口原生同时支持 `gacl://` 与标准 `hysteria2://` / `hy2://` 客户端，默认启用 BBR 拥塞控制与 `initial_mtu = 1200` 防止路径分片。
+- **可选 TCP 通道 Brutal 拥塞控制**：默认关闭（`0` = BBR），开启后仅作用于 TCP 通道（游戏 UDP 通道始终保持 BBR），内置 5 秒滑窗丢包补偿（2.5× 封顶）、基于 `min_rtt` 的排队保护及有界低窗口 ProbeRTT。
 - **游戏 UDP 通道**：通过 QUIC Datagram（RFC 9221）转发 UDP，单连接共享有界队列（`UdpDupPacer`）实时监测 QUIC 丢包率，链路健康时零冗余发包，检测到丢包（≥ 0.5%）时自动对 `< 200B` 游戏小包开启 2–5ms 抖动零拷贝双发，配合 256-bit 滑动窗口去重（支持乱序与 `u16` 回绕）。
-- **节点分享与订阅**：内置 `gacl://` 分享链接与订阅 JSON 编解码。
+- **节点分享与订阅**：内置 `gacl://` 与 `hysteria2://` / `hy2://` 分享链接（支持可选 `&brutal=<mbps>`）及订阅 JSON 编解码。
 
 ### 2. All-in-One 服务端 (`crates/server`)
 - **Full Cone NAT (NAT1)**：按 `flow_id` 同步创建独立 UDP Socket（并发首包无竞态），支持 60s 空闲回收。
@@ -40,5 +41,15 @@ cargo build --release -p game-accel-gui -p client
 cargo zigbuild --release -p server --target x86_64-unknown-linux-gnu.2.36
 ```
 
-### Linux VPS 部署
-支持使用 [`scripts/install.sh`](scripts/install.sh) 配置 `systemd` 服务与 `/usr/local/bin/gacl` 交互式运维菜单。
+### Linux VPS 一键部署
+先将你的域名 A 记录解析到 VPS 公网 IP，然后以 `root` 执行：
+
+```bash
+GACL_BIN_URL="https://github.com/xuanjinya168/game-accel-rs/releases/download/v0.2.1/game-accel-server-v0.2.1-linux-x86_64.tar.gz" \
+bash <(curl -fsSL https://raw.githubusercontent.com/xuanjinya168/game-accel-rs/main/scripts/install.sh)
+```
+
+脚本 [`scripts/install.sh`](scripts/install.sh) 会自动完成：
+- DNS 解析校验、Let's Encrypt 证书自动申请与续签（Certbot）
+- Nginx HTTPS + Hugo (PaperMod) 静态伪装博客 + HTTP/3 (`--masquerade-dir`) 伪装回落
+- `systemd` 服务配置与 `/usr/local/bin/gacl` 交互式运维菜单（随时运行 `gacl` 查看状态和分享链接）
