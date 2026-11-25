@@ -148,22 +148,26 @@ impl GameAccelApp {
                         ui.add_space(4.0);
                         for sub in &subs {
                             ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(format!(
-                                            "{} · {} (更新: {})",
-                                            sub.name,
-                                            sub.url,
-                                            sub.last_updated.as_deref().unwrap_or("-")
-                                        ))
-                                        .size(FONT_SM)
-                                        .color(p.text_secondary),
-                                    )
-                                    .truncate(),
-                                );
-                                if chip_btn(ui, "刷新", p, false).clicked() {
-                                    fetch_url = Some(sub.url.clone());
-                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if chip_btn(ui, "刷新", p, false).clicked() {
+                                        fetch_url = Some(sub.url.clone());
+                                    }
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!(
+                                                    "{} · {} (更新: {})",
+                                                    sub.name,
+                                                    sub.url,
+                                                    sub.last_updated.as_deref().unwrap_or("-")
+                                                ))
+                                                .size(FONT_SM)
+                                                .color(p.text_secondary),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                });
                             });
                         }
                     }

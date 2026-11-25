@@ -70,10 +70,12 @@ impl GameAccelApp {
                         }
                         if chip_btn(ui, "+ 添加", p, false).clicked() {
                             self.admin.server_editor = Some(AdminServerEditor::new_blank());
+                            self.admin.link_editor = None;
                         }
                         if chip_btn(ui, "编辑", p, false).clicked() {
                             self.admin.server_editor =
                                 Some(AdminServerEditor::from_profile(&active_srv));
+                            self.admin.link_editor = None;
                         }
                     });
                 },
@@ -387,6 +389,7 @@ impl GameAccelApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if primary_btn(ui, "+ 新建链接", p).clicked() {
                         self.admin.link_editor = Some(AdminLinkEditor::new_blank());
+                        self.admin.server_editor = None;
                     }
                 });
             });
@@ -625,6 +628,7 @@ impl GameAccelApp {
                                 }
                                 if chip_btn(ui, "编辑", p, false).clicked() {
                                     self.admin.link_editor = Some(AdminLinkEditor::from_link(l));
+                                    self.admin.server_editor = None;
                                 }
 
                                 let confirm_reset = self.admin.confirm_action.as_ref()
