@@ -10,6 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const HY2_TCP_STREAM_TYPE: u64 = 0x401;
+pub const H3_FRAME_DATA: u64 = 0x00;
 pub const H3_FRAME_HEADERS: u64 = 0x01;
 pub const H3_FRAME_SETTINGS: u64 = 0x04;
 pub const H3_STREAM_CONTROL: u8 = 0x00;
@@ -352,6 +353,24 @@ pub async fn write_h3_auth_request<W: AsyncWrite + Unpin>(
     encode_varint(block.len() as u64, &mut frame);
     frame.put_slice(&block);
     w.write_all(&frame).await?;
+    Ok(())
+}
+
+/// Write an HTTP/3 HEADERS response frame, optionally followed by a DATA frame when `body` is non-empty.
+pub async fn write_h3_response_with_body<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    status: &str,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<()> {
+    write_h3_response(w, status, extra_headers).await?;
+    if !body.is_empty() {
+        let mut frame = BytesMut::with_capacity(16);
+        encode_varint(H3_FRAME_DATA, &mut frame);
+        encode_varint(body.len() as u64, &mut frame);
+        w.write_all(&frame).await?;
+        w.write_all(body).await?;
+    }
     Ok(())
 }
 

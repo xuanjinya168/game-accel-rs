@@ -187,13 +187,23 @@ main() {
   fi
 
   CERT_ARGS=""
-  if [[ "$SNI_DOMAIN" != "localhost" && -f "/root/cert/${SNI_DOMAIN}/fullchain.pem" && -f "/root/cert/${SNI_DOMAIN}/privkey.pem" ]]; then
+  if [[ "$SNI_DOMAIN" != "localhost" && -f "/etc/letsencrypt/live/${SNI_DOMAIN}/fullchain.pem" && -f "/etc/letsencrypt/live/${SNI_DOMAIN}/privkey.pem" ]]; then
+    ok "自动发现 Let's Encrypt 证书: /etc/letsencrypt/live/${SNI_DOMAIN}/"
+    CERT_ARGS="--cert /etc/letsencrypt/live/${SNI_DOMAIN}/fullchain.pem --key /etc/letsencrypt/live/${SNI_DOMAIN}/privkey.pem"
+  elif [[ "$SNI_DOMAIN" != "localhost" && -f "/root/cert/${SNI_DOMAIN}/fullchain.pem" && -f "/root/cert/${SNI_DOMAIN}/privkey.pem" ]]; then
     ok "自动发现正规证书: /root/cert/${SNI_DOMAIN}/"
     CERT_ARGS="--cert /root/cert/${SNI_DOMAIN}/fullchain.pem --key /root/cert/${SNI_DOMAIN}/privkey.pem"
   elif [[ -n "${GACL_CERT:-}" && -n "${GACL_KEY:-}" ]]; then
     CERT_ARGS="--cert ${GACL_CERT} --key ${GACL_KEY}"
   else
     warn "未发现 ${SNI_DOMAIN} 的 PEM 证书，将使用自签测试证书（后续可在 systemd 配置 --cert/--key）"
+  fi
+
+  MASQ_ARGS=""
+  if [[ -n "${GACL_MASQUERADE_DIR:-}" && -d "${GACL_MASQUERADE_DIR}" ]]; then
+    MASQ_ARGS="--masquerade-dir ${GACL_MASQUERADE_DIR}"
+  elif [[ -d "/var/www/goldpeak" ]]; then
+    MASQ_ARGS="--masquerade-dir /var/www/goldpeak"
   fi
 
   SEED_TOKEN="${GACL_TOKEN:-$(rand_str 24)}"
@@ -210,7 +220,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${BIN_PATH} --listen 0.0.0.0:${UDP_PORT} --panel-listen 127.0.0.1:${PANEL_PORT} --data-file ${DATA_FILE} --public-host ${PUBLIC_HOST} --sni ${SNI_DOMAIN} --token ${SEED_TOKEN} ${PANEL_PASS_ARG} ${CERT_ARGS}
+ExecStart=${BIN_PATH} --listen 0.0.0.0:${UDP_PORT} --panel-listen 127.0.0.1:${PANEL_PORT} --data-file ${DATA_FILE} --public-host ${PUBLIC_HOST} --sni ${SNI_DOMAIN} --token ${SEED_TOKEN} ${PANEL_PASS_ARG} ${CERT_ARGS} ${MASQ_ARGS}
 Restart=always
 RestartSec=3
 LimitNOFILE=65535

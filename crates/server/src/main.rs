@@ -75,6 +75,10 @@ struct Args {
     /// Self-signed cert SAN domain when --cert/--key are omitted
     #[arg(long, default_value = "localhost")]
     dev_domain: String,
+
+    /// Optional static web root directory served over HTTP/3 to unauthenticated probes/browsers
+    #[arg(long)]
+    masquerade_dir: Option<PathBuf>,
 }
 
 const INTERNAL_PANEL_HOST: &str = "panel.gacl.local";
@@ -207,17 +211,24 @@ async fn main() -> Result<()> {
         udp_sock,
         Arc::new(quinn::TokioRuntime),
     )?;
+    let masquerade_dir = args.masquerade_dir.map(Arc::new);
+    if let Some(dir) = &masquerade_dir {
+        info!("HTTP/3 static masquerade enabled from {:?}", dir);
+    }
     info!("QUIC server listening on udp://{}", args.listen);
 
     while let Some(incoming) = endpoint.accept().await {
         let state = state.clone();
         let panel_route = panel_route.clone();
+        let masquerade_dir = masquerade_dir.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     let remote = conn.remote_address();
                     info!("new QUIC connection from {}", remote);
-                    if let Err(e) = handle_connection(conn, state, panel_route).await {
+                    if let Err(e) =
+                        handle_connection(conn, state, panel_route, masquerade_dir).await
+                    {
                         warn!("connection {} closed: {:#}", remote, e);
                     }
                 }
@@ -316,6 +327,7 @@ async fn handle_connection(
     conn: quinn::Connection,
     state: Arc<AppState>,
     panel_route: Option<Arc<PanelRoute>>,
+    masquerade_dir: Option<Arc<PathBuf>>,
 ) -> Result<()> {
     let (mut auth_send, mut auth_recv) = conn.accept_bi().await.context("accept auth stream")?;
     let mut first_four = [0u8; 4];
@@ -326,7 +338,7 @@ async fn handle_connection(
 
     // Dual-protocol dispatch on the same QUIC/ALPN-h3 port:
     // - `GACL` prefix => native game-accel-rs client
-    // - anything else => HTTP/3 Hysteria2 auth (Shadowrocket / Clash / sing-box)
+    // - anything else => HTTP/3 Hysteria2 auth (Shadowrocket / Clash / sing-box) or HTTP/3 masquerade
     if &first_four != AUTH_MAGIC {
         return hy2::handle_hy2_connection(
             conn,
@@ -335,6 +347,7 @@ async fn handle_connection(
             auth_recv,
             state,
             panel_route,
+            masquerade_dir,
         )
         .await;
     }
@@ -672,7 +685,7 @@ mod tests {
         tokio::spawn(async move {
             if let Some(inc) = ep_bg.accept().await {
                 if let Ok(conn) = inc.await {
-                    let _ = handle_connection(conn, st_bg, None).await;
+                    let _ = handle_connection(conn, st_bg, None, None).await;
                 }
             }
         });
@@ -774,7 +787,7 @@ mod tests {
             if let Some(inc) = ep_bg.accept().await
                 && let Ok(conn) = inc.await
             {
-                let _ = handle_connection(conn, st_bg, None).await;
+                let _ = handle_connection(conn, st_bg, None, None).await;
             }
         });
 
