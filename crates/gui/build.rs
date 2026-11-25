@@ -1,14 +1,15 @@
 fn main() {
     #[cfg(target_os = "windows")]
     {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let manifest_path = std::path::Path::new(&manifest_dir).join("app.manifest");
         println!("cargo:rerun-if-changed=app.manifest");
-        println!("cargo:rustc-link-arg-bin=game-accel=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-bin=game-accel=/MANIFESTUAC:NO");
-        println!(
-            "cargo:rustc-link-arg-bin=game-accel=/MANIFESTINPUT:{}",
-            manifest_path.display()
-        );
+        println!("cargo:rerun-if-changed=assets/app.ico");
+
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/app.ico");
+        res.set_manifest_file("app.manifest");
+        res.set("ProductName", "GameAccel");
+        res.set("FileDescription", "GameAccel QUIC/UDP Accelerator");
+        res.set("LegalCopyright", "Copyright (c) GameAccel");
+        res.compile().expect("failed to compile Windows resources");
     }
 }

@@ -28,6 +28,7 @@ WizardStyle=modern
 CloseApplications=yes
 OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseName}
+SetupIconFile=..\..\crates\gui\assets\app.ico
 UninstallDisplayIcon={app}\game-accel.exe
 
 [Languages]
