@@ -124,20 +124,22 @@ impl GameAccelApp {
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let w = (ui.available_width() - 106.0).max(200.0);
-                        styled_input(
-                            ui,
-                            &mut self.sub_url_input,
-                            "https://panel.example.com:9090/sub/your-token",
-                            w,
-                            false,
-                            p,
-                        );
-                        ui.add_enabled_ui(!sub_loading, |ui| {
-                            let lbl = if sub_loading { "拉取中..." } else { "拉取订阅" };
-                            if primary_btn(ui, lbl, p).clicked() {
-                                fetch_url = Some(self.sub_url_input.clone());
-                            }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_enabled_ui(!sub_loading, |ui| {
+                                let lbl = if sub_loading { "拉取中..." } else { "拉取订阅" };
+                                if primary_btn(ui, lbl, p).clicked() {
+                                    fetch_url = Some(self.sub_url_input.clone());
+                                }
+                            });
+                            let w = ui.available_width().max(200.0);
+                            styled_input(
+                                ui,
+                                &mut self.sub_url_input,
+                                "https://panel.example.com:9090/sub/your-token",
+                                w,
+                                false,
+                                p,
+                            );
                         });
                     });
                     if !subs.is_empty() {
