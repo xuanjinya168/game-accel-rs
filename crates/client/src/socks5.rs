@@ -235,20 +235,16 @@ async fn handle_http_proxy_client(
 
     // `ok_reply` is written to the local client once the upstream path is ready;
     // `upstream_preamble` is the first bytes to send upstream (rebuilt request + body).
-    let (target, ok_reply, upstream_preamble, fail_reply): (
-        TargetAddr,
-        Option<&'static [u8]>,
-        Vec<u8>,
-        Option<&'static [u8]>,
-    ) = if method.eq_ignore_ascii_case("CONNECT") {
-        (
-            parse_host_port(raw_target, 443)?,
-            Some(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
-            leftover.to_vec(),
-            // After 200 was sent (proxy fast-open) there is no way to report an error.
-            None,
-        )
-    } else {
+    let (target, ok_reply, upstream_preamble, fail_reply) =
+        if method.eq_ignore_ascii_case("CONNECT") {
+            (
+                parse_host_port(raw_target, 443)?,
+                Some(&b"HTTP/1.1 200 Connection Established\r\n\r\n"[..]),
+                leftover.to_vec(),
+                // After 200 was sent (proxy fast-open) there is no way to report an error.
+                None,
+            )
+        } else {
         // Plain HTTP proxy request: e.g. GET http://example.com/path HTTP/1.1
         let (target, path) = parse_http_url(raw_target)?;
         let mut rebuilt = String::with_capacity(header_str.len() + 32);
@@ -683,11 +679,10 @@ async fn handle_udp_associate(
                         .filter(IpAddr::is_ipv4)
                         .map(|ip| SocketAddr::new(ip, *p)),
                 };
-                if let (Some((s, _)), Some(a)) = (&direct, dst_addr) {
-                    if let Err(e) = s.send_to(&payload, a).await {
+                if let (Some((s, _)), Some(a)) = (&direct, dst_addr)
+                    && let Err(e) = s.send_to(&payload, a).await {
                         debug!("direct udp send to {a} failed: {e}");
                     }
-                }
                 continue;
             }
 

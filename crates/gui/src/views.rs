@@ -690,13 +690,10 @@ impl GameAccelApp {
                         self.node_picker_open = false;
                     } else if !trigger_clicked
                         && ui.ctx().input(|i| i.pointer.any_pressed())
-                    {
-                        if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
-                            if !area_resp.rect.contains(pos) && !pill_rect.contains(pos) {
+                        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+                            && !area_resp.rect.contains(pos) && !pill_rect.contains(pos) {
                                 self.node_picker_open = false;
                             }
-                        }
-                    }
                 }
             });
 

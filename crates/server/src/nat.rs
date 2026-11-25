@@ -1,4 +1,3 @@
-use crate::sniff::extract_root_domain;
 use crate::store::{AppState, LiveCounters};
 use anyhow::Result;
 use bytes::Bytes;
@@ -6,12 +5,14 @@ use dashmap::DashMap;
 use protocol::dedup::DedupWindow;
 use protocol::frame::{FLAG_GAME_MODE, TargetAddr, UdpFrame};
 use protocol::pacer::{UdpDupPacer, send_datagram_checked};
+use protocol::sniff::extract_root_domain;
+use protocol::unix_now_secs as now_secs;
 use quinn::Connection;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -42,13 +43,6 @@ pub(crate) fn bind_nat_socket() -> std::io::Result<(std::net::UdpSocket, bool)> 
     }
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 struct NatMeta {
     last_active: AtomicU64,
     game_mode: AtomicBool,
@@ -68,11 +62,10 @@ struct NatEntry {
 
 impl Drop for NatEntry {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.recv_task.lock() {
-            if let Some(h) = guard.take() {
+        if let Ok(mut guard) = self.recv_task.lock()
+            && let Some(h) = guard.take() {
                 h.abort();
             }
-        }
     }
 }
 

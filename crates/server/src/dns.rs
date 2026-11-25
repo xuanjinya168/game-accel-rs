@@ -20,7 +20,9 @@ const CACHE_MAX_ENTRIES: usize = 8192;
 /// IP cannot consume the whole connect timeout before healthy ones are tried.
 const MIN_PER_ADDR_BUDGET: Duration = Duration::from_secs(2);
 
-static CACHE: LazyLock<DashMap<String, (Arc<[IpAddr]>, Instant)>> = LazyLock::new(DashMap::new);
+type DnsCache = DashMap<String, (Arc<[IpAddr]>, Instant)>;
+
+static CACHE: LazyLock<DnsCache> = LazyLock::new(DashMap::new);
 
 /// Resolve `host:port`, serving fresh answers from the cache.
 pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
@@ -29,11 +31,10 @@ pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let key = host.to_ascii_lowercase();
-    if let Some(hit) = CACHE.get(&key) {
-        if hit.1.elapsed() < CACHE_TTL {
+    if let Some(hit) = CACHE.get(&key)
+        && hit.1.elapsed() < CACHE_TTL {
             return Ok(hit.0.iter().map(|ip| SocketAddr::new(*ip, port)).collect());
         }
-    }
 
     let mut ips: Vec<IpAddr> = Vec::new();
     for addr in tokio::net::lookup_host((key.as_str(), 0)).await? {

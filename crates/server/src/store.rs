@@ -66,7 +66,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);
@@ -330,11 +330,10 @@ impl AppState {
             // Sync runtime CLI udp_port & insecure mode if changed
             cfg.udp_port = params.udp_port;
             cfg.insecure = params.insecure;
-            if let Some(pass) = params.initial_panel_pass {
-                if !pass.is_empty() {
+            if let Some(pass) = params.initial_panel_pass
+                && !pass.is_empty() {
                     cfg.admin_pass = hash_password(&pass);
                 }
-            }
             // Transparently migrate legacy plaintext admin_pass to salted PBKDF2-HMAC-SHA256
             if !cfg.admin_pass.starts_with(PBKDF2_PREFIX) {
                 cfg.admin_pass = hash_password(&cfg.admin_pass);
@@ -417,11 +416,10 @@ impl AppState {
             cfg.clone()
         };
 
-        if let Some(parent) = self.data_path.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = self.data_path.parent()
+            && !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
-        }
         let tmp = self.data_path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(&snapshot)?;
         std::fs::write(&tmp, text)?;
@@ -498,12 +496,11 @@ impl AppState {
 
         // Persist compact line to rotating access.log (10 MB cap)
         if let Ok(_guard) = self.log_file_lock.lock() {
-            if let Ok(meta) = std::fs::metadata(&self.access_log_path) {
-                if meta.len() >= MAX_ACCESS_LOG_FILE_BYTES {
+            if let Ok(meta) = std::fs::metadata(&self.access_log_path)
+                && meta.len() >= MAX_ACCESS_LOG_FILE_BYTES {
                     let old = self.access_log_path.with_extension("log.old");
                     let _ = std::fs::rename(&self.access_log_path, old);
                 }
-            }
             if let Ok(mut f) = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -533,16 +530,14 @@ impl AppState {
             .iter()
             .rev()
             .filter(|e| {
-                if let Some(id) = lid {
-                    if e.link_id != id {
+                if let Some(id) = lid
+                    && e.link_id != id {
                         return false;
                     }
-                }
-                if let Some(p) = &pr {
-                    if e.proto != *p {
+                if let Some(p) = &pr
+                    && e.proto != *p {
                         return false;
                     }
-                }
                 if let Some(q) = &kw {
                     let hit = e.root_domain.to_ascii_lowercase().contains(q)
                         || e.target.to_ascii_lowercase().contains(q)
@@ -590,11 +585,10 @@ impl AppState {
     }
 
     pub fn verify_session(&self, sid: &str) -> bool {
-        if let Some(ts) = self.sessions.get(sid) {
-            if ts.elapsed() < SESSION_TTL {
+        if let Some(ts) = self.sessions.get(sid)
+            && ts.elapsed() < SESSION_TTL {
                 return true;
             }
-        }
         self.sessions.remove(sid);
         false
     }
@@ -828,11 +822,10 @@ impl AppState {
             self.to_link_view(&cfg, &cloned)
         };
 
-        if kick_needed {
-            if let Some(c) = self.live.get(id) {
+        if kick_needed
+            && let Some(c) = self.live.get(id) {
                 c.kick_all();
             }
-        }
         self.sync_and_save()?;
         Ok(view)
     }
@@ -977,43 +970,22 @@ impl AppState {
     }
 }
 
-fn percent_encode_uri(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+fn build_hy2_uri(cfg: &PanelConfig, link: &LinkRecord) -> String {
+    let mut node = build_node_profile(cfg, link);
+    node.protocol = protocol::share::NodeProtocol::Hysteria2;
+    node.to_share_uri()
 }
 
-fn build_hy2_uri(cfg: &PanelConfig, link: &LinkRecord) -> String {
+fn build_node_profile(cfg: &PanelConfig, link: &LinkRecord) -> NodeProfile {
     let host = if cfg.public_host.contains(':') && !cfg.public_host.starts_with('[') {
         format!("[{}]", cfg.public_host)
     } else {
         cfg.public_host.clone()
     };
-    let sni = percent_encode_uri(&cfg.sni);
-    let name = percent_encode_uri(&link.name);
-    let insecure = if cfg.insecure { 1 } else { 0 };
-    format!(
-        "hysteria2://{}@{}:{}/?sni={}&insecure={}#{}",
-        percent_encode_uri(&link.token),
-        host,
-        cfg.udp_port,
-        sni,
-        insecure,
-        name
-    )
-}
-
-fn build_node_profile(cfg: &PanelConfig, link: &LinkRecord) -> NodeProfile {
     NodeProfile {
         id: link.id.clone(),
         name: link.name.clone(),
-        server: format!("{}:{}", cfg.public_host, cfg.udp_port),
+        server: format!("{host}:{}", cfg.udp_port),
         sni: cfg.sni.clone(),
         token: link.token.clone(),
         protocol: protocol::share::NodeProtocol::Gacl,

@@ -37,11 +37,10 @@ impl DirectDialer {
         } else {
             TcpSocket::new_v6()?
         };
-        if addr.is_ipv4() && !addr.ip().is_loopback() {
-            if let Some(idx) = self.interface() {
+        if addr.is_ipv4() && !addr.ip().is_loopback()
+            && let Some(idx) = self.interface() {
                 pin_v4(&sock, idx)?;
             }
-        }
         let stream = sock.connect(addr).await?;
         let _ = stream.set_nodelay(true);
         Ok(stream)

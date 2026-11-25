@@ -6,7 +6,6 @@
 
 use crate::dns;
 use crate::nat::bind_nat_socket;
-use crate::sniff::{extract_root_domain, sniff_first_packet};
 use crate::store::{AppState, AuthTicket, LiveCounters, generate_random_str};
 use crate::{PanelRoute, TCP_CONNECT_TIMEOUT};
 use anyhow::{Context, Result, bail};
@@ -21,25 +20,20 @@ use protocol::hy2::{
 #[cfg(test)]
 pub(crate) use protocol::hy2::encode_varint;
 pub(crate) use protocol::hy2::read_varint;
+use protocol::sniff::{extract_root_domain, sniff_first_packet};
+use protocol::unix_now_secs as now_secs;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 const HY2_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 /// Reader that yields a small already-peeked prefix before delegating to `inner`.
 struct PrefixedReader<R> {
@@ -116,7 +110,7 @@ pub(crate) async fn handle_hy2_connection(
     let headers = match read_h3_headers(&mut reader).await {
         Ok(h) => h,
         Err(e) => {
-            let _ = serve_masquerade_h3(&mut auth_send, "GET", "/404", masquerade_dir.as_deref()).await;
+            let _ = serve_masquerade_h3(&mut auth_send, "GET", "/404", masquerade_dir.as_deref().map(PathBuf::as_path)).await;
             let _ = auth_send.finish();
             uni_task.abort();
             return Err(e).context("decode Hysteria2 HTTP/3 auth request");
@@ -129,7 +123,7 @@ pub(crate) async fn handle_hy2_connection(
     let client_ip = conn.remote_address().ip().to_string();
 
     if !method.eq_ignore_ascii_case("POST") || path != "/auth" || auth_token.is_empty() {
-        let _ = serve_masquerade_h3(&mut auth_send, method, path, masquerade_dir.as_deref()).await;
+        let _ = serve_masquerade_h3(&mut auth_send, method, path, masquerade_dir.as_deref().map(PathBuf::as_path)).await;
         let _ = auth_send.finish();
         // Serve follow-up HTTP/3 asset requests (CSS/JS/images) on this same QUIC connection
         // so real browsers / HTTP/3 probes see a complete working website.
@@ -143,7 +137,7 @@ pub(crate) async fn handle_hy2_connection(
     let ticket = match state.authenticate_token(auth_token) {
         Ok(t) => t,
         Err(e) => {
-            let _ = serve_masquerade_h3(&mut auth_send, "POST", "/auth", masquerade_dir.as_deref()).await;
+            let _ = serve_masquerade_h3(&mut auth_send, "POST", "/auth", masquerade_dir.as_deref().map(PathBuf::as_path)).await;
             let _ = auth_send.finish();
             state.record_access_log(
                 "",
@@ -247,7 +241,7 @@ async fn serve_masquerade_h3(
     send: &mut quinn::SendStream,
     method: &str,
     path: &str,
-    masquerade_dir: Option<&PathBuf>,
+    masquerade_dir: Option<&Path>,
 ) -> Result<()> {
     let is_head = method.eq_ignore_ascii_case("HEAD");
     let allow_file = method.eq_ignore_ascii_case("GET") || is_head;
@@ -295,7 +289,7 @@ async fn serve_masquerade_h3(
     .await
 }
 
-async fn serve_masquerade_followup(conn: &quinn::Connection, root: &PathBuf) {
+async fn serve_masquerade_followup(conn: &quinn::Connection, root: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     for _ in 0..32 {
         let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
@@ -304,12 +298,12 @@ async fn serve_masquerade_followup(conn: &quinn::Connection, root: &PathBuf) {
         let Ok(Ok((mut send, mut recv))) = tokio::time::timeout(rem, conn.accept_bi()).await else {
             break;
         };
-        let root_clone = root.clone();
+        let root_clone = root.to_path_buf();
         tokio::spawn(async move {
             if let Ok(headers) = read_h3_headers(&mut recv).await {
                 let method = header_val(&headers, ":method").unwrap_or("GET");
                 let path = header_val(&headers, ":path").unwrap_or("/");
-                let _ = serve_masquerade_h3(&mut send, method, path, Some(&root_clone)).await;
+                let _ = serve_masquerade_h3(&mut send, method, path, Some(root_clone.as_path())).await;
             }
             let _ = send.finish();
         });
@@ -764,7 +758,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "gacl-masq-test-{}",
             std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));

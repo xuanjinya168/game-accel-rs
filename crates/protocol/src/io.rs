@@ -67,7 +67,7 @@ mod tests {
 
         // Drop destination reader to force a write error on next chunk (simulating TCP RST)
         drop(dst_r);
-        let _ = src_w.write_all(&vec![b'B'; 200]).await;
+        let _ = src_w.write_all(&[b'B'; 200]).await;
         drop(src_w);
 
         let total = copy_task.await.unwrap();

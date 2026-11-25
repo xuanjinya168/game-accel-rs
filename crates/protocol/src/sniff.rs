@@ -105,14 +105,13 @@ fn parse_tls_sni(data: &[u8]) -> Option<String> {
                 if p + name_len > end {
                     break;
                 }
-                if name_type == 0x00 {
-                    if let Ok(sni) = std::str::from_utf8(&payload[p..p + name_len]) {
+                if name_type == 0x00
+                    && let Ok(sni) = std::str::from_utf8(&payload[p..p + name_len]) {
                         let clean = sni.trim();
                         if !clean.is_empty() {
                             return Some(clean.to_string());
                         }
                     }
-                }
                 p += name_len;
             }
         }
@@ -140,15 +139,14 @@ fn parse_http_host(data: &[u8]) -> Option<String> {
         if line.is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case("host") {
+        if let Some((k, v)) = line.split_once(':')
+            && k.eq_ignore_ascii_case("host") {
                 let host = v.trim();
                 let clean = host.split(':').next().unwrap_or(host).trim();
                 if !clean.is_empty() {
                     return Some(clean.to_string());
                 }
             }
-        }
     }
     None
 }

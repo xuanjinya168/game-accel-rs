@@ -196,14 +196,13 @@ fn merge<T: Ord + Copy + num_succ::Succ>(mut v: Vec<(T, T)>) -> Vec<(T, T)> {
     v.sort_unstable();
     let mut out: Vec<(T, T)> = Vec::with_capacity(v.len());
     for (s, e) in v {
-        if let Some(last) = out.last_mut() {
-            if s <= last.1.succ_saturating() {
+        if let Some(last) = out.last_mut()
+            && s <= last.1.succ_saturating() {
                 if e > last.1 {
                     last.1 = e;
                 }
                 continue;
             }
-        }
         out.push((s, e));
     }
     out
@@ -418,11 +417,10 @@ impl Router {
         }
         // A domain learned from DNS beats GEOIP (e.g. a domestic site on a foreign CDN IP,
         // or a foreign site served from an in-China IP).
-        if let Some(name) = self.dns_hints.get(&ip).map(|h| h.clone()) {
-            if let Some(route) = self.decide_domain_static(&name) {
+        if let Some(name) = self.dns_hints.get(&ip).map(|h| h.clone())
+            && let Some(route) = self.decide_domain_static(&name) {
                 return route;
             }
-        }
         if self.data.cn_ip.contains(ip) {
             Route::Direct
         } else {
@@ -448,11 +446,10 @@ impl Router {
     /// Resolve `host` with the local (ISP) resolver, cached; used for GEOIP fallback and
     /// for addressing direct UDP to domain targets.
     pub async fn resolve_cached(&self, host: &str) -> Option<IpAddr> {
-        if let Some(hit) = self.dns_cache.get(host) {
-            if hit.1.elapsed() < DNS_CACHE_TTL {
+        if let Some(hit) = self.dns_cache.get(host)
+            && hit.1.elapsed() < DNS_CACHE_TTL {
                 return hit.0;
             }
-        }
         let ip = tokio::time::timeout(GEOIP_RESOLVE_TIMEOUT, tokio::net::lookup_host((host, 0)))
             .await
             .ok()

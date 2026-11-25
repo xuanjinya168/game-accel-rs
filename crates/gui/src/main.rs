@@ -201,11 +201,10 @@ impl GameAccelApp {
                 let _ = tray_tx.send(AsyncEvent::Tray(cmd));
             },
             move || {
-                if let Ok(mut guard) = quit_shutdown.lock() {
-                    if let Some(tx) = guard.take() {
+                if let Ok(mut guard) = quit_shutdown.lock()
+                    && let Some(tx) = guard.take() {
                         let _ = tx.send(true);
                     }
-                }
                 if quit_proxy_flag.swap(false, Ordering::SeqCst) {
                     let _ = sys_proxy::disable_system_proxy();
                     logger::log_line("INFO", "退出清理：已关闭 Windows 系统代理");
@@ -495,11 +494,10 @@ impl GameAccelApp {
         self.reconnect.reset();
         self.pending_mode_reconnect = None;
         self.session_id = self.session_id.wrapping_add(1);
-        if let Ok(mut guard) = self.shutdown_slot.lock() {
-            if let Some(tx) = guard.take() {
+        if let Ok(mut guard) = self.shutdown_slot.lock()
+            && let Some(tx) = guard.take() {
                 let _ = tx.send(true);
             }
-        }
         self.state = ConnState::Disconnected;
         self.stats = Arc::new(ClientStats::default());
         self.rtt_history.clear();
@@ -605,11 +603,10 @@ impl GameAccelApp {
                 added += 1;
             }
         }
-        if self.cfg.active_node().is_none() {
-            if let Some(first) = self.cfg.nodes.first() {
+        if self.cfg.active_node().is_none()
+            && let Some(first) = self.cfg.nodes.first() {
                 self.cfg.active_node_id = first.id.clone();
             }
-        }
         save_config(&self.cfg);
         added
     }

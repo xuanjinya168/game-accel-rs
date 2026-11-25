@@ -50,15 +50,15 @@ fn extract_sid(headers: &HeaderMap) -> Option<String> {
     let cookie_hdr = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in cookie_hdr.split(';') {
         let part = part.trim();
-        if let Some(val) = part.strip_prefix(&format!("{COOKIE_NAME}=")) {
-            if !val.is_empty() {
+        if let Some(val) = part.strip_prefix(&format!("{COOKIE_NAME}="))
+            && !val.is_empty() {
                 return Some(val.to_string());
             }
-        }
     }
     None
 }
 
+#[allow(clippy::result_large_err)]
 fn require_auth(headers: &HeaderMap, state: &AppState) -> std::result::Result<(), Response> {
     let Some(sid) = extract_sid(headers) else {
         return Err(json_err(StatusCode::UNAUTHORIZED, "未登录"));

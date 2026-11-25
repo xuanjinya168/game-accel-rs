@@ -31,3 +31,11 @@ pub const DATAGRAM_SEND_BUFFER: usize = 128 * 1024;
 
 /// Incoming QUIC datagram queue (application read side).
 pub const DATAGRAM_RECV_BUFFER: usize = 1024 * 1024;
+
+/// Current Unix timestamp in seconds (monotonic-safe fallback to 0).
+pub fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}

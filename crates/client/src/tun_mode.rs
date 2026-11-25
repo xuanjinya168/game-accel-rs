@@ -13,25 +13,19 @@ use protocol::dedup::DedupWindow;
 use protocol::frame::{TargetAddr, UdpFrame};
 use protocol::pacer::UdpDupPacer;
 use protocol::share::NodeProtocol;
+use protocol::unix_now_secs as now_secs;
 use quinn::Connection;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 const TUN_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -83,13 +77,11 @@ fn detect_physical_gateway() -> Result<Ipv4Addr> {
     for line in out.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
         // Typical row: 0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.100  25
-        if cols.len() >= 4 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0" {
-            if let Ok(gw) = cols[2].parse::<Ipv4Addr>() {
-                if gw != TUN_GW && !gw.is_unspecified() {
+        if cols.len() >= 4 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0"
+            && let Ok(gw) = cols[2].parse::<Ipv4Addr>()
+                && gw != TUN_GW && !gw.is_unspecified() {
                     return Ok(gw);
                 }
-            }
-        }
     }
     bail!("无法自动检测物理默认网关，请检查网络连接")
 }
@@ -307,14 +299,13 @@ pub async fn run_tun_mode(
     #[cfg(target_os = "windows")]
     {
         builder = builder.mtu_v4(TUN_MTU);
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent() {
                 let candidate = dir.join("wintun.dll");
                 if candidate.is_file() {
                     builder = builder.wintun_file(candidate.to_string_lossy().into_owned());
                 }
             }
-        }
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -686,11 +677,9 @@ async fn handle_tun_tcp(
     {
         let mut buf = vec![0u8; 4096];
         if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await
-        {
-            if n > 0 {
+            && n > 0 {
                 first_chunk.extend_from_slice(&buf[..n]);
             }
-        }
         if let Some((_, host)) = protocol::sniff::sniff_first_packet(&first_chunk) {
             router.decide(&TargetAddr::Domain(host, dst.port())).await
         } else {

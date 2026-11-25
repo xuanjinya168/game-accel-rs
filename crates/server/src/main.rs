@@ -2,12 +2,11 @@ mod dns;
 mod hy2;
 mod nat;
 mod panel;
-mod sniff;
 mod store;
 
 use crate::nat::FullConeNat;
-use crate::sniff::{extract_root_domain, sniff_first_packet};
 use crate::store::{AppState, InitParams, LiveCounters};
+use protocol::sniff::{extract_root_domain, sniff_first_packet};
 use anyhow::{Context, Result};
 use clap::Parser;
 use protocol::auth::{AUTH_ERR, AUTH_MAGIC, AUTH_OK, read_auth_request_after_magic};
@@ -411,57 +410,47 @@ async fn handle_connection(
     // lookup cannot stall every IP-targeted (game) flow, with bounded concurrency.
     let resolve_slots = Arc::new(tokio::sync::Semaphore::new(32));
     let dgram_task = tokio::spawn(async move {
-        loop {
-            match dgram_conn.read_datagram().await {
-                Ok(data) => {
-                    let needs_resolve = matches!(
-                        UdpFrame::decode(data.clone()).map(|f| f.addr),
-                        Ok(TargetAddr::Domain(..))
-                    );
-                    if needs_resolve {
-                        match resolve_slots.clone().try_acquire_owned() {
-                            Ok(permit) => {
-                                let nat = nat.clone();
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    if let Err(e) = nat.handle_datagram(data).await {
-                                        warn!("udp datagram error: {:#}", e);
-                                    }
-                                });
+        while let Ok(data) = dgram_conn.read_datagram().await {
+            let needs_resolve = matches!(
+                UdpFrame::decode(data.clone()).map(|f| f.addr),
+                Ok(TargetAddr::Domain(..))
+            );
+            if needs_resolve {
+                match resolve_slots.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        let nat = nat.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(e) = nat.handle_datagram(data).await {
+                                warn!("udp datagram error: {:#}", e);
                             }
-                            Err(_) => {
-                                warn!("dropping domain-targeted udp datagram: dns resolve queue full");
-                            }
-                        }
-                    } else if let Err(e) = nat.handle_datagram(data).await {
-                        warn!("udp datagram error: {:#}", e);
+                        });
+                    }
+                    Err(_) => {
+                        warn!("dropping domain-targeted udp datagram: dns resolve queue full");
                     }
                 }
-                Err(_) => break,
+            } else if let Err(e) = nat.handle_datagram(data).await {
+                warn!("udp datagram error: {:#}", e);
             }
         }
     });
 
     // Accept TCP proxy streams over QUIC Streams
-    loop {
-        match conn.accept_bi().await {
-            Ok((send, recv)) => {
-                let counters = ticket.counters.clone();
-                let st = state.clone();
-                let lid = ticket.link_id.clone();
-                let lname = ticket.link_name.clone();
-                let cip = client_ip.clone();
-                let proute = panel_route.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_tcp_stream(send, recv, counters, st, lid, lname, cip, proute).await
-                    {
-                        warn!("tcp stream error: {:#}", e);
-                    }
-                });
+    while let Ok((send, recv)) = conn.accept_bi().await {
+        let counters = ticket.counters.clone();
+        let st = state.clone();
+        let lid = ticket.link_id.clone();
+        let lname = ticket.link_name.clone();
+        let cip = client_ip.clone();
+        let proute = panel_route.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                handle_tcp_stream(send, recv, counters, st, lid, lname, cip, proute).await
+            {
+                warn!("tcp stream error: {:#}", e);
             }
-            Err(_) => break,
-        }
+        });
     }
 
     dgram_task.abort();
@@ -683,11 +672,10 @@ mod tests {
         let ep_bg = server_ep.clone();
         let st_bg = state.clone();
         tokio::spawn(async move {
-            if let Some(inc) = ep_bg.accept().await {
-                if let Ok(conn) = inc.await {
+            if let Some(inc) = ep_bg.accept().await
+                && let Ok(conn) = inc.await {
                     let _ = handle_connection(conn, st_bg, None, None).await;
                 }
-            }
         });
 
         let mut tls = rustls::ClientConfig::builder()

@@ -316,41 +316,38 @@ pub async fn run_client_with_shutdown(
     let dgram_proto = opts.protocol;
     let dgram_task = tokio::spawn(async move {
         let mut hy2_reasm = Hy2UdpReassembler::default();
-        loop {
-            match dgram_conn.read_datagram().await {
-                Ok(raw) => match dgram_proto {
-                    NodeProtocol::Gacl => match UdpFrame::decode(raw) {
-                        Ok(frame) => {
-                            if let Some(tx) = dispatch_clone.get(&frame.flow_id) {
-                                let _ = tx.try_send(frame);
-                            }
+        while let Ok(raw) = dgram_conn.read_datagram().await {
+            match dgram_proto {
+                NodeProtocol::Gacl => match UdpFrame::decode(raw) {
+                    Ok(frame) => {
+                        if let Some(tx) = dispatch_clone.get(&frame.flow_id) {
+                            let _ = tx.try_send(frame);
                         }
-                        Err(e) => warn!("invalid udp frame from server: {:#}", e),
-                    },
-                    NodeProtocol::Hysteria2 => match decode_hy2_udp_message(&raw) {
-                        Ok(msg) => {
-                            if let Some((sid, pid, addr_str, payload)) = hy2_reasm.push(msg) {
-                                match parse_hy2_addr(&addr_str) {
-                                    Ok(addr) => {
-                                        let flow_id = sid as u16;
-                                        if let Some(tx) = dispatch_clone.get(&flow_id) {
-                                            let _ = tx.try_send(UdpFrame {
-                                                flow_id,
-                                                seq: pid,
-                                                flags: 0,
-                                                addr,
-                                                payload,
-                                            });
-                                        }
-                                    }
-                                    Err(e) => warn!("invalid hy2 udp addr from server: {:#}", e),
-                                }
-                            }
-                        }
-                        Err(e) => warn!("invalid hy2 udp datagram from server: {:#}", e),
-                    },
+                    }
+                    Err(e) => warn!("invalid udp frame from server: {:#}", e),
                 },
-                Err(_) => break,
+                NodeProtocol::Hysteria2 => match decode_hy2_udp_message(&raw) {
+                    Ok(msg) => {
+                        if let Some((sid, pid, addr_str, payload)) = hy2_reasm.push(msg) {
+                            match parse_hy2_addr(&addr_str) {
+                                Ok(addr) => {
+                                    let flow_id = sid as u16;
+                                    if let Some(tx) = dispatch_clone.get(&flow_id) {
+                                        let _ = tx.try_send(UdpFrame {
+                                            flow_id,
+                                            seq: pid,
+                                            flags: 0,
+                                            addr,
+                                            payload,
+                                        });
+                                    }
+                                }
+                                Err(e) => warn!("invalid hy2 udp addr from server: {:#}", e),
+                            }
+                        }
+                    }
+                    Err(e) => warn!("invalid hy2 udp datagram from server: {:#}", e),
+                },
             }
         }
     });
