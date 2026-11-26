@@ -310,12 +310,19 @@ fn win32_show_and_focus_window(title: &str) {
 #[cfg(not(target_os = "windows"))]
 fn win32_show_and_focus_window(_title: &str) {}
 
+/// Restore and focus the main window.
+///
+/// Commands are sent explicitly to `ViewportId::ROOT`: this is also called from the tray
+/// thread, and `ctx.send_viewport_cmd` targets whichever viewport the UI thread happens to be
+/// rendering at that moment — often the floating card, which would then get
+/// `Visible`/`Minimized(false)`/`Focus` and visibly flash.
 pub fn wake_window(ctx: &egui::Context) {
+    use egui::ViewportId;
     win32_show_and_focus_window("GameAccel");
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    ctx.request_repaint();
+    ctx.send_viewport_cmd_to(ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd_to(ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd_to(ViewportId::ROOT, egui::ViewportCommand::Focus);
+    ctx.request_repaint_of(ViewportId::ROOT);
 }
 
 /// Convert physical cursor coordinates `(px, py)` into logical coordinates clamped inside
@@ -465,17 +472,20 @@ where
                     }
                     "toggle" => {
                         on_cmd(TrayCmd::ToggleConnect);
-                        ctx.request_repaint();
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
                     }
                     "quit" => {
                         log_line("INFO", "执行托盘退出：开始清理连接、TUN 路由与系统代理...");
                         on_cmd(TrayCmd::Quit);
                         cleanup();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        ctx.request_repaint();
+                        ctx.send_viewport_cmd_to(
+                            egui::ViewportId::ROOT,
+                            egui::ViewportCommand::Close,
+                        );
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
                         std::thread::sleep(Duration::from_millis(350));
                         log_line("INFO", "========== GameAccel 正常退出 ==========");
-                        std::process::exit(0);
+                        crate::hard_exit(0);
                     }
                     _ => {}
                 }
@@ -497,7 +507,7 @@ where
                         }
                         MouseButton::Right if panel_flag.load(Ordering::Relaxed) => {
                             on_cmd(TrayCmd::TogglePopover(position.x, position.y));
-                            ctx.request_repaint();
+                            ctx.request_repaint_of(egui::ViewportId::ROOT);
                         }
                         _ => {}
                     }

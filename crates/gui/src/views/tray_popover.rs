@@ -616,7 +616,7 @@ impl GameAccelApp {
                     std::thread::spawn(|| {
                         std::thread::sleep(Duration::from_millis(300));
                         log_line("INFO", "========== GameAccel 正常退出 ==========");
-                        std::process::exit(0);
+                        crate::hard_exit(0);
                     });
                 }
             }

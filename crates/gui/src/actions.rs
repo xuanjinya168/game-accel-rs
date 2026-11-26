@@ -433,6 +433,9 @@ impl GameAccelApp {
                         self.window_hidden_to_tray = false;
                         self.tray_popover_open = false;
                         crate::tray::wake_window(ctx);
+                        if self.cfg.show_floating_pill {
+                            self.floating_pill_raise_frames = 8;
+                        }
                     }
                     TrayCmd::ToggleConnect => match self.state {
                         ConnState::Disconnected => self.start_connect(),
@@ -648,4 +651,43 @@ impl GameAccelApp {
         }
     }
 
+}
+
+impl GameAccelApp {
+    /// Drive periodic update checks and surface a one-time toast for a new version.
+    pub(crate) fn tick_updater(&mut self, ctx: &egui::Context) {
+        let rt = self.rt.clone();
+        self.updater
+            .tick_auto_check(self.cfg.auto_check_update, &rt, ctx);
+        if let crate::updater::UpdateStatus::Available(info) = self.updater.status()
+            && self.update_notified.as_deref() != Some(info.version.as_str())
+        {
+            self.update_notified = Some(info.version.clone());
+            self.push_log(format!("发现新版本 v{}，可在「设置 → 软件更新」中一键升级", info.version));
+            self.show_toast(format!("发现新版本 v{}，可在设置中一键更新", info.version));
+        }
+    }
+
+    /// Restore network state, launch the downloaded installer and exit so it can replace files.
+    pub(crate) fn install_update(&mut self, installer: &std::path::Path) {
+        if self.state != ConnState::Disconnected {
+            self.stop_connect();
+        }
+        save_config(&self.cfg);
+        match crate::updater::launch_installer(installer) {
+            Ok(()) => {
+                logger::log_line("INFO", "已启动新版本安装程序，退出当前版本以完成升级");
+                self.really_quit = true;
+                std::thread::spawn(|| {
+                    // Leave a moment for async teardown (routes / proxy) before exiting.
+                    std::thread::sleep(Duration::from_millis(400));
+                    crate::hard_exit(0);
+                });
+            }
+            Err(e) => {
+                self.push_log(format!("{e:#}"));
+                self.show_toast(format!("{e:#}"));
+            }
+        }
+    }
 }

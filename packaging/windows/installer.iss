@@ -50,3 +50,5 @@ Name: "{autodesktop}\GameAccel"; Filename: "{app}\game-accel.exe"; Tasks: deskto
 
 [Run]
 Filename: "{app}\game-accel.exe"; Description: "{cm:LaunchProgram,GameAccel}"; Flags: nowait postinstall skipifsilent shellexec
+; In-app auto-update runs this installer with /SILENT: relaunch the new version afterwards.
+Filename: "{app}\game-accel.exe"; Flags: nowait shellexec; Check: WizardSilent

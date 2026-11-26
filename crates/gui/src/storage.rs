@@ -83,6 +83,21 @@ pub struct AppConfig {
     /// Saved logical screen position `[x, y]` of the floating speed pill.
     #[serde(default)]
     pub floating_pill_pos: Option<[f32; 2]>,
+    /// Keep floating speed card always on top.
+    #[serde(default = "default_true")]
+    pub floating_pill_always_on_top: bool,
+    /// Automatically hide floating speed card when another app is fullscreen.
+    #[serde(default = "default_true")]
+    pub floating_pill_hide_fullscreen: bool,
+    /// Automatically tuck floating speed card into screen edge when docked.
+    #[serde(default)]
+    pub floating_pill_edge_hide: bool,
+    /// Lock floating speed card position to prevent accidental dragging.
+    #[serde(default)]
+    pub floating_pill_locked: bool,
+    /// Automatically check GitHub Releases for a newer version.
+    #[serde(default = "default_true")]
+    pub auto_check_update: bool,
 }
 
 impl Default for AppConfig {
@@ -103,6 +118,11 @@ impl Default for AppConfig {
             tray_style: TrayStyle::default(),
             show_floating_pill: false,
             floating_pill_pos: None,
+            floating_pill_always_on_top: true,
+            floating_pill_hide_fullscreen: true,
+            floating_pill_edge_hide: false,
+            floating_pill_locked: false,
+            auto_check_update: true,
         }
     }
 }
@@ -214,6 +234,11 @@ pub fn load_config() -> AppConfig {
             tray_style: TrayStyle::default(),
             show_floating_pill: false,
             floating_pill_pos: None,
+            floating_pill_always_on_top: true,
+            floating_pill_hide_fullscreen: true,
+            floating_pill_edge_hide: false,
+            floating_pill_locked: false,
+            auto_check_update: true,
         };
         save_config(&migrated);
         return migrated;

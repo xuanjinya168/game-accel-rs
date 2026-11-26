@@ -11,6 +11,7 @@ mod storage;
 mod sys_proxy;
 mod theme;
 mod tray;
+mod updater;
 mod views;
 mod widgets;
 
@@ -182,6 +183,23 @@ pub(crate) struct GameAccelApp {
     pub(crate) tray_popover_ever_focused: bool,
     pub(crate) tray_popover_search: String,
     pub(crate) floating_pill_pos_dirty: Option<Instant>,
+    pub(crate) floating_pill_raise_frames: u8,
+    pub(crate) floating_menu_open: bool,
+    pub(crate) floating_menu_pos: Pos2,
+    pub(crate) floating_menu_just_opened: bool,
+    pub(crate) floating_menu_ever_focused: bool,
+    pub(crate) floating_pill_fs_hidden: bool,
+    pub(crate) floating_pill_last_fs_check: Instant,
+    pub(crate) floating_pill_edge_tucked: bool,
+    pub(crate) floating_pill_last_hover: Instant,
+    /// Position handed to the floating card's `ViewportBuilder`. Kept constant for the
+    /// lifetime of the window: egui turns any change into an `OuterPosition` command,
+    /// which would fight with OS drags / edge-tuck moves and make the card flicker.
+    pub(crate) floating_pill_spawn_pos: Option<Pos2>,
+    /// GitHub Releases based auto-updater.
+    pub(crate) updater: updater::Updater,
+    /// Version we've already toasted about, so the "new version" toast shows once.
+    pub(crate) update_notified: Option<String>,
     pub(crate) really_quit: bool,
 }
 
@@ -276,6 +294,18 @@ impl GameAccelApp {
             tray_popover_ever_focused: false,
             tray_popover_search: String::new(),
             floating_pill_pos_dirty: None,
+            floating_pill_raise_frames: 0,
+            floating_menu_open: false,
+            floating_menu_pos: Pos2::new(600.0, 200.0),
+            floating_menu_just_opened: false,
+            floating_menu_ever_focused: false,
+            floating_pill_fs_hidden: false,
+            floating_pill_last_fs_check: Instant::now(),
+            floating_pill_edge_tucked: false,
+            floating_pill_last_hover: Instant::now(),
+            floating_pill_spawn_pos: None,
+            updater: updater::Updater::default(),
+            update_notified: None,
             really_quit: false,
         };
         app.push_log(if is_admin {
@@ -406,20 +436,24 @@ impl eframe::App for GameAccelApp {
             self.window_hidden_to_tray = false;
         }
         let is_background = self.window_hidden_to_tray || is_minimized;
-        let pill_animating =
-            self.cfg.show_floating_pill && self.state != ConnState::Disconnected;
-        if is_background && !self.tray_popover_open && !pill_animating {
+        let pill_animating = self.cfg.show_floating_pill
+            && !self.floating_pill_fs_hidden
+            && self.state != ConnState::Disconnected;
+        if is_background && !self.tray_popover_open && !self.floating_menu_open && !pill_animating {
             std::thread::sleep(Duration::from_millis(24));
         }
 
         self.poll_async(ctx);
+        self.tick_updater(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.really_quit && self.tray.is_some()
         {
             self.window_hidden_to_tray = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             tray::hide_window_to_tray();
-            return;
+            if self.cfg.show_floating_pill {
+                self.floating_pill_raise_frames = 8;
+            }
         }
 
         let p = ThemePalette::from_mode(self.cfg.theme_mode);
@@ -429,7 +463,7 @@ impl eframe::App for GameAccelApp {
             .values()
             .any(|v| matches!(v, ProbeState::Probing));
         if pill_animating {
-            ctx.request_repaint_after(Duration::from_millis(50));
+            ctx.request_repaint_after(views::floating_pill::PILL_ANIM_INTERVAL);
         } else if self.state != ConnState::Disconnected
             || any_probing
             || self.sub_loading
@@ -437,6 +471,8 @@ impl eframe::App for GameAccelApp {
             || (self.active_tab == NavTab::Admin && self.admin.session_cookie.is_some())
             || self.toast.is_some()
             || self.tray_popover_open
+            || self.floating_menu_open
+            || self.cfg.show_floating_pill
             || self.floating_pill_pos_dirty.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -444,6 +480,16 @@ impl eframe::App for GameAccelApp {
 
         let mut toast_workspace_rect = egui::Rect::NOTHING;
 
+        // While hidden to tray (parked off-screen) / minimized the main window is invisible, but
+        // the floating card's animation keeps driving root frames. Skip the (expensive) main UI.
+        // Use the real window position rather than `window_hidden_to_tray`: the tray thread
+        // restores the window before that flag is cleared, which would show one empty frame.
+        let main_offscreen = ctx.input(|i| {
+            i.viewport()
+                .outer_rect
+                .is_some_and(|r| r.min.x < -8000.0 || r.min.y < -8000.0)
+        });
+        if !(is_minimized || main_offscreen) {
         // Frameless rounded window container with single crisp 1px outer border (zero double-stroke)
         egui::CentralPanel::default()
             .frame(Frame::NONE)
@@ -542,6 +588,7 @@ impl eframe::App for GameAccelApp {
                     );
                 }
             });
+        }
 
         if toast_workspace_rect.is_positive() {
             self.render_toast_overlay(ctx, toast_workspace_rect, p);
@@ -656,9 +703,37 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let res = eframe::run_native(
         "GameAccel",
         options,
         Box::new(move |cc| Ok(Box::new(GameAccelApp::new(cc, rt.clone())))),
-    )
+    );
+    if let Err(e) = &res {
+        logger::log_line("ERROR", &format!("eframe 异常退出: {e}"));
+    }
+    // Give async teardown (TUN routes, sockets) a moment to finish, then terminate.
+    std::thread::sleep(Duration::from_millis(300));
+    logger::log_line("INFO", "========== GameAccel 正常退出 ==========");
+    hard_exit(if res.is_ok() { 0 } else { 1 })
+}
+
+/// Terminate the process immediately, skipping CRT/DLL teardown.
+///
+/// A normal `ExitProcess` runs every DLL's detach handler under the loader lock (GL driver,
+/// wintun, tray, tokio worker threads still alive...), and this was observed to leave the
+/// process hung forever after "彻底退出". All real cleanup (system proxy, routes, config) is
+/// done explicitly before we get here.
+pub(crate) fn hard_exit(code: u32) -> ! {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+        }
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), code);
+        }
+    }
+    std::process::exit(code as i32)
 }

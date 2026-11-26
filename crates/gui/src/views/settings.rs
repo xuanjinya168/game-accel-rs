@@ -261,7 +261,7 @@ impl GameAccelApp {
                             .color(p.text_primary),
                     );
                     ui.label(
-                        RichText::new("置顶极简双行网速小卡片，带呼吸灯与实时上下行网速（可拖动、右键隐藏）")
+                        RichText::new("置顶极简双行网速小卡片，带呼吸灯与实时上下行网速（支持右键菜单、贴边隐藏、全屏自动隐藏）")
                             .size(FONT_SM)
                             .color(p.text_muted),
                     );
@@ -514,6 +514,142 @@ impl GameAccelApp {
                             ));
                         }
                     });
+                });
+            });
+        });
+
+        ui.add_space(18.0);
+        self.render_update_section(ui, ctx, p);
+    }
+
+    /// Group 3: version & GitHub-Releases based one-click update.
+    fn render_update_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: ThemePalette) {
+        use crate::updater::{CURRENT_VERSION, UpdateStatus, is_installed_copy, open_url};
+
+        ui.label(RichText::new("软件更新").size(FONT_SM).color(p.text_muted));
+        ui.add_space(6.0);
+        let status = self.updater.status();
+        card_frame(p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(
+                        RichText::new(format!("当前版本 v{CURRENT_VERSION}"))
+                            .size(FONT_BODY)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    let (line, col) = match &status {
+                        UpdateStatus::Idle => ("从 GitHub Releases 获取新版本".to_string(), p.text_muted),
+                        UpdateStatus::Checking => ("正在检查更新…".to_string(), p.text_muted),
+                        UpdateStatus::UpToDate { checked_at } => {
+                            (format!("已是最新版本（{checked_at} 检查）"), p.text_muted)
+                        }
+                        UpdateStatus::Available(info) => {
+                            (format!("发现新版本 v{}", info.version), p.success_text)
+                        }
+                        UpdateStatus::Downloading {
+                            info,
+                            downloaded,
+                            total,
+                        } => {
+                            let mb = |b: u64| b as f64 / 1024.0 / 1024.0;
+                            let line = match total {
+                                Some(t) if *t > 0 => format!(
+                                    "正在下载 v{} … {:.0}%（{:.1} / {:.1} MB）",
+                                    info.version,
+                                    *downloaded as f64 * 100.0 / *t as f64,
+                                    mb(*downloaded),
+                                    mb(*t)
+                                ),
+                                _ => format!("正在下载 v{} … {:.1} MB", info.version, mb(*downloaded)),
+                            };
+                            (line, p.text_muted)
+                        }
+                        UpdateStatus::Ready { info, .. } => (
+                            format!("v{} 已下载并通过校验，安装时会自动关闭并重启程序", info.version),
+                            p.success_text,
+                        ),
+                        UpdateStatus::Failed(msg) => (msg.clone(), p.danger_text),
+                    };
+                    ui.label(RichText::new(line).size(FONT_SM).color(col));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    match &status {
+                        UpdateStatus::Available(info) => {
+                            if primary_btn(ui, "下载更新", p).clicked() {
+                                let rt = self.rt.clone();
+                                self.updater.download(&rt, ctx, info.clone());
+                            }
+                            if !info.html_url.is_empty() && soft_btn(ui, "更新说明", p).clicked() {
+                                open_url(&info.html_url);
+                            }
+                        }
+                        UpdateStatus::Ready { info, installer } => {
+                            if primary_btn(ui, "安装并重启", p).clicked() {
+                                let installer = installer.clone();
+                                self.install_update(&installer);
+                            }
+                            if !info.html_url.is_empty() && soft_btn(ui, "更新说明", p).clicked() {
+                                open_url(&info.html_url);
+                            }
+                        }
+                        UpdateStatus::Checking | UpdateStatus::Downloading { .. } => {
+                            ui.add_enabled_ui(false, |ui| soft_btn(ui, "请稍候…", p));
+                        }
+                        UpdateStatus::Idle
+                        | UpdateStatus::UpToDate { .. }
+                        | UpdateStatus::Failed(_) => {
+                            if soft_btn(ui, "检查更新", p).clicked() {
+                                let rt = self.rt.clone();
+                                self.updater.check(&rt, ctx, false);
+                            }
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            hairline_divider(ui, p);
+            ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(
+                        RichText::new("自动检查更新")
+                            .size(FONT_BODY)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.label(
+                        RichText::new(if is_installed_copy() {
+                            "启动后及每 6 小时检查一次，有新版本时提示"
+                        } else {
+                            "当前不是安装版，更新会安装到 Program Files"
+                        })
+                        .size(FONT_SM)
+                        .color(p.text_muted),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let label = if self.cfg.auto_check_update {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    };
+                    if soft_btn(ui, label, p).clicked() {
+                        self.cfg.auto_check_update = !self.cfg.auto_check_update;
+                        save_config(&self.cfg);
+                        self.show_toast(if self.cfg.auto_check_update {
+                            "已开启自动检查更新"
+                        } else {
+                            "已关闭自动检查更新"
+                        });
+                    }
                 });
             });
         });

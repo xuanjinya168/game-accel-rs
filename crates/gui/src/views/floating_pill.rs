@@ -1,32 +1,92 @@
 use crate::storage::save_config;
-use crate::theme::ThemePalette;
-use crate::tray::wake_window;
-use crate::{ConnState, GameAccelApp};
+use crate::theme::{FONT_SM, ThemePalette};
+use crate::tray::{clamp_popover_position, wake_window};
+use crate::widgets::hairline_divider;
+use crate::{ConnState, GameAccelApp, NavTab};
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Frame, PointerButton, Pos2, Sense, Stroke,
-    StrokeKind,
+    self, Align2, Color32, CornerRadius, FontId, Frame, Margin, PointerButton, Pos2, Sense, Stroke,
+    StrokeKind, Vec2,
 };
 use std::time::{Duration, Instant};
 
 const CARD_W: f32 = 98.0;
 const CARD_H: f32 = 44.0;
+const CARD_RADIUS: f32 = 6.0;
+
+const MENU_W: f32 = 166.0;
+const MENU_H: f32 = 228.0;
+const MENU_RADIUS: f32 = 8.0;
+
+/// Repaint interval for the floating card's breathing LED animation (~20fps).
+pub(crate) const PILL_ANIM_INTERVAL: Duration = Duration::from_millis(50);
+
+enum CardMenuAction {
+    ToggleTopmost,
+    ToggleFullscreenHide,
+    ToggleEdgeHide,
+    ToggleLock,
+    ToggleConnect,
+    OpenDashboard,
+    CloseCard,
+}
 
 impl GameAccelApp {
     pub(crate) fn render_floating_pill(&mut self, ctx: &egui::Context, p: ThemePalette) {
         if !self.cfg.show_floating_pill {
+            self.floating_menu_open = false;
+            self.floating_pill_fs_hidden = false;
+            self.floating_pill_edge_tucked = false;
+            self.floating_pill_spawn_pos = None;
+            set_taskbar_guard(false);
             return;
         }
 
+        // Poll fullscreen state every 500ms when enabled
+        if self.cfg.floating_pill_hide_fullscreen {
+            if self.floating_pill_last_fs_check.elapsed() >= Duration::from_millis(500) {
+                self.floating_pill_last_fs_check = Instant::now();
+                let fs = is_another_app_fullscreen();
+                if fs != self.floating_pill_fs_hidden {
+                    self.floating_pill_fs_hidden = fs;
+                    if fs {
+                        self.floating_menu_open = false;
+                    } else {
+                        self.floating_pill_raise_frames = 6;
+                    }
+                }
+            }
+        } else if self.floating_pill_fs_hidden {
+            self.floating_pill_fs_hidden = false;
+            self.floating_pill_raise_frames = 6;
+        }
+
         let ppp = ctx.pixels_per_point().max(1.0);
-        let init_pos = self
-            .cfg
-            .floating_pill_pos
-            .map(|[x, y]| Pos2::new(x, y))
-            .unwrap_or_else(|| default_card_pos(ppp));
+        // Only used when the window is (re)created; must stay constant afterwards.
+        let saved_pos = self.cfg.floating_pill_pos;
+        let init_pos = *self.floating_pill_spawn_pos.get_or_insert_with(|| {
+            saved_pos
+                .map(|[x, y]| Pos2::new(x, y))
+                .unwrap_or_else(|| default_card_pos(ppp))
+        });
+
+        let now_secs = ctx.input(|i| i.time);
+        let force_raise = if self.floating_pill_raise_frames > 0 {
+            self.floating_pill_raise_frames -= 1;
+            ctx.request_repaint_after(Duration::from_millis(33));
+            true
+        } else {
+            false
+        };
 
         let mut open_main = false;
-        let mut hide_card = false;
+        let mut open_menu_at: Option<(f64, f64)> = None;
         let mut latest_outer_pos: Option<[f32; 2]> = None;
+        let mut is_hovered = false;
+        let mut is_dragging = false;
+
+        let always_on_top = self.cfg.floating_pill_always_on_top;
+        let locked = self.cfg.floating_pill_locked;
+        let fs_hidden = self.floating_pill_fs_hidden;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("game_accel_floating_pill"),
@@ -39,30 +99,19 @@ impl GameAccelApp {
                 .with_inner_size([CARD_W, CARD_H])
                 .with_position([init_pos.x, init_pos.y]),
             |vctx, _class| {
-                // Apply native Windows 11 rounded corners + soft DWM drop shadow to all
-                // top-level windows of this process (no brittle title lookup). Run for the
-                // first few frames so it applies even if winit finishes showing the child
-                // viewport after frame 0.
-                let frames_id = egui::Id::new("floating_card_round_frames");
-                let applied_frames = vctx.data(|d| d.get_temp::<u8>(frames_id).unwrap_or(0));
-                if applied_frames < 5 {
-                    crate::tray::apply_win11_rounded_corners();
-                    vctx.data_mut(|d| d.insert_temp(frames_id, applied_frames + 1));
-                }
+                let vppp = vctx.pixels_per_point().max(1.0);
+                set_taskbar_guard(always_on_top && !fs_hidden);
+                ensure_floating_card_window(vppp, always_on_top, fs_hidden, force_raise);
 
-                if vctx.input(|i| i.viewport().close_requested()) {
-                    hide_card = true;
-                }
                 if let Some(outer) = vctx.input(|i| i.viewport().outer_rect) {
                     latest_outer_pos = Some([outer.min.x, outer.min.y]);
                 }
 
-                // Drive smooth breathing LED animation when active (20fps keeps CPU negligible).
-                if self.state != ConnState::Disconnected {
-                    vctx.request_repaint_after(Duration::from_millis(50));
+                // Drive the breathing LED animation when visible & active. 20fps is visually
+                // indistinguishable for this slow sine and costs ~1/3 less than 30fps.
+                if !fs_hidden && self.state != ConnState::Disconnected {
+                    vctx.request_repaint_after(PILL_ANIM_INTERVAL);
                 }
-
-                let now_secs = vctx.input(|i| i.time);
 
                 egui::CentralPanel::default()
                     .frame(Frame::new().fill(p.bg_card))
@@ -73,21 +122,31 @@ impl GameAccelApp {
                             ui.id().with("floating_card_body"),
                             Sense::click_and_drag(),
                         );
+                        is_hovered = resp.hovered() || vctx.input(|i| i.pointer.has_pointer());
+                        is_dragging = resp.dragged();
 
-                        if resp.drag_started_by(PointerButton::Primary) {
+                        if !locked && resp.drag_started_by(PointerButton::Primary) {
+                            self.floating_menu_open = false;
                             vctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                         }
                         if resp.double_clicked_by(PointerButton::Primary) {
+                            self.floating_menu_open = false;
                             open_main = true;
                         }
                         if resp.clicked_by(PointerButton::Secondary) {
-                            hide_card = true;
+                            if let Some((cx, cy)) = win32_cursor_pos() {
+                                open_menu_at = Some((cx, cy));
+                            } else if let Some(outer) = vctx.input(|i| i.viewport().outer_rect) {
+                                open_menu_at = Some((
+                                    (outer.right() * vppp) as f64,
+                                    (outer.bottom() * vppp) as f64,
+                                ));
+                            }
                         }
 
                         let painter = ui.painter();
                         painter.rect_filled(rect, CornerRadius::ZERO, p.bg_card);
 
-                        // Subtle inner border matching Win11 native 8px rounded frame
                         let border_col = if resp.hovered() {
                             p.border_strong
                         } else {
@@ -95,7 +154,7 @@ impl GameAccelApp {
                         };
                         painter.rect_stroke(
                             rect,
-                            CornerRadius::same(8),
+                            CornerRadius::same(CARD_RADIUS as u8),
                             Stroke::new(1.0_f32, border_col),
                             StrokeKind::Inside,
                         );
@@ -114,36 +173,64 @@ impl GameAccelApp {
                                 Color32::from_rgb(38, 152, 68),
                             )
                         };
-                        let led_green = down_col;
 
                         // Left breathing status LED
-                        let led_center = Pos2::new(rect.left() + 12.0, cy);
+                        let led_center = Pos2::new(rect.left() + 13.0, cy);
                         match self.state {
                             ConnState::Connected => {
-                                let pulse = ((now_secs * 2.4).sin() * 0.5 + 0.5) as f32;
-                                let halo_r = 3.6 + pulse * 3.4;
-                                let halo_alpha = (26.0 + (1.0 - pulse) * 78.0) as u8;
-                                let halo = Color32::from_rgba_unmultiplied(
-                                    led_green.r(),
-                                    led_green.g(),
-                                    led_green.b(),
-                                    halo_alpha,
+                                let wave = ((now_secs * 2.8).sin() * 0.5 + 0.5) as f32;
+                                let ring_t = ((now_secs * 0.55).fract()) as f32;
+
+                                let ripple_r = 3.2 + ring_t * 6.0;
+                                let ripple_alpha = ((1.0 - ring_t).powi(2) * 165.0) as u8;
+                                painter.circle_filled(
+                                    led_center,
+                                    ripple_r,
+                                    Color32::from_rgba_unmultiplied(
+                                        down_col.r(),
+                                        down_col.g(),
+                                        down_col.b(),
+                                        ripple_alpha,
+                                    ),
                                 );
-                                painter.circle_filled(led_center, halo_r, halo);
-                                painter.circle_filled(led_center, 3.0, led_green);
+
+                                let glow_r = 4.2 + wave * 2.2;
+                                let glow_alpha = (55.0 + wave * 95.0) as u8;
+                                painter.circle_filled(
+                                    led_center,
+                                    glow_r,
+                                    Color32::from_rgba_unmultiplied(
+                                        down_col.r(),
+                                        down_col.g(),
+                                        down_col.b(),
+                                        glow_alpha,
+                                    ),
+                                );
+
+                                let core_r = 2.6 + wave * 0.9;
+                                let core_col = lerp_color(
+                                    down_col.linear_multiply(0.75),
+                                    Color32::from_rgb(56, 204, 102),
+                                    wave,
+                                );
+                                painter.circle_filled(led_center, core_r, core_col);
                             }
                             ConnState::Connecting => {
-                                let pulse = ((now_secs * 4.8).sin() * 0.5 + 0.5) as f32;
-                                let halo_r = 3.4 + pulse * 3.4;
-                                let halo_alpha = (28.0 + (1.0 - pulse) * 92.0) as u8;
-                                let halo = Color32::from_rgba_unmultiplied(
-                                    up_col.r(),
-                                    up_col.g(),
-                                    up_col.b(),
-                                    halo_alpha,
+                                let wave = ((now_secs * 5.2).sin() * 0.5 + 0.5) as f32;
+                                let glow_r = 4.0 + wave * 3.2;
+                                let glow_alpha = (55.0 + wave * 120.0) as u8;
+                                painter.circle_filled(
+                                    led_center,
+                                    glow_r,
+                                    Color32::from_rgba_unmultiplied(
+                                        up_col.r(),
+                                        up_col.g(),
+                                        up_col.b(),
+                                        glow_alpha,
+                                    ),
                                 );
-                                painter.circle_filled(led_center, halo_r, halo);
-                                painter.circle_filled(led_center, 3.0, up_col);
+                                let core_r = 2.5 + wave * 1.0;
+                                painter.circle_filled(led_center, core_r, up_col);
                             }
                             ConnState::Disconnected => {
                                 painter.circle_filled(led_center, 2.7, p.border_strong);
@@ -151,8 +238,8 @@ impl GameAccelApp {
                         }
 
                         // Two crisp stacked rows: upload (top) & download (bottom)
-                        let arrow_x = rect.left() + 24.5;
-                        let text_x = rect.left() + 33.0;
+                        let arrow_x = rect.left() + 25.5;
+                        let text_x = rect.left() + 33.5;
                         let up_y = cy - 8.5;
                         let down_y = cy + 8.5;
 
@@ -185,8 +272,45 @@ impl GameAccelApp {
             },
         );
 
-        // Debounced position persistence when the user drags the card
-        if let Some([nx, ny]) = latest_outer_pos
+        // Edge auto-hide (dock & tuck to left/right/top screen border)
+        if is_hovered || is_dragging || self.floating_menu_open {
+            self.floating_pill_last_hover = Instant::now();
+        }
+        // Set when we move the window ourselves this frame: `latest_outer_pos` was sampled
+        // before the move and is stale (e.g. still the tucked position), so don't persist it.
+        let mut moved_this_frame = false;
+        if !fs_hidden {
+            if self.cfg.floating_pill_edge_hide {
+                let want_tuck = !is_hovered
+                    && !is_dragging
+                    && !self.floating_menu_open
+                    && self.floating_pill_last_hover.elapsed() >= Duration::from_millis(420);
+                if want_tuck && !self.floating_pill_edge_tucked {
+                    if let Some([tx, ty]) = compute_tucked_pos(ppp) {
+                        move_floating_card_physical(ppp, tx, ty);
+                        self.floating_pill_edge_tucked = true;
+                        moved_this_frame = true;
+                    }
+                } else if !want_tuck && self.floating_pill_edge_tucked {
+                    if let Some([ux, uy]) = compute_untucked_pos(ppp) {
+                        move_floating_card_physical(ppp, ux, uy);
+                    }
+                    self.floating_pill_edge_tucked = false;
+                    moved_this_frame = true;
+                }
+            } else if self.floating_pill_edge_tucked {
+                if let Some([ux, uy]) = compute_untucked_pos(ppp) {
+                    move_floating_card_physical(ppp, ux, uy);
+                }
+                self.floating_pill_edge_tucked = false;
+                moved_this_frame = true;
+            }
+        }
+
+        // Debounced position persistence (skip while edge-tucked so docked anchor stays clean)
+        if !self.floating_pill_edge_tucked
+            && !moved_this_frame
+            && let Some([nx, ny]) = latest_outer_pos
             && nx > -4000.0
             && ny > -4000.0
         {
@@ -209,14 +333,229 @@ impl GameAccelApp {
         if open_main {
             self.window_hidden_to_tray = false;
             wake_window(ctx);
+            self.floating_pill_raise_frames = 8;
         }
-        if hide_card {
-            self.cfg.show_floating_pill = false;
-            self.floating_pill_pos_dirty = None;
-            save_config(&self.cfg);
-            self.show_toast("已隐藏桌面网速悬浮窗");
+
+        if let Some((px, py)) = open_menu_at {
+            self.floating_menu_pos = clamp_popover_position(px, py, MENU_W, MENU_H, ppp);
+            self.floating_menu_just_opened = true;
+            self.floating_menu_ever_focused = false;
+            self.floating_menu_open = true;
+            ctx.request_repaint();
+        }
+
+        self.render_floating_card_menu(ctx, p);
+    }
+
+    fn render_floating_card_menu(&mut self, ctx: &egui::Context, p: ThemePalette) {
+        if !self.floating_menu_open {
+            return;
+        }
+
+        let mut close_menu = false;
+        let mut picked: Option<CardMenuAction> = None;
+
+        let topmost = self.cfg.floating_pill_always_on_top;
+        let fs_hide = self.cfg.floating_pill_hide_fullscreen;
+        let edge_hide = self.cfg.floating_pill_edge_hide;
+        let locked = self.cfg.floating_pill_locked;
+        let conn_label = match self.state {
+            ConnState::Disconnected => "开启加速",
+            ConnState::Connecting => "取消连接",
+            ConnState::Connected => "断开加速",
+        };
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("game_accel_floating_card_menu"),
+            egui::ViewportBuilder::default()
+                .with_title("GameAccel 悬浮窗菜单")
+                .with_decorations(false)
+                .with_always_on_top()
+                .with_taskbar(false)
+                .with_resizable(false)
+                .with_inner_size([MENU_W, MENU_H])
+                .with_position([self.floating_menu_pos.x, self.floating_menu_pos.y]),
+            |vctx, _class| {
+                let vppp = vctx.pixels_per_point().max(1.0);
+                ensure_popup_menu_region(vppp);
+
+                if self.floating_menu_just_opened {
+                    vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.floating_menu_just_opened = false;
+                }
+
+                let focused = vctx.input(|i| i.viewport().focused);
+                if focused == Some(true) {
+                    self.floating_menu_ever_focused = true;
+                } else if self.floating_menu_ever_focused && focused == Some(false) {
+                    close_menu = true;
+                }
+                if vctx
+                    .input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
+                {
+                    close_menu = true;
+                }
+
+                egui::CentralPanel::default()
+                    .frame(
+                        Frame::new()
+                            .fill(p.bg_card)
+                            .stroke(Stroke::new(1.0_f32, p.border_strong))
+                            .corner_radius(CornerRadius::same(MENU_RADIUS as u8))
+                            .inner_margin(Margin::symmetric(6, 6)),
+                    )
+                    .show(vctx, |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+
+                        if menu_row(ui, "窗口置顶显示", Some(topmost), false, p).clicked() {
+                            picked = Some(CardMenuAction::ToggleTopmost);
+                            close_menu = true;
+                        }
+                        if menu_row(ui, "贴边自动隐藏", Some(edge_hide), false, p).clicked() {
+                            picked = Some(CardMenuAction::ToggleEdgeHide);
+                            close_menu = true;
+                        }
+                        if menu_row(ui, "全屏时自动隐藏", Some(fs_hide), false, p).clicked()
+                        {
+                            picked = Some(CardMenuAction::ToggleFullscreenHide);
+                            close_menu = true;
+                        }
+                        if menu_row(ui, "锁定悬浮窗位置", Some(locked), false, p).clicked() {
+                            picked = Some(CardMenuAction::ToggleLock);
+                            close_menu = true;
+                        }
+
+                        ui.add_space(4.0);
+                        hairline_divider(ui, p);
+                        ui.add_space(4.0);
+
+                        if menu_row(ui, conn_label, None, false, p).clicked() {
+                            picked = Some(CardMenuAction::ToggleConnect);
+                            close_menu = true;
+                        }
+                        if menu_row(ui, "查看流量详情", None, false, p).clicked() {
+                            picked = Some(CardMenuAction::OpenDashboard);
+                            close_menu = true;
+                        }
+                        if menu_row(ui, "关闭流量悬浮窗", None, true, p).clicked() {
+                            picked = Some(CardMenuAction::CloseCard);
+                            close_menu = true;
+                        }
+                    });
+            },
+        );
+
+        if close_menu {
+            self.floating_menu_open = false;
+            self.floating_menu_ever_focused = false;
+        }
+
+        if let Some(act) = picked {
+            match act {
+                CardMenuAction::ToggleTopmost => {
+                    self.cfg.floating_pill_always_on_top = !self.cfg.floating_pill_always_on_top;
+                    save_config(&self.cfg);
+                    self.floating_pill_raise_frames = 4;
+                }
+                CardMenuAction::ToggleFullscreenHide => {
+                    self.cfg.floating_pill_hide_fullscreen =
+                        !self.cfg.floating_pill_hide_fullscreen;
+                    if !self.cfg.floating_pill_hide_fullscreen {
+                        self.floating_pill_fs_hidden = false;
+                    }
+                    save_config(&self.cfg);
+                }
+                CardMenuAction::ToggleEdgeHide => {
+                    self.cfg.floating_pill_edge_hide = !self.cfg.floating_pill_edge_hide;
+                    save_config(&self.cfg);
+                }
+                CardMenuAction::ToggleLock => {
+                    self.cfg.floating_pill_locked = !self.cfg.floating_pill_locked;
+                    save_config(&self.cfg);
+                }
+                CardMenuAction::ToggleConnect => match self.state {
+                    ConnState::Disconnected => self.start_connect(),
+                    ConnState::Connecting | ConnState::Connected => self.stop_connect(),
+                },
+                CardMenuAction::OpenDashboard => {
+                    self.active_tab = NavTab::Dashboard;
+                    self.window_hidden_to_tray = false;
+                    wake_window(ctx);
+                    self.floating_pill_raise_frames = 8;
+                }
+                CardMenuAction::CloseCard => {
+                    self.cfg.show_floating_pill = false;
+                    self.floating_pill_pos_dirty = None;
+                    self.floating_pill_edge_tucked = false;
+                    save_config(&self.cfg);
+                    self.show_toast("已隐藏桌面网速悬浮窗");
+                }
+            }
         }
     }
+}
+
+fn menu_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    checked: Option<bool>,
+    is_danger: bool,
+    p: ThemePalette,
+) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+    if resp.hovered() {
+        let fill = if is_danger {
+            p.danger_soft
+        } else {
+            p.bg_nav_hover
+        };
+        ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    }
+
+    if checked == Some(true) {
+        // Crisp warm-amber checkmark matching reference style
+        let cx = rect.left() + 14.0;
+        let cy = rect.center().y;
+        let check_col = if p.is_dark {
+            Color32::from_rgb(245, 166, 86)
+        } else {
+            Color32::from_rgb(217, 119, 36)
+        };
+        let s = Stroke::new(1.6_f32, check_col);
+        let p1 = Pos2::new(cx - 4.0, cy - 0.2);
+        let p2 = Pos2::new(cx - 1.2, cy + 2.8);
+        let p3 = Pos2::new(cx + 4.5, cy - 3.2);
+        ui.painter().line_segment([p1, p2], s);
+        ui.painter().line_segment([p2, p3], s);
+    }
+
+    let text_col = if is_danger && resp.hovered() {
+        p.danger_text
+    } else if is_danger {
+        p.text_secondary
+    } else {
+        p.text_primary
+    };
+    ui.painter().text(
+        Pos2::new(rect.left() + 28.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(FONT_SM),
+        text_col,
+    );
+    resp
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
+    Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
 }
 
 /// Draw a crisp vector up/down arrow centered at `c`.
@@ -273,4 +612,728 @@ fn default_card_pos(ppp: f32) -> Pos2 {
     }
     let _ = ppp;
     Pos2::new(960.0, 36.0)
+}
+
+fn win32_cursor_pos() -> Option<(f64, f64)> {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetCursorPos(lp_point: *mut Point) -> i32;
+        }
+        let mut pt = Point { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut pt) } != 0 {
+            return Some((pt.x as f64, pt.y as f64));
+        }
+    }
+    None
+}
+
+/// Cached HWNDs so we don't `EnumWindows` over every top-level window on each frame.
+#[cfg(target_os = "windows")]
+static CARD_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
+static MENU_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Whether the taskbar guard should keep the card above the taskbar.
+#[cfg(target_os = "windows")]
+static KEEP_ABOVE_TASKBAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn set_taskbar_guard(enabled: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        KEEP_ABOVE_TASKBAR.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            return;
+        }
+        static INSTALLED: AtomicBool = AtomicBool::new(false);
+        if INSTALLED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        type WinEventProc = unsafe extern "system" fn(isize, u32, isize, i32, i32, u32, u32);
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn SetWinEventHook(
+                event_min: u32,
+                event_max: u32,
+                hmod: isize,
+                callback: WinEventProc,
+                pid: u32,
+                tid: u32,
+                flags: u32,
+            ) -> isize;
+        }
+        const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+        const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+        const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
+
+        /// The taskbar is itself a topmost window: when it's activated (e.g. clicking a tray
+        /// icon) it jumps above a card placed over it. Re-assert our z-order right away instead
+        /// of waiting for the next frame / tray poll, which showed up as a visible blink.
+        unsafe extern "system" fn on_foreground(
+            _hook: isize,
+            _event: u32,
+            hwnd: isize,
+            _id_object: i32,
+            _id_child: i32,
+            _thread: u32,
+            _time: u32,
+        ) {
+            if KEEP_ABOVE_TASKBAR.load(Ordering::Relaxed) && is_taskbar_window(hwnd) {
+                raise_card_topmost();
+            }
+        }
+
+        // Out-of-context hooks are delivered through this (UI) thread's message loop.
+        unsafe {
+            let _ = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                0,
+                on_foreground,
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = enabled;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_taskbar_window(hwnd: isize) -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAncestor(hwnd: *mut std::ffi::c_void, flags: u32) -> *mut std::ffi::c_void;
+        fn GetClassNameW(hwnd: *mut std::ffi::c_void, buf: *mut u16, max_count: i32) -> i32;
+    }
+    const GA_ROOT: u32 = 2;
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        let hwnd = hwnd as *mut std::ffi::c_void;
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let root = if !root.is_null() { root } else { hwnd };
+        let mut buf = [0u16; 32];
+        let n = GetClassNameW(root, buf.as_mut_ptr(), buf.len() as i32);
+        if n <= 0 {
+            return false;
+        }
+        let cls = String::from_utf16_lossy(&buf[..n as usize]);
+        cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd"
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn raise_card_topmost() {
+    use std::sync::atomic::Ordering;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsWindowVisible(hwnd: *mut std::ffi::c_void) -> i32;
+        fn SetWindowPos(
+            hwnd: isize,
+            insert_after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+    }
+    const HWND_TOPMOST: isize = -1;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    let hwnd = CARD_HWND.load(Ordering::Relaxed);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        if IsWindowVisible(hwnd as *mut std::ffi::c_void) != 0 {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn find_own_window_by_size(
+    cache: &std::sync::atomic::AtomicIsize,
+    exp_w: i32,
+    exp_h: i32,
+) -> Option<(isize, i32, i32, i32, i32)> {
+    use std::ffi::c_void;
+    use std::sync::atomic::Ordering;
+    type Hwnd = *mut c_void;
+    type EnumProc = unsafe extern "system" fn(Hwnd, isize) -> i32;
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    struct FindCtx {
+        pid: u32,
+        exp_w: i32,
+        exp_h: i32,
+        found: Option<(isize, i32, i32, i32, i32)>,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: EnumProc, lparam: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
+    }
+
+    /// Returns `(x, y, w, h)` if `hwnd` belongs to `pid` and roughly has the expected size.
+    unsafe fn probe(hwnd: Hwnd, pid: u32, exp_w: i32, exp_h: i32) -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let mut wpid: u32 = 0;
+            if GetWindowThreadProcessId(hwnd, &mut wpid) == 0 || wpid != pid {
+                return None;
+            }
+            let mut rc = WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetWindowRect(hwnd as isize, &mut rc) == 0 {
+                return None;
+            }
+            let w = rc.right - rc.left;
+            let h = rc.bottom - rc.top;
+            ((w - exp_w).abs() <= 24 && (h - exp_h).abs() <= 24).then_some((rc.left, rc.top, w, h))
+        }
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: Hwnd, lparam: isize) -> i32 {
+        unsafe {
+            let ctx = &mut *(lparam as *mut FindCtx);
+            if let Some((x, y, w, h)) = probe(hwnd, ctx.pid, ctx.exp_w, ctx.exp_h) {
+                ctx.found = Some((hwnd as isize, x, y, w, h));
+                return 0;
+            }
+        }
+        1
+    }
+
+    unsafe {
+        let pid = GetCurrentProcessId();
+        let cached = cache.load(Ordering::Relaxed);
+        if cached != 0 {
+            if let Some((x, y, w, h)) = probe(cached as Hwnd, pid, exp_w, exp_h) {
+                return Some((cached, x, y, w, h));
+            }
+            cache.store(0, Ordering::Relaxed);
+        }
+
+        let mut fctx = FindCtx {
+            pid,
+            exp_w,
+            exp_h,
+            found: None,
+        };
+        let _ = EnumWindows(enum_cb, (&mut fctx as *mut FindCtx) as isize);
+        if let Some((hwnd, ..)) = fctx.found {
+            cache.store(hwnd, Ordering::Relaxed);
+        }
+        fctx.found
+    }
+}
+
+/// Keep the floating card detached from the main window owner, respect topmost/fullscreen
+/// visibility settings, and clip its Win32 region to an exact rounded rectangle.
+fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, force_raise: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::c_void;
+        type Hwnd = *mut c_void;
+
+        #[repr(C)]
+        struct WinRect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn IsWindowVisible(hwnd: Hwnd) -> i32;
+            fn GetForegroundWindow() -> Hwnd;
+            fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+            fn SetWindowLongPtrW(hwnd: isize, index: i32, new_long: isize) -> isize;
+            fn GetWindowRgnBox(hwnd: isize, lprc: *mut WinRect) -> i32;
+            fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+            fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+            fn SetWindowPos(
+                hwnd: isize,
+                insert_after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
+        }
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
+        }
+
+        let Some((hwnd, _x, _y, w, h)) = find_own_window_by_size(
+            &CARD_HWND,
+            (CARD_W * ppp).round() as i32,
+            (CARD_H * ppp).round() as i32,
+        ) else {
+            return;
+        };
+        if w <= 0 || h <= 0 {
+            return;
+        }
+
+        unsafe {
+            // Detach owner so hiding/restoring the main window never flickers the floating card.
+            const GWLP_HWNDPARENT: i32 = -8;
+            if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != 0 {
+                let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+            }
+
+            const SW_HIDE: i32 = 0;
+            const SW_SHOWNOACTIVATE: i32 = 4;
+            const GWL_EXSTYLE: i32 = -20;
+            const WS_EX_TOPMOST: isize = 0x0000_0008;
+            const HWND_TOPMOST: isize = -1;
+            const HWND_NOTOPMOST: isize = -2;
+            const SWP_NOSIZE: u32 = 0x0001;
+            const SWP_NOMOVE: u32 = 0x0002;
+            const SWP_NOACTIVATE: u32 = 0x0010;
+            const SWP_SHOWWINDOW: u32 = 0x0040;
+
+            let visible = IsWindowVisible(hwnd as Hwnd) != 0;
+            if fs_hidden {
+                if visible {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+                return;
+            }
+
+            let cur_topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+            // Fallback for the taskbar guard hook: while the taskbar is the foreground window,
+            // keep re-asserting our position above it.
+            let taskbar_active = always_on_top && is_taskbar_window(GetForegroundWindow() as isize);
+            if !visible
+                || cur_topmost != always_on_top
+                || (force_raise && always_on_top)
+                || taskbar_active
+            {
+                if !visible {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+                let insert_after = if always_on_top {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                };
+                // Only pass SWP_SHOWWINDOW when actually hidden; re-"showing" an already
+                // visible window on every raise frame can make it blink.
+                let show_flag = if visible { 0 } else { SWP_SHOWWINDOW };
+                let _ = SetWindowPos(
+                    hwnd,
+                    insert_after,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | show_flag,
+                );
+            }
+
+            let mut rgn_rc = WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            let rgn_type = GetWindowRgnBox(hwnd, &mut rgn_rc);
+            if rgn_type == 0
+                || (rgn_rc.right - rgn_rc.left - w).abs() > 2
+                || (rgn_rc.bottom - rgn_rc.top - h).abs() > 2
+            {
+                let diam = (CARD_RADIUS * 2.0 * ppp).round().max(8.0) as i32;
+                let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diam, diam);
+                if hrgn != 0 {
+                    let _ = SetWindowRgn(hwnd, hrgn, 1);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (ppp, always_on_top, fs_hidden, force_raise);
+    }
+}
+
+fn ensure_popup_menu_region(ppp: f32) {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct WinRect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetWindowRgnBox(hwnd: isize, lprc: *mut WinRect) -> i32;
+            fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+        }
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
+        }
+
+        let Some((hwnd, _x, _y, w, h)) = find_own_window_by_size(
+            &MENU_HWND,
+            (MENU_W * ppp).round() as i32,
+            (MENU_H * ppp).round() as i32,
+        ) else {
+            return;
+        };
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        unsafe {
+            let mut rgn_rc = WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            let rgn_type = GetWindowRgnBox(hwnd, &mut rgn_rc);
+            if rgn_type == 0
+                || (rgn_rc.right - rgn_rc.left - w).abs() > 2
+                || (rgn_rc.bottom - rgn_rc.top - h).abs() > 2
+            {
+                let diam = (MENU_RADIUS * 2.0 * ppp).round().max(10.0) as i32;
+                let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diam, diam);
+                if hrgn != 0 {
+                    let _ = SetWindowRgn(hwnd, hrgn, 1);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ppp;
+    }
+}
+
+/// Detect whether another non-desktop foreground window covers its entire monitor.
+fn is_another_app_fullscreen() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::c_void;
+        type Hwnd = *mut c_void;
+
+        #[repr(C)]
+        struct WinRect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        #[repr(C)]
+        struct MonitorInfo {
+            cb_size: u32,
+            rc_monitor: WinRect,
+            rc_work: WinRect,
+            dw_flags: u32,
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcessId() -> u32;
+        }
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn SHQueryUserNotificationState(state: *mut i32) -> i32;
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetForegroundWindow() -> Hwnd;
+            fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+            fn GetClassNameW(hwnd: Hwnd, buf: *mut u16, max_count: i32) -> i32;
+            fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
+            fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+            fn IsZoomed(hwnd: Hwnd) -> i32;
+            fn MonitorFromWindow(hwnd: Hwnd, dw_flags: u32) -> isize;
+            fn GetMonitorInfoW(hmonitor: isize, lpmi: *mut MonitorInfo) -> i32;
+        }
+
+        unsafe {
+            // Exclusive (D3D) fullscreen games may not expose a monitor-sized foreground rect.
+            const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
+            let mut quns: i32 = 0;
+            if SHQueryUserNotificationState(&mut quns) == 0 && quns == QUNS_RUNNING_D3D_FULL_SCREEN
+            {
+                return true;
+            }
+
+            let fg = GetForegroundWindow();
+            if fg.is_null() {
+                return false;
+            }
+            let mut fg_pid: u32 = 0;
+            GetWindowThreadProcessId(fg, &mut fg_pid);
+            if fg_pid == GetCurrentProcessId() {
+                return false;
+            }
+
+            // A normal maximized window (title bar present) can cover the whole monitor when the
+            // taskbar is auto-hidden; that's not "fullscreen", so don't hide the card for it.
+            const GWL_STYLE: i32 = -16;
+            const WS_CAPTION: isize = 0x00C0_0000;
+            let style = GetWindowLongPtrW(fg as isize, GWL_STYLE);
+            if IsZoomed(fg) != 0 && (style & WS_CAPTION) == WS_CAPTION {
+                return false;
+            }
+
+            let mut cls_buf = [0u16; 64];
+            let cls_len = GetClassNameW(fg, cls_buf.as_mut_ptr(), cls_buf.len() as i32);
+            if cls_len > 0 {
+                let cls = String::from_utf16_lossy(&cls_buf[..cls_len as usize]);
+                if matches!(
+                    cls.as_str(),
+                    "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+                ) {
+                    return false;
+                }
+            }
+
+            let mut wrc = WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetWindowRect(fg as isize, &mut wrc) == 0 {
+                return false;
+            }
+            const MONITOR_DEFAULTTONEAREST: u32 = 2;
+            let hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+            if hmon == 0 {
+                return false;
+            }
+            let mut mi = MonitorInfo {
+                cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                rc_monitor: WinRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                rc_work: WinRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                dw_flags: 0,
+            };
+            if GetMonitorInfoW(hmon, &mut mi) == 0 {
+                return false;
+            }
+
+            wrc.left <= mi.rc_monitor.left
+                && wrc.top <= mi.rc_monitor.top
+                && wrc.right >= mi.rc_monitor.right
+                && wrc.bottom >= mi.rc_monitor.bottom
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn monitor_work_rect_for_hwnd(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    use std::ffi::c_void;
+    type Hwnd = *mut c_void;
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: WinRect,
+        rc_work: WinRect,
+        dw_flags: u32,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MonitorFromWindow(hwnd: Hwnd, dw_flags: u32) -> isize;
+        fn GetMonitorInfoW(hmonitor: isize, lpmi: *mut MonitorInfo) -> i32;
+    }
+
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+    unsafe {
+        let hmon = MonitorFromWindow(hwnd as Hwnd, MONITOR_DEFAULTTONEAREST);
+        if hmon == 0 {
+            return None;
+        }
+        let mut mi = MonitorInfo {
+            cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+            rc_monitor: WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            rc_work: WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            dw_flags: 0,
+        };
+        if GetMonitorInfoW(hmon, &mut mi) == 0 {
+            return None;
+        }
+        Some((
+            mi.rc_work.left,
+            mi.rc_work.top,
+            mi.rc_work.right,
+            mi.rc_work.bottom,
+        ))
+    }
+}
+
+/// If the floating card is docked near the left, right, or top screen edge, return its
+/// physical tucked `[x, y]` leaving a 6px peek strip visible.
+fn compute_tucked_pos(ppp: f32) -> Option<[i32; 2]> {
+    #[cfg(target_os = "windows")]
+    {
+        let (hwnd, x, y, w, h) = find_own_window_by_size(
+            &CARD_HWND,
+            (CARD_W * ppp).round() as i32,
+            (CARD_H * ppp).round() as i32,
+        )?;
+        let (ml, mt, mr, _mb) = monitor_work_rect_for_hwnd(hwnd)?;
+        let snap = (14.0 * ppp).round() as i32;
+        let peek = (6.0 * ppp).round().max(5.0) as i32;
+
+        if x <= ml + snap {
+            Some([ml - w + peek, y])
+        } else if x + w >= mr - snap {
+            Some([mr - peek, y])
+        } else if y <= mt + snap {
+            Some([x, mt - h + peek])
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ppp;
+        None
+    }
+}
+
+/// Restore a tucked card back inside its monitor work area.
+fn compute_untucked_pos(ppp: f32) -> Option<[i32; 2]> {
+    #[cfg(target_os = "windows")]
+    {
+        let (hwnd, x, y, w, h) = find_own_window_by_size(
+            &CARD_HWND,
+            (CARD_W * ppp).round() as i32,
+            (CARD_H * ppp).round() as i32,
+        )?;
+        let (ml, mt, mr, mb) = monitor_work_rect_for_hwnd(hwnd)?;
+        let nx = x.clamp(ml, (mr - w).max(ml));
+        let ny = y.clamp(mt, (mb - h).max(mt));
+        Some([nx, ny])
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ppp;
+        None
+    }
+}
+
+fn move_floating_card_physical(ppp: f32, x: i32, y: i32) {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn SetWindowPos(
+                hwnd: isize,
+                insert_after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
+        }
+        if let Some((hwnd, _ox, _oy, _w, _h)) = find_own_window_by_size(
+            &CARD_HWND,
+            (CARD_W * ppp).round() as i32,
+            (CARD_H * ppp).round() as i32,
+        ) {
+            const SWP_NOSIZE: u32 = 0x0001;
+            const SWP_NOZORDER: u32 = 0x0004;
+            const SWP_NOACTIVATE: u32 = 0x0010;
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    0,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (ppp, x, y);
+    }
 }
