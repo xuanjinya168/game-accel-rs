@@ -275,89 +275,27 @@ impl GameAccelApp {
                             .color(p.text_muted),
                     );
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let (pill_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(130.0, 30.0), Sense::hover());
-                    ui.painter().rect(
-                        pill_rect,
-                        CornerRadius::same(9),
-                        p.bg_card_alt,
-                        Stroke::new(1.0_f32, p.border_subtle),
-                        egui::StrokeKind::Inside,
-                    );
-                    let seg_w = 60.0;
-                    let seg_h = 24.0;
-                    for (idx, (val, lbl)) in [(false, "隐藏"), (true, "显示")].into_iter().enumerate()
-                    {
-                        let x = pill_rect.left() + 3.0 + idx as f32 * (seg_w + 4.0);
-                        let seg_rect = egui::Rect::from_min_size(
-                            Pos2::new(x, pill_rect.top() + 3.0),
-                            Vec2::new(seg_w, seg_h),
-                        );
-                        let resp = ui.interact(
-                            seg_rect,
-                            ui.id().with(("floating_pill_seg", idx)),
-                            Sense::click(),
-                        );
-                        let active = self.cfg.show_floating_pill == val;
-                        let fill = if active {
-                            p.bg_card
-                        } else if resp.hovered() {
-                            p.bg_nav_hover
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        let stroke = if active {
-                            Stroke::new(1.0_f32, p.border_subtle)
-                        } else {
-                            Stroke::NONE
-                        };
-                        ui.painter().rect(
-                            seg_rect,
-                            CornerRadius::same(6),
-                            fill,
-                            stroke,
-                            egui::StrokeKind::Inside,
-                        );
-                        ui.painter().text(
-                            seg_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            lbl,
-                            FontId::proportional(FONT_SM),
-                            if active {
-                                p.text_primary
-                            } else {
-                                p.text_muted
-                            },
-                        );
-                        if resp.clicked() && self.cfg.show_floating_pill != val {
-                            self.cfg.show_floating_pill = val;
-                            save_config(&self.cfg);
-                            self.show_toast(if val {
-                                "已开启桌面网速悬浮窗"
-                            } else {
-                                "已隐藏桌面网速悬浮窗"
-                            });
-                        }
-                    }
-                });
+                if let Some(val) = settings_segments(ui, p, "floating_pill_seg", self.cfg.show_floating_pill, &[(false, "隐藏"), (true, "显示")]) {
+                    self.cfg.show_floating_pill = val;
+                    save_config(&self.cfg);
+                    self.show_toast(if val { "已开启桌面网速悬浮窗" } else { "已隐藏桌面网速悬浮窗" });
+                }
             });
 
             ui.add_space(12.0);
             hairline_divider(ui, p);
             ui.add_space(12.0);
 
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 ui.label(RichText::new("悬浮窗灯效").size(FONT_BODY).strong().color(p.text_primary));
-                for (style, label) in [
+                if let Some(style) = settings_segments(ui, p, "floating_light_seg", self.cfg.floating_pill_light, &[
                     (PillLightStyle::Glow, "柔光"),
                     (PillLightStyle::Ripple, "微波纹"),
                     (PillLightStyle::Orbit, "星轨"),
                     (PillLightStyle::Bars, "律动"),
-                ] {
-                    if ui.selectable_value(&mut self.cfg.floating_pill_light, style, label).changed() {
-                        save_config(&self.cfg);
-                    }
+                ]) {
+                    self.cfg.floating_pill_light = style;
+                    save_config(&self.cfg);
                 }
             });
             ui.add_space(12.0);
@@ -687,4 +625,69 @@ impl GameAccelApp {
             });
         });
     }
+}
+
+fn settings_segments<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    p: ThemePalette,
+    id: &str,
+    selected: T,
+    options: &[(T, &str)],
+) -> Option<T> {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let (pill_rect, _) = ui.allocate_exact_size(
+            Vec2::new(6.0 + options.len() as f32 * 64.0 - 4.0, 30.0),
+            Sense::hover(),
+        );
+        ui.painter().rect(
+            pill_rect,
+            CornerRadius::same(9),
+            p.bg_card_alt,
+            Stroke::new(1.0_f32, p.border_subtle),
+            egui::StrokeKind::Inside,
+        );
+        let seg_w = 60.0;
+        let seg_h = 24.0;
+        let mut picked = None;
+        for (idx, &(val, lbl)) in options.iter().enumerate() {
+            let x = pill_rect.left() + 3.0 + idx as f32 * (seg_w + 4.0);
+            let seg_rect = egui::Rect::from_min_size(
+                Pos2::new(x, pill_rect.top() + 3.0),
+                Vec2::new(seg_w, seg_h),
+            );
+            let resp = ui.interact(seg_rect, ui.id().with((id, idx)), Sense::click());
+            let active = selected == val;
+            let fill = if active {
+                p.bg_card
+            } else if resp.hovered() {
+                p.bg_nav_hover
+            } else {
+                Color32::TRANSPARENT
+            };
+            let stroke = if active {
+                Stroke::new(1.0_f32, p.border_subtle)
+            } else {
+                Stroke::NONE
+            };
+            ui.painter().rect(
+                seg_rect,
+                CornerRadius::same(6),
+                fill,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                seg_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                lbl,
+                FontId::proportional(FONT_SM),
+                if active { p.text_primary } else { p.text_muted },
+            );
+            if resp.clicked() && !active {
+                picked = Some(val);
+            }
+        }
+        picked
+    })
+    .inner
 }
