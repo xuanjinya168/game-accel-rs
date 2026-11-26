@@ -192,39 +192,6 @@ pub fn draw_theme_icon(painter: &Painter, center: Pos2, is_dark: bool, color: Co
     }
 }
 
-/// Share icon (open tray with upward arrow).
-pub fn draw_share_icon(painter: &Painter, center: Pos2, color: Color32) {
-    let stroke = Stroke::new(1.4_f32, color);
-    painter.line_segment(
-        [
-            Pos2::new(center.x, center.y + 1.0),
-            Pos2::new(center.x, center.y - 5.2),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(center.x - 2.6, center.y - 2.6),
-            Pos2::new(center.x, center.y - 5.2),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(center.x + 2.6, center.y - 2.6),
-            Pos2::new(center.x, center.y - 5.2),
-        ],
-        stroke,
-    );
-    let l = center.x - 4.5;
-    let r = center.x + 4.5;
-    let t = center.y - 0.5;
-    let b = center.y + 5.0;
-    painter.line_segment([Pos2::new(l, t), Pos2::new(l, b)], stroke);
-    painter.line_segment([Pos2::new(l, b), Pos2::new(r, b)], stroke);
-    painter.line_segment([Pos2::new(r, b), Pos2::new(r, t)], stroke);
-}
-
 /// Vector window control icons (Minimize, Maximize/Restore & Close).
 pub fn draw_win_min_icon(painter: &Painter, center: Pos2, color: Color32) {
     painter.line_segment(
@@ -283,27 +250,6 @@ pub fn draw_win_close_icon(painter: &Painter, center: Pos2, color: Color32) {
         ],
         stroke,
     );
-}
-
-/// Thin chevron (down when `up == false`, up when `up == true`).
-pub fn draw_chevron(painter: &Painter, center: Pos2, up: bool, color: Color32) {
-    let stroke = Stroke::new(1.5_f32, color);
-    let dy = if up { -2.0 } else { 2.0 };
-    let left = Pos2::new(center.x - 4.0, center.y - dy * 0.5);
-    let mid = Pos2::new(center.x, center.y + dy * 1.1);
-    let right = Pos2::new(center.x + 4.0, center.y - dy * 0.5);
-    painter.line_segment([left, mid], stroke);
-    painter.line_segment([mid, right], stroke);
-}
-
-/// Crisp checkmark icon.
-pub fn draw_check_icon(painter: &Painter, center: Pos2, color: Color32) {
-    let stroke = Stroke::new(1.7_f32, color);
-    let p1 = Pos2::new(center.x - 4.2, center.y + 0.2);
-    let p2 = Pos2::new(center.x - 1.2, center.y + 3.4);
-    let p3 = Pos2::new(center.x + 4.6, center.y - 3.2);
-    painter.line_segment([p1, p2], stroke);
-    painter.line_segment([p2, p3], stroke);
 }
 
 /// Power icon for the primary connection button.

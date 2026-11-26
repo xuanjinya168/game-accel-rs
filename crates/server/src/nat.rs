@@ -1,8 +1,9 @@
-use crate::store::{AppState, LiveCounters};
+use crate::StreamContext;
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
 use protocol::dedup::DedupWindow;
+use protocol::domain::{AccessLogRecord, AccessOutcome};
 use protocol::frame::{FLAG_GAME_MODE, TargetAddr, UdpFrame};
 use protocol::pacer::{UdpDupPacer, send_datagram_checked};
 use protocol::sniff::extract_root_domain;
@@ -20,9 +21,6 @@ use tracing::{debug, warn};
 const NAT_IDLE_TIMEOUT_SECS: u64 = 60;
 const NAT_SOCKET_BUFFER: usize = 2 * 1024 * 1024;
 
-/// Bind a per-flow NAT socket. Prefers one dual-stack `[::]:0` socket so both IPv4
-/// and IPv6 targets work (and the Full Cone mapping stays a single port); falls back
-/// to IPv4-only on hosts without IPv6. Returns `(socket, is_dual_stack)`.
 pub(crate) fn bind_nat_socket() -> std::io::Result<(std::net::UdpSocket, bool)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let build = |domain: Domain, addr: SocketAddr| -> std::io::Result<std::net::UdpSocket> {
@@ -30,7 +28,6 @@ pub(crate) fn bind_nat_socket() -> std::io::Result<(std::net::UdpSocket, bool)> 
         if domain == Domain::IPV6 {
             s.set_only_v6(false)?;
         }
-        // Linux default (~208 KB) overflows on bursty game/voice traffic.
         let _ = s.set_recv_buffer_size(NAT_SOCKET_BUFFER);
         let _ = s.set_send_buffer_size(NAT_SOCKET_BUFFER);
         s.set_nonblocking(true)?;
@@ -39,7 +36,10 @@ pub(crate) fn bind_nat_socket() -> std::io::Result<(std::net::UdpSocket, bool)> 
     };
     match build(Domain::IPV6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) {
         Ok(s) => Ok((s, true)),
-        Err(_) => Ok((build(Domain::IPV4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?, false)),
+        Err(_) => Ok((
+            build(Domain::IPV4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?,
+            false,
+        )),
     }
 }
 
@@ -51,8 +51,6 @@ struct NatMeta {
 
 struct NatEntry {
     socket: Arc<UdpSocket>,
-    /// `true` when `socket` is an AF_INET6 dual-stack socket (IPv4 targets must be
-    /// addressed as v4-mapped IPv6); `false` for an IPv4-only fallback socket.
     dual_stack: bool,
     meta: Arc<NatMeta>,
     dedup: Mutex<DedupWindow>,
@@ -64,40 +62,26 @@ struct NatEntry {
 impl Drop for NatEntry {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.recv_task.lock()
-            && let Some(h) = guard.take() {
-                h.abort();
-            }
+            && let Some(h) = guard.take()
+        {
+            h.abort();
+        }
     }
 }
 
 /// Full Cone NAT (NAT1) table scoped to a single QUIC client connection.
-/// Lock-free fast path via DashMap + synchronized slow-path creation so concurrent
-/// first packets for the same `flow_id` never leak duplicate sockets or race `recv_task`.
 pub struct FullConeNat {
     conn: Connection,
     pacer: UdpDupPacer,
     entries: Arc<DashMap<u16, Arc<NatEntry>>>,
     create_lock: tokio::sync::Mutex<()>,
-    counters: Arc<LiveCounters>,
-    state: Arc<AppState>,
-    link_id: String,
-    link_name: String,
-    client_ip: String,
+    ctx: Arc<StreamContext>,
 }
 
 impl FullConeNat {
-    pub fn new(
-        conn: Connection,
-        pacer: UdpDupPacer,
-        counters: Arc<LiveCounters>,
-        state: Arc<AppState>,
-        link_id: String,
-        link_name: String,
-        client_ip: String,
-    ) -> Self {
+    pub(crate) fn new(conn: Connection, pacer: UdpDupPacer, ctx: Arc<StreamContext>) -> Self {
         let entries: Arc<DashMap<u16, Arc<NatEntry>>> = Arc::new(DashMap::new());
 
-        // Background idle reaper
         let reaper_entries = entries.clone();
         let reaper_conn = conn.clone();
         tokio::spawn(async move {
@@ -121,11 +105,7 @@ impl FullConeNat {
             pacer,
             entries,
             create_lock: tokio::sync::Mutex::new(()),
-            counters,
-            state,
-            link_id,
-            link_name,
-            client_ip,
+            ctx,
         }
     }
 
@@ -137,7 +117,6 @@ impl FullConeNat {
         let is_game = (frame.flags & FLAG_GAME_MODE) != 0;
         entry.meta.game_mode.store(is_game, Ordering::Relaxed);
 
-        // Deduplicate packets from client-side dual-send
         let is_new = {
             let mut dedup = entry.dedup.lock().unwrap_or_else(|e| e.into_inner());
             dedup.check_and_insert(frame.seq)
@@ -174,13 +153,12 @@ impl FullConeNat {
             _ => dst,
         };
         let sent = entry.socket.send_to(&frame.payload, send_addr).await?;
-        self.counters
+        self.ctx
+            .counters
             .tx_bytes
             .fetch_add(sent as u64, Ordering::Relaxed);
 
-        // Zero-allocation fast path: skip string formatting and lock once access logging
-        // is disabled or this flow has already logged its cap of 64 distinct targets.
-        if self.state.is_access_log_enabled() && !entry.seen_full.load(Ordering::Relaxed) {
+        if self.ctx.state.is_access_log_enabled() && !entry.seen_full.load(Ordering::Relaxed) {
             let (host_str, target_str) = match domain_host {
                 Some(h) => {
                     let t = format!("{h}:{}", dst.port());
@@ -202,30 +180,28 @@ impl FullConeNat {
                 }
             };
             if should_log {
-                self.state.record_access_log(
-                    &self.link_id,
-                    &self.link_name,
-                    &self.client_ip,
-                    "UDP",
-                    extract_root_domain(&host_str),
-                    target_str,
-                    sent as u64,
-                    0,
-                    0,
-                    "ok",
-                );
+                self.ctx.state.record_access(AccessLogRecord {
+                    link_id: self.ctx.link_id.clone(),
+                    link_name: self.ctx.link_name.clone(),
+                    client_ip: self.ctx.client_ip.clone(),
+                    proto: "UDP".to_string(),
+                    root_domain: extract_root_domain(&host_str),
+                    target: target_str,
+                    tx_bytes: sent as u64,
+                    rx_bytes: 0,
+                    duration_ms: 0,
+                    outcome: AccessOutcome::Ok,
+                });
             }
         }
         Ok(())
     }
 
     async fn get_or_create_entry(&self, flow_id: u16) -> Result<Arc<NatEntry>> {
-        // Lock-free fast path
         if let Some(existing) = self.entries.get(&flow_id) {
             return Ok(existing.clone());
         }
 
-        // Synchronized creation slow path (eliminates duplicate socket race)
         let _guard = self.create_lock.lock().await;
         if let Some(existing) = self.entries.get(&flow_id) {
             return Ok(existing.clone());
@@ -249,19 +225,16 @@ impl FullConeNat {
             recv_task: Mutex::new(None),
         });
 
-        // Insert BEFORE spawning receive task, and pass `Arc<NatMeta>` directly
-        // so `recv_task` can never race map insertion.
         self.entries.insert(flow_id, entry.clone());
 
         let conn = self.conn.clone();
         let pacer = self.pacer.clone();
-        let counters_rx = self.counters.clone();
+        let counters_rx = self.ctx.counters.clone();
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((n, src_addr)) => {
-                        // Report v4-mapped sources (dual-stack socket) as plain IPv4.
                         let src_addr = SocketAddr::new(src_addr.ip().to_canonical(), src_addr.port());
                         meta.last_active.store(now_secs(), Ordering::Relaxed);
                         counters_rx.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -281,7 +254,6 @@ impl FullConeNat {
                             if !send_datagram_checked(&conn, encoded.clone()) {
                                 break;
                             }
-                            // True zero-copy duplicate via shared connection-scoped 2ms pacer
                             if is_game && n < 200 {
                                 pacer.schedule_dup(encoded);
                             }

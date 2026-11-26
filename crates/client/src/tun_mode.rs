@@ -1,8 +1,6 @@
-use crate::relay::{
-    ClientStats, TUN_FLOW_MAX, TUN_FLOW_MIN, UdpDispatchMap, open_proxy_tcp_stream,
-    relay_fast_open, reserve_flow_id, send_proxy_udp_packet,
-};
+use crate::relay::{ClientStats, TUN_FLOW_MIN, UdpDispatchMap};
 use crate::rules::{DOMESTIC_DNS, DnsRoute, Route, RouteMode, Router};
+use crate::tunnel::TunnelSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -11,10 +9,7 @@ use netstack_smoltcp::StackBuilder;
 use protocol::TUN_MTU;
 use protocol::dedup::DedupWindow;
 use protocol::frame::{TargetAddr, UdpFrame};
-use protocol::pacer::UdpDupPacer;
-use protocol::share::NodeProtocol;
 use protocol::unix_now_secs as now_secs;
-use quinn::Connection;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Command;
 use std::sync::Arc;
@@ -81,7 +76,6 @@ fn detect_physical_gateway() -> Result<Ipv4Addr> {
     let out = run_hidden("route", &["print", "0.0.0.0"])?;
     for line in out.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        // Typical row: 0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.100  25
         if cols.len() >= 4
             && cols[0] == "0.0.0.0"
             && cols[1] == "0.0.0.0"
@@ -97,7 +91,6 @@ fn detect_physical_gateway() -> Result<Ipv4Addr> {
 
 /// RAII guard that pins the VPS server IP to the physical gateway and installs
 /// two half-default routes (`0.0.0.0/1` and `128.0.0.0/1`) onto the TUN interface.
-/// On drop (or even crash), the original `0.0.0.0/0` default route stays untouched.
 struct RouteGuard {
     server_v4: Option<Ipv4Addr>,
 }
@@ -108,7 +101,6 @@ impl RouteGuard {
         let phys_gw = detect_physical_gateway()?;
         let gw_str = phys_gw.to_string();
 
-        // 1. Pin VPS server IP via physical gateway so QUIC never loops back into TUN
         let server_v4 = match server_ip {
             IpAddr::V4(v4) => {
                 let ip_str = v4.to_string();
@@ -131,7 +123,6 @@ impl RouteGuard {
             IpAddr::V6(_) => None,
         };
 
-        // 2. Configure DNS on the TUN adapter (routed through QUIC to prevent DNS pollution)
         let _ = run_hidden(
             "netsh",
             &[
@@ -157,9 +148,6 @@ impl RouteGuard {
             ],
         );
 
-        // 3. Install 0.0.0.0/1 + 128.0.0.0/1 onto TUN (safer than replacing 0.0.0.0/0).
-        // Build the guard first so a partial failure runs Drop and removes the routes
-        // that did get added; otherwise half the internet stays routed to a dead TUN.
         let guard = Self { server_v4 };
         if let Err(e) = guard.install_half_default_routes(tun_if_index) {
             drop(guard);
@@ -218,8 +206,6 @@ impl Drop for RouteGuard {
     fn drop(&mut self) {
         #[cfg(target_os = "windows")]
         {
-            // Scope the deletes to our TUN gateway so a half-default route that belongs
-            // to another VPN/proxy tool is never removed.
             let tun_gw_str = TUN_GW.to_string();
             let _ = run_hidden(
                 "route",
@@ -259,7 +245,6 @@ impl Drop for TunUdpSession {
     }
 }
 
-/// Per-source direct UDP session (bound to physical NIC so it never loops back into TUN).
 struct TunDirectUdpSession {
     socket: Arc<tokio::net::UdpSocket>,
     last_active: Arc<AtomicU64>,
@@ -272,7 +257,6 @@ impl Drop for TunDirectUdpSession {
     }
 }
 
-/// Clears `DirectDialer` interface pinning whenever TUN exits or fails.
 struct DialerIfGuard(Arc<Router>);
 
 impl Drop for DialerIfGuard {
@@ -281,15 +265,9 @@ impl Drop for DialerIfGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_tun_mode(
     server_ip: IpAddr,
-    tcp_conn: Connection,
-    udp_conn: Connection,
-    pacer: UdpDupPacer,
-    udp_dispatch: UdpDispatchMap,
-    protocol: NodeProtocol,
-    game_dup: bool,
+    tunnel: Arc<TunnelSession>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
     log_tx: Option<mpsc::UnboundedSender<String>>,
@@ -310,9 +288,6 @@ pub async fn run_tun_mode(
         .name(TUN_NAME)
         .ipv4(TUN_IP, TUN_PREFIX, None);
 
-    // On Windows, `builder.mtu(1200)` also attempts to set IPv6 MTU = 1200, which fails with
-    // `ERROR_INVALID_PARAMETER (os error 87)` because IPv6 requires MTU >= 1280.
-    // Use `mtu_v4` on Windows and explicitly locate `wintun.dll` beside the executable.
     #[cfg(target_os = "windows")]
     {
         builder = builder.mtu_v4(TUN_MTU);
@@ -335,8 +310,6 @@ pub async fn run_tun_mode(
         .context("创建 Wintun 虚拟网卡失败（请确认同目录存在 wintun.dll 且已用管理员身份运行）")?;
 
     let if_index = dev.if_index().context("获取 TUN 网卡索引失败")?;
-    // Detect physical IPv4 interface BEFORE installing TUN half-default routes,
-    // so direct connections (`IP_UNICAST_IF`) bypass TUN without needing 8k route entries.
     let phys_if = crate::direct::detect_physical_interface_v4().filter(|&idx| idx != if_index);
     router.dialer.set_interface(phys_if);
     let _dialer_guard = DialerIfGuard(router.clone());
@@ -349,7 +322,6 @@ pub async fn run_tun_mode(
 
     let dev = Arc::new(dev);
 
-    // Build smoltcp userspace TCP/IP stack
     let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(true)
@@ -360,7 +332,6 @@ pub async fn run_tun_mode(
     let runner_task = runner.map(tokio::spawn);
     let (mut stack_sink, mut stack_stream) = stack.split();
 
-    // Pump 1: Wintun -> netstack
     let dev_in = dev.clone();
     let tun_to_stack = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
@@ -380,7 +351,6 @@ pub async fn run_tun_mode(
         }
     });
 
-    // Pump 2: netstack -> Wintun
     let dev_out = dev.clone();
     let stack_to_tun = tokio::spawn(async move {
         while let Some(pkt) = stack_stream.next().await {
@@ -398,18 +368,17 @@ pub async fn run_tun_mode(
         }
     });
 
-    // TCP handler: netstack TcpListener -> Direct (physical NIC) or QUIC TCP Stream lane
     let tcp_task = if let Some(mut listener) = tcp_listener {
-        let conn = tcp_conn.clone();
+        let tunnel_tcp = tunnel.clone();
         let stats = stats.clone();
         let router = router.clone();
         Some(tokio::spawn(async move {
             while let Some((stream, _local, _remote)) = listener.next().await {
-                let conn = conn.clone();
+                let tunnel_tcp = tunnel_tcp.clone();
                 let stats = stats.clone();
                 let router = router.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_tun_tcp(stream, conn, protocol, stats, router).await {
+                    if let Err(e) = handle_tun_tcp(stream, tunnel_tcp, stats, router).await {
                         debug!("tun tcp ended: {:#}", e);
                     }
                 });
@@ -419,14 +388,11 @@ pub async fn run_tun_mode(
         None
     };
 
-    // UDP handler: netstack UdpSocket <-> Direct UDP / Split DNS / QUIC Datagram
-    // Reserve flow_ids 32768..=65534 for TUN sessions so they never collide with SOCKS5 (1..=32767).
     let tun_flow_ids: Arc<DashMap<SocketAddr, Arc<TunUdpSession>>> = Arc::new(DashMap::new());
     let direct_flow_ids: Arc<DashMap<SocketAddr, Arc<TunDirectUdpSession>>> =
         Arc::new(DashMap::new());
     let next_tun_flow = Arc::new(AtomicU16::new(TUN_FLOW_MIN));
 
-    // Periodic idle reaper (60s timeout) prevents ephemeral DNS/UDP sockets from leaking flow_ids
     let reaper_flows = tun_flow_ids.clone();
     let reaper_direct = direct_flow_ids.clone();
     let reaper_task = tokio::spawn(async move {
@@ -447,15 +413,12 @@ pub async fn run_tun_mode(
 
     let (udp_tx_task, udp_rx_task) = if let Some(udp_sock) = udp_socket {
         let (mut udp_read, mut udp_write) = udp_sock.split();
-        // Unified return channel into TUN netstack: (payload, remote_src, local_dst, count_rx)
         let (out_tx, mut out_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr, bool)>(1024);
 
-        let conn_out = udp_conn.clone();
-        let pacer_tx = pacer.clone();
+        let tunnel_udp = tunnel.clone();
         let stats_tx = stats.clone();
         let flow_map = tun_flow_ids.clone();
         let direct_map = direct_flow_ids.clone();
-        let dispatch = udp_dispatch.clone();
         let next_flow = next_tun_flow.clone();
         let router_udp = router.clone();
         let out_tx_tunnel = out_tx.clone();
@@ -464,15 +427,10 @@ pub async fn run_tun_mode(
             while let Some((payload, local_src, remote_dst)) = udp_read.next().await {
                 let now = now_secs();
 
-                // 1. Split DNS (UDP port 53) & direct IPv4 UDP routing
                 let direct_target: Option<(SocketAddr, Option<SocketAddr>)> =
                     if remote_dst.port() == 53 && remote_dst.is_ipv4() {
                         match router_udp.decide_dns_query(&payload) {
-                            DnsRoute::Domestic => {
-                                // Rewrite domestic DNS query to 223.5.5.5:53, and spoof reply
-                                // source back to `remote_dst` so Windows DNS client accepts it.
-                                Some((DOMESTIC_DNS, Some(remote_dst)))
-                            }
+                            DnsRoute::Domestic => Some((DOMESTIC_DNS, Some(remote_dst))),
                             DnsRoute::Direct => Some((remote_dst, None)),
                             DnsRoute::Proxy => None,
                         }
@@ -540,15 +498,13 @@ pub async fn run_tun_mode(
                     continue;
                 }
 
-                // 2. Tunnelled UDP path (QUIC Datagram)
+                // Tunnelled UDP path via TunnelSession
                 let session = if let Some(existing) = flow_map.get(&local_src) {
                     existing.last_active.store(now, Ordering::Relaxed);
                     existing.clone()
                 } else {
                     let (f_tx, mut f_rx) = mpsc::channel::<UdpFrame>(256);
-                    let Some(fid) =
-                        reserve_flow_id(&next_flow, &dispatch, f_tx, TUN_FLOW_MIN, TUN_FLOW_MAX)
-                    else {
+                    let Some(fid) = tunnel_udp.reserve_tun_flow(&next_flow, f_tx) else {
                         warn!("TUN UDP flow_id space exhausted, dropping packet from {local_src}");
                         continue;
                     };
@@ -557,11 +513,11 @@ pub async fn run_tun_mode(
                     let last_active_rx = last_active.clone();
                     let out_tx_clone = out_tx_tunnel.clone();
                     let router_hint = router_udp.clone();
+                    let dedup_rx = tunnel_udp.should_dedup_rx();
                     let rx_handle = tokio::spawn(async move {
                         let mut dedup = DedupWindow::new();
                         while let Some(frame) = f_rx.recv().await {
-                            if protocol == NodeProtocol::Gacl && !dedup.check_and_insert(frame.seq)
-                            {
+                            if dedup_rx && !dedup.check_and_insert(frame.seq) {
                                 continue;
                             }
                             last_active_rx.store(now_secs(), Ordering::Relaxed);
@@ -586,7 +542,7 @@ pub async fn run_tun_mode(
                         tx_seq: AtomicU16::new(0),
                         last_active,
                         rx_task: rx_handle,
-                        dispatch: dispatch.clone(),
+                        dispatch: tunnel_udp.dispatch_map().clone(),
                         stats: stats_tx.clone(),
                     });
                     flow_map.insert(local_src, session.clone());
@@ -597,16 +553,12 @@ pub async fn run_tun_mode(
                 let payload_len = payload.len();
                 let payload_bytes = Bytes::from(payload);
 
-                // Enable game dual-send only for small non-DNS, non-QUIC-443 UDP packets
-                let is_game_pkt = game_dup
+                let is_game_pkt = tunnel_udp.game_dup_enabled()
                     && payload_len < 200
                     && remote_dst.port() != 53
                     && remote_dst.port() != 443;
 
-                if !send_proxy_udp_packet(
-                    protocol,
-                    &conn_out,
-                    &pacer_tx,
+                if !tunnel_udp.send_udp(
                     session.flow_id,
                     seq,
                     is_game_pkt,
@@ -638,7 +590,6 @@ pub async fn run_tun_mode(
         (None, None)
     };
 
-    // Wait for shutdown signal
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -648,7 +599,6 @@ pub async fn run_tun_mode(
         }
     }
 
-    // Cleanup all background tasks & dispatch entries (RAII Drop on TunUdpSession handles per-flow cleanup)
     reaper_task.abort();
     tun_to_stack.abort();
     stack_to_tun.abort();
@@ -672,18 +622,13 @@ pub async fn run_tun_mode(
 
 async fn handle_tun_tcp(
     mut stream: netstack_smoltcp::TcpStream,
-    conn: Connection,
-    protocol: NodeProtocol,
+    tunnel: Arc<TunnelSession>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
     let dst = *stream.remote_addr();
-    // Tunnel-only server panel IP (198.18.0.1) must always traverse the tunnel.
     let is_panel_ip = dst.ip() == IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
 
-    // If DNS hints didn't record `dst` (e.g. browser DoH or pre-cached DNS) on client-first
-    // ports 80/443 in Rule mode, opportunistically sniff TLS SNI / HTTP Host from the first
-    // chunk so domain rules still take precedence over raw IP ranges.
     let mut first_chunk: Vec<u8> = Vec::new();
     let route = if is_panel_ip {
         Route::Proxy
@@ -720,8 +665,7 @@ async fn handle_tun_tcp(
         return Ok(());
     }
 
-    let (mut quic_send, quic_recv) =
-        open_proxy_tcp_stream(&conn, protocol, &TargetAddr::Ip(dst)).await?;
+    let (mut quic_send, quic_recv) = tunnel.open_tcp(&TargetAddr::Ip(dst)).await?;
     if !first_chunk.is_empty() {
         quic_send.write_all(&first_chunk).await?;
         stats
@@ -729,9 +673,8 @@ async fn handle_tun_tcp(
             .fetch_add(first_chunk.len() as u64, Ordering::Relaxed);
     }
 
-    // Fast-open: the smoltcp handshake with the app is already complete, so start
-    // relaying immediately; the server's dial status is checked inside the relay.
-    relay_fast_open(stream, quic_send, quic_recv, protocol, stats, None)
+    tunnel
+        .relay_tcp(stream, quic_send, quic_recv, stats, None)
         .await
         .with_context(|| format!("tcp to {dst}"))
 }

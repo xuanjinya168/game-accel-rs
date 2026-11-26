@@ -7,151 +7,125 @@ pub(crate) mod tray_popover;
 
 use crate::icons;
 use crate::storage::save_config;
-use crate::theme::{
-    FONT_BODY, FONT_SM, FONT_SUB, FONT_TITLE, FONT_XS, ThemeMode, ThemePalette, apply_theme,
-};
-use crate::widgets::{aligned_row, draw_status_pill, hairline_divider};
+use crate::theme::{FONT_XS, ThemeMode, ThemePalette, apply_theme, font_bold};
+use crate::widgets::{aligned_row, draw_status_pill};
 use crate::{APP_VERSION, ConnState, GameAccelApp, NavTab};
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Layout, PointerButton, Pos2, RichText, Sense,
-    Stroke, Vec2,
+    self, Align, CornerRadius, FontId, Layout, PointerButton, Pos2, RichText, Sense, Stroke, Vec2,
 };
 
 impl GameAccelApp {
+    /// Renders the 68px ultra-slim vertical icon rail matching `v03_cockpit_preview.html`:
+    /// top Terracotta brand mark, 4 gamer tabs with clean surface card highlight (no orange stripe),
+    /// and `运维` cleanly isolated at the bottom.
     pub(crate) fn render_sidebar_contents(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         p: ThemePalette,
     ) {
-        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+        ui.spacing_mut().item_spacing = Vec2::new(0.0, 6.0);
 
-        // Optically aligned brand header (acts as frameless window drag handle; Beta badge removed)
-        let (brand_rect, brand_resp) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), 36.0),
-            Sense::click_and_drag(),
-        );
+        // Brand Bolt Mark (36x36 centered inside 52px rail width, acts as frameless drag handle)
+        let (brand_slot, brand_resp) =
+            ui.allocate_exact_size(Vec2::new(52.0, 40.0), Sense::click_and_drag());
         if brand_resp.drag_started_by(PointerButton::Primary) {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
+        let logo_rect = egui::Rect::from_center_size(brand_slot.center(), Vec2::splat(36.0));
+        icons::draw_brand_logo(ui.painter(), logo_rect, p);
+        brand_resp.on_hover_text(format!("GameAccel {APP_VERSION}"));
 
-        let painter = ui.painter();
-        let logo_rect = egui::Rect::from_min_size(
-            Pos2::new(brand_rect.left() + 2.0, brand_rect.center().y - 16.0),
-            Vec2::new(32.0, 32.0),
-        );
-        icons::draw_brand_logo(painter, logo_rect, p);
+        ui.add_space(12.0);
 
-        let text_x = logo_rect.right() + 10.0;
-        let title_y = logo_rect.top() + 9.0;
-        let sub_y = logo_rect.bottom() - 6.5;
-
-        painter.text(
-            Pos2::new(text_x, title_y),
-            egui::Align2::LEFT_CENTER,
-            "GameAccel",
-            FontId::proportional(FONT_SUB),
-            p.text_primary,
-        );
-        painter.text(
-            Pos2::new(text_x, sub_y),
-            egui::Align2::LEFT_CENTER,
-            APP_VERSION,
-            FontId::monospace(FONT_XS),
-            p.text_muted,
-        );
-
-        ui.add_space(20.0);
-
-        let mut items = vec![
-            (NavTab::Dashboard, 0u8, "加速面板"),
-            (NavTab::Nodes, 1u8, "节点管理"),
-            (NavTab::Logs, 2u8, "运行日志"),
+        let gamer_items = [
+            (NavTab::Dashboard, 0u8, "加速"),
+            (NavTab::Nodes, 1u8, "线路"),
+            (NavTab::Logs, 2u8, "日志"),
+            (NavTab::Settings, 3u8, "设置"),
         ];
-        if self.cfg.show_admin_menu {
-            items.push((NavTab::Admin, 4u8, "服务端"));
-        }
-        items.push((NavTab::Settings, 3u8, "偏好设置"));
 
-        for (tab, icon_kind, label) in items {
-            let active = self.active_tab == tab;
-            let (rect, resp) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
-            let bg = if active {
-                p.bg_nav_active
-            } else if resp.hovered() {
-                p.bg_nav_hover
-            } else {
-                Color32::TRANSPARENT
-            };
-            let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(8), bg);
-            if active {
+        for (tab, icon_kind, label) in gamer_items {
+            self.draw_rail_item(ui, tab, icon_kind, label, p);
+        }
+
+        if self.cfg.show_admin_menu {
+            let remaining = ui.available_height();
+            if remaining > 58.0 {
+                ui.add_space(remaining - 56.0);
+            }
+            let (div_rect, _) = ui.allocate_exact_size(Vec2::new(52.0, 6.0), Sense::hover());
+            ui.painter().line_segment(
+                [
+                    Pos2::new(div_rect.center().x - 14.0, div_rect.center().y),
+                    Pos2::new(div_rect.center().x + 14.0, div_rect.center().y),
+                ],
+                Stroke::new(1.0_f32, p.border_subtle),
+            );
+            self.draw_rail_item(ui, NavTab::Admin, 4u8, "运维", p);
+        }
+    }
+
+    fn draw_rail_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        tab: NavTab,
+        icon_kind: u8,
+        label: &str,
+        p: ThemePalette,
+    ) {
+        let active = self.active_tab == tab;
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(52.0, 46.0), Sense::click());
+        let painter = ui.painter();
+
+        if active {
+            if p.card_shadow != egui::Shadow::NONE {
+                painter.add(p.card_shadow.as_shape(rect, CornerRadius::same(10)));
+            }
+            painter.rect_filled(rect, CornerRadius::same(10), p.bg_nav_active);
+            if p.is_dark {
                 painter.rect_stroke(
                     rect,
-                    CornerRadius::same(8),
+                    CornerRadius::same(10),
                     Stroke::new(1.0_f32, p.border_subtle),
                     egui::StrokeKind::Inside,
                 );
             }
-            let icon_color = if active { p.accent } else { p.text_muted };
-            let icon_center = Pos2::new(rect.left() + 16.0, rect.center().y);
-            icons::draw_nav_icon(painter, icon_center, icon_kind, icon_color);
-
-            let fg = if active {
-                p.text_primary
-            } else {
-                p.text_secondary
-            };
-            let galley =
-                ui.fonts(|f| f.layout_no_wrap(label.to_string(), FontId::proportional(FONT_BODY), fg));
-            painter.galley(
-                Pos2::new(rect.left() + 34.0, rect.center().y - galley.size().y * 0.5),
-                galley,
-                fg,
-            );
-            if resp.clicked() {
-                self.active_tab = tab;
-            }
-            ui.add_space(3.0);
+        } else if resp.hovered() {
+            painter.rect_filled(rect, CornerRadius::same(10), p.bg_nav_hover);
         }
 
-        // Minimalist single-row footer pinned at bottom
-        let remaining = ui.available_height();
-        if remaining > 34.0 {
-            ui.add_space(remaining - 32.0);
+        let fg = if active {
+            p.text_primary
+        } else if resp.hovered() {
+            p.text_secondary
+        } else {
+            p.text_muted
+        };
+        icons::draw_nav_icon(
+            painter,
+            Pos2::new(rect.center().x, rect.top() + 15.5),
+            icon_kind,
+            fg,
+        );
+
+        let font = if active {
+            font_bold(FONT_XS)
+        } else {
+            FontId::proportional(FONT_XS)
+        };
+        let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, fg));
+        painter.galley(
+            Pos2::new(
+                rect.center().x - galley.size().x * 0.5,
+                rect.bottom() - 10.5 - galley.size().y * 0.5,
+            ),
+            galley,
+            fg,
+        );
+        if resp.clicked() {
+            self.active_tab = tab;
         }
-        hairline_divider(ui, p);
-        ui.add_space(6.0);
-        aligned_row(ui, 20.0, |ui| {
-            ui.label(
-                RichText::new(&self.cfg.listen_addr)
-                    .size(FONT_SM)
-                    .monospace()
-                    .color(p.text_secondary),
-            );
-            if self.is_admin {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let font = FontId::proportional(FONT_XS);
-                    let galley =
-                        ui.fonts(|f| f.layout_no_wrap("TUN".to_string(), font, p.success_text));
-                    let (r, _) = ui.allocate_exact_size(
-                        Vec2::new(galley.size().x + 10.0, 18.0),
-                        Sense::hover(),
-                    );
-                    ui.painter()
-                        .rect_filled(r, CornerRadius::same(4), p.success_soft);
-                    ui.painter().galley(
-                        Pos2::new(
-                            r.center().x - galley.size().x * 0.5,
-                            r.center().y - galley.size().y * 0.5,
-                        ),
-                        galley,
-                        p.success_text,
-                    );
-                });
-            }
-        });
     }
 
     pub(crate) fn render_right_workspace(
@@ -162,20 +136,20 @@ impl GameAccelApp {
     ) {
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
-        // Integrated frameless title bar locked to 28px height for exact horizontal centering
+        // Slim 28px frameless studio topbar matching `v03_cockpit_preview.html`
         aligned_row(ui, 28.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
             let page_title = match self.active_tab {
-                NavTab::Dashboard => "加速面板",
-                NavTab::Nodes => "节点管理",
-                NavTab::Logs => "运行日志",
-                NavTab::Admin => "服务端",
+                NavTab::Dashboard => "加速驾驶舱",
+                NavTab::Nodes => "线路与订阅",
+                NavTab::Logs => "诊断日志",
+                NavTab::Admin => "服务端运维",
                 NavTab::Settings => "偏好设置",
             };
             let title_resp = ui.add(
                 egui::Label::new(
                     RichText::new(page_title)
-                        .size(FONT_TITLE)
-                        .strong()
+                        .font(font_bold(16.0))
                         .color(p.text_primary),
                 )
                 .sense(Sense::click_and_drag()),
@@ -188,8 +162,43 @@ impl GameAccelApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
             }
 
+            // Soft recessed well port badge (`127.0.0.1:1080`, click to copy)
+            let addr_str = self.cfg.listen_addr.clone();
+            let port_galley = ui.fonts(|f| {
+                f.layout_no_wrap(
+                    addr_str.clone(),
+                    FontId::monospace(11.5),
+                    p.text_muted,
+                )
+            });
+            let (p_rect, p_resp) = ui.allocate_exact_size(
+                Vec2::new(port_galley.size().x + 16.0, 22.0),
+                Sense::click(),
+            );
+            ui.painter().rect_filled(
+                p_rect,
+                CornerRadius::same(6),
+                if p_resp.hovered() {
+                    p.bg_nav_hover
+                } else {
+                    p.bg_card_alt
+                },
+            );
+            ui.painter().galley(
+                Pos2::new(
+                    p_rect.center().x - port_galley.size().x * 0.5,
+                    p_rect.center().y - port_galley.size().y * 0.5,
+                ),
+                port_galley,
+                p.text_muted,
+            );
+            if p_resp.on_hover_text("点击复制本地混合代理地址").clicked() {
+                ctx.copy_text(addr_str);
+                self.show_toast("已复制本地代理地址");
+            }
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.x = 4.0;
 
                 // Close button (minimize to system tray)
                 let (c_rect, c_resp) =
@@ -216,7 +225,7 @@ impl GameAccelApp {
                     ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
                 if x_resp.hovered() {
                     ui.painter()
-                        .rect_filled(x_rect, CornerRadius::same(7), p.bg_nav_hover);
+                        .rect_filled(x_rect, CornerRadius::same(7), p.bg_card_alt);
                 }
                 icons::draw_win_max_icon(
                     ui.painter(),
@@ -225,11 +234,7 @@ impl GameAccelApp {
                     p.text_secondary,
                 );
                 if x_resp
-                    .on_hover_text(if is_maximized {
-                        "还原窗口"
-                    } else {
-                        "最大化"
-                    })
+                    .on_hover_text(if is_maximized { "还原窗口" } else { "最大化" })
                     .clicked()
                 {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
@@ -240,27 +245,20 @@ impl GameAccelApp {
                     ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
                 if m_resp.hovered() {
                     ui.painter()
-                        .rect_filled(m_rect, CornerRadius::same(7), p.bg_nav_hover);
+                        .rect_filled(m_rect, CornerRadius::same(7), p.bg_card_alt);
                 }
                 icons::draw_win_min_icon(ui.painter(), m_rect.center(), p.text_secondary);
                 if m_resp.on_hover_text("最小化").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 }
 
-                // Theme toggle (Sun / Moon)
+                // Uniform borderless Theme toggle (Sun / Moon) matching window controls
                 let (t_rect, t_resp) =
                     ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
-                ui.painter().rect(
-                    t_rect,
-                    CornerRadius::same(7),
-                    if t_resp.hovered() {
-                        p.bg_nav_hover
-                    } else {
-                        p.bg_card
-                    },
-                    Stroke::new(1.0_f32, p.border_subtle),
-                    egui::StrokeKind::Inside,
-                );
+                if t_resp.hovered() {
+                    ui.painter()
+                        .rect_filled(t_rect, CornerRadius::same(7), p.bg_card_alt);
+                }
                 icons::draw_theme_icon(ui.painter(), t_rect.center(), p.is_dark, p.text_secondary);
                 if t_resp
                     .on_hover_text(if p.is_dark {
@@ -278,32 +276,35 @@ impl GameAccelApp {
                     save_config(&self.cfg);
                 }
 
-                // Compact status pill
-                let reconnect = self.reconnect_status();
-                let pill = match (self.state, reconnect) {
-                    (ConnState::Connected, _) => "已加速".to_string(),
-                    (ConnState::Connecting, Some((attempt, 0))) => format!("重连 #{attempt}"),
-                    (ConnState::Connecting, Some((attempt, secs))) => {
-                        format!("重连 #{attempt} ({secs}s)")
-                    }
-                    (ConnState::Connecting, None) => "连接中…".to_string(),
-                    (ConnState::Disconnected, _) => "未连接".to_string(),
-                };
-                let (dot_col, bg, fg, stroke_col) = match self.state {
-                    ConnState::Connected => (
-                        p.success_text,
-                        p.success_soft,
-                        p.success_text,
-                        p.success_text,
-                    ),
-                    ConnState::Connecting => (p.accent, p.accent_soft, p.accent_text, p.accent),
-                    ConnState::Disconnected => {
-                        (p.text_muted, p.bg_card, p.text_secondary, p.border_subtle)
-                    }
-                };
-                draw_status_pill(ui, &pill, dot_col, bg, fg, stroke_col);
+                if self.active_tab != NavTab::Dashboard {
+                    let reconnect = self.reconnect_status();
+                    let pill_txt = match (self.state, reconnect) {
+                        (ConnState::Connected, _) => "隧道保护中".to_string(),
+                        (ConnState::Connecting, Some((attempt, 0))) => format!("重连 #{attempt}"),
+                        (ConnState::Connecting, Some((attempt, secs))) => {
+                            format!("重连 #{attempt} ({secs}s)")
+                        }
+                        (ConnState::Connecting, None) => "握手中…".to_string(),
+                        (ConnState::Disconnected, _) => "待机".to_string(),
+                    };
+                    let (dot_col, bg, fg, stroke_col) = match self.state {
+                        ConnState::Connected => (
+                            p.success_text,
+                            p.success_soft,
+                            p.success_text,
+                            p.success_text,
+                        ),
+                        ConnState::Connecting => {
+                            (p.warn_text, p.warn_soft, p.warn_text, p.warn_text)
+                        }
+                        ConnState::Disconnected => {
+                            (p.text_muted, p.bg_card, p.text_secondary, p.border_subtle)
+                        }
+                    };
+                    draw_status_pill(ui, &pill_txt, dot_col, bg, fg, stroke_col);
+                }
 
-                // Remaining empty space between status pill and title -> drag handle
+                // Remaining empty header area -> frameless window drag handle
                 let gap_w = ui.available_width();
                 if gap_w > 6.0 {
                     let (_, gap_resp) =
@@ -318,12 +319,11 @@ impl GameAccelApp {
             });
         });
 
-        ui.add_space(14.0);
+        ui.add_space(6.0);
 
-        // Responsive max-width centering on wide/maximized monitors
         let max_content_w = match self.active_tab {
             NavTab::Logs | NavTab::Admin => 1180.0,
-            _ => 960.0,
+            _ => 1040.0,
         };
         let avail_w = ui.available_width();
         let avail_h = ui.available_height();

@@ -42,6 +42,23 @@ impl GameAccelApp {
         self.connect(false);
     }
 
+    pub(crate) fn switch_active_node(&mut self, node_id: String) {
+        if self.cfg.active_node_id == node_id {
+            return;
+        }
+        self.cfg.active_node_id = node_id;
+        save_config(&self.cfg);
+        if self.state != ConnState::Disconnected {
+            self.stop_connect();
+            self.start_connect();
+            if let Some(n) = self.cfg.active_node() {
+                self.show_toast(format!("已切换至「{}」并重新建立加速", n.name));
+            }
+        } else if let Some(n) = self.cfg.active_node() {
+            self.show_toast(format!("已选用节点「{}」", n.name));
+        }
+    }
+
     pub(crate) fn switch_route_mode(&mut self, mode: storage::RouteMode) {
         if self.cfg.route_mode == mode {
             return;
@@ -190,12 +207,7 @@ impl GameAccelApp {
         // Allocate fresh stats per session so a winding-down previous task cannot
         // reset `connected` or counters of the newly started session.
         self.stats = Arc::new(ClientStats::default());
-        self.rtt_history.clear();
-        self.speed_history.clear();
-        self.last_tx_bytes = 0;
-        self.last_rx_bytes = 0;
-        self.tx_speed_bps = 0.0;
-        self.rx_speed_bps = 0.0;
+        self.telemetry.reset();
         self.state = ConnState::Connecting;
 
         if self.cfg.proxy_mode == ProxyMode::SystemProxy {
@@ -263,12 +275,7 @@ impl GameAccelApp {
         }
         self.state = ConnState::Disconnected;
         self.stats = Arc::new(ClientStats::default());
-        self.rtt_history.clear();
-        self.speed_history.clear();
-        self.last_tx_bytes = 0;
-        self.last_rx_bytes = 0;
-        self.tx_speed_bps = 0.0;
-        self.rx_speed_bps = 0.0;
+        self.telemetry.reset();
 
         if self.sys_proxy_flag.swap(false, Ordering::SeqCst) {
             match sys_proxy::disable_system_proxy() {
@@ -391,8 +398,7 @@ impl GameAccelApp {
             self.push_log(format!("{reason}，{secs} 秒后自动重连（第 {attempt} 次）"));
             // Keep the system proxy on: the next attempt restores the local listener.
             self.state = ConnState::Connecting;
-            self.tx_speed_bps = 0.0;
-            self.rx_speed_bps = 0.0;
+            self.telemetry.clear_instant_rates();
         } else {
             let attempts = self.reconnect.attempt();
             self.last_error = Some(format!("{reason}，自动重连 {attempts} 次仍未成功"));
@@ -626,32 +632,8 @@ impl GameAccelApp {
             self.stop_connect();
         }
 
-        let elapsed = self.last_sample_at.elapsed();
-        if elapsed >= Duration::from_secs(1) {
-            let secs = elapsed.as_secs_f64();
-            let cur_tx = self.stats.tx_bytes.load(Ordering::Relaxed);
-            let cur_rx = self.stats.rx_bytes.load(Ordering::Relaxed);
-            if self.state == ConnState::Connected {
-                self.tx_speed_bps = cur_tx.saturating_sub(self.last_tx_bytes) as f64 / secs;
-                self.rx_speed_bps = cur_rx.saturating_sub(self.last_rx_bytes) as f64 / secs;
-                let rtt = self.stats.rtt_ms.load(Ordering::Relaxed);
-                if self.rtt_history.len() >= 60 {
-                    self.rtt_history.pop_front();
-                }
-                self.rtt_history.push_back(rtt);
-                if self.speed_history.len() >= 60 {
-                    self.speed_history.pop_front();
-                }
-                self.speed_history
-                    .push_back((self.rx_speed_bps, self.tx_speed_bps));
-            } else {
-                self.tx_speed_bps = 0.0;
-                self.rx_speed_bps = 0.0;
-            }
-            self.last_tx_bytes = cur_tx;
-            self.last_rx_bytes = cur_rx;
-            self.last_sample_at = Instant::now();
-        }
+        self.telemetry
+            .tick_if_due(&self.stats, self.state == ConnState::Connected);
 
         if let Some((_, ts)) = &self.toast
             && ts.elapsed() > Duration::from_millis(2700)

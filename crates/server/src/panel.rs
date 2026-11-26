@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use protocol::domain::AccessOutcome;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,9 +52,10 @@ fn extract_sid(headers: &HeaderMap) -> Option<String> {
     for part in cookie_hdr.split(';') {
         let part = part.trim();
         if let Some(val) = part.strip_prefix(&format!("{COOKIE_NAME}="))
-            && !val.is_empty() {
-                return Some(val.to_string());
-            }
+            && !val.is_empty()
+        {
+            return Some(val.to_string());
+        }
     }
     None
 }
@@ -69,8 +71,8 @@ fn require_auth(headers: &HeaderMap, state: &AppState) -> std::result::Result<()
     Ok(())
 }
 
-pub async fn run_panel_server(listen: SocketAddr, state: Arc<AppState>) -> Result<()> {
-    let app = Router::new()
+pub fn build_panel_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/", get(index_handler))
         .route("/sub/{token}", get(subscription_handler))
         .route("/api/login", post(login_handler))
@@ -88,8 +90,11 @@ pub async fn run_panel_server(listen: SocketAddr, state: Arc<AppState>) -> Resul
         .route("/api/logs/toggle", put(toggle_logs_handler))
         .route("/api/settings/node", put(update_node_settings_handler))
         .route("/api/settings/password", put(update_password_handler))
-        .with_state(state);
+        .with_state(state)
+}
 
+pub async fn run_panel_server(listen: SocketAddr, state: Arc<AppState>) -> Result<()> {
+    let app = build_panel_router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!("Web admin panel listening on http://{}", listen);
     axum::serve(
@@ -112,28 +117,20 @@ async fn login_handler(
 ) -> Response {
     let ip = addr.ip().to_string();
     if let Err(remaining) = state.check_login_throttle(addr.ip()) {
-        state.record_access_log(
-            "",
+        state.record_panel_audit(
             "管理后台",
             &ip,
-            "PANEL",
-            "login".to_string(),
+            "login",
             format!(
                 "POST /api/login 已被限流 (user={})，剩余 {} 秒",
                 req.username,
                 remaining.as_secs() + 1
             ),
-            0,
-            0,
-            0,
-            "denied",
+            AccessOutcome::Denied,
         );
         return json_err(
             StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "登录失败次数过多，请 {} 秒后重试",
-                remaining.as_secs() + 1
-            ),
+            format!("登录失败次数过多，请 {} 秒后重试", remaining.as_secs() + 1),
         );
     }
     let is_https = headers
@@ -144,17 +141,12 @@ async fn login_handler(
     let login = state.verify_login(&req.username, &req.password);
     state.record_login_result(addr.ip(), login.is_some());
     if let Some(sid) = login {
-        state.record_access_log(
-            "",
+        state.record_panel_audit(
             "管理后台",
             &ip,
-            "PANEL",
-            "login".to_string(),
+            "login",
             format!("POST /api/login (user={})", req.username),
-            0,
-            0,
-            0,
-            "ok",
+            AccessOutcome::Ok,
         );
         let mut resp = (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
         let secure_flag = if is_https { "; Secure" } else { "" };
@@ -166,17 +158,12 @@ async fn login_handler(
         }
         resp
     } else {
-        state.record_access_log(
-            "",
+        state.record_panel_audit(
             "管理后台",
             &ip,
-            "PANEL",
-            "login".to_string(),
+            "login",
             format!("POST /api/login 密码错误 (user={})", req.username),
-            0,
-            0,
-            0,
-            "denied",
+            AccessOutcome::Denied,
         );
         json_err(StatusCode::UNAUTHORIZED, "账号或密码错误")
     }
@@ -187,7 +174,8 @@ async fn logout_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         state.revoke_session(&sid);
     }
     let mut resp = (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
-    if let Ok(val) = HeaderValue::from_str(&format!("{COOKIE_NAME}=; Path=/; HttpOnly; Max-Age=0")) {
+    if let Ok(val) = HeaderValue::from_str(&format!("{COOKIE_NAME}=; Path=/; HttpOnly; Max-Age=0"))
+    {
         resp.headers_mut().insert(header::SET_COOKIE, val);
     }
     resp
@@ -350,17 +338,12 @@ async fn subscription_handler(
     let ip = addr.ip().to_string();
     match state.build_subscription(&token) {
         Ok((payload, tx, rx, total_limit)) => {
-            state.record_access_log(
-                "",
+            state.record_panel_audit(
                 &payload.name,
                 &ip,
-                "PANEL",
-                "subscription".to_string(),
+                "subscription",
                 "GET /sub/***".to_string(),
-                0,
-                0,
-                0,
-                "ok",
+                AccessOutcome::Ok,
             );
             let mut resp = Json(payload).into_response();
             let userinfo = format!(
@@ -373,17 +356,12 @@ async fn subscription_handler(
             resp
         }
         Err(e) => {
-            state.record_access_log(
-                "",
+            state.record_panel_audit(
                 "订阅拉取",
                 &ip,
-                "PANEL",
-                "subscription".to_string(),
+                "subscription",
                 format!("GET /sub/*** ({e:#})"),
-                0,
-                0,
-                0,
-                "denied",
+                AccessOutcome::Denied,
             );
             json_err(StatusCode::FORBIDDEN, format!("{e:#}"))
         }

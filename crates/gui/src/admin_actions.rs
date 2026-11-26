@@ -123,11 +123,13 @@ impl GameAccelApp {
                 &server,
                 &listen_addr,
                 &cookie,
-                editing_id.as_deref(),
-                &name,
-                game_dup,
-                traffic_limit_gb,
-                expire_at.as_deref(),
+                admin::SaveLinkRequest {
+                    editing_id,
+                    name,
+                    game_dup,
+                    traffic_limit_gb,
+                    expire_at,
+                },
             )
             .await;
             let _ = ev_tx.send(AsyncEvent::Admin(AdminEvent::MutationResult {

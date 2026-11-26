@@ -1,29 +1,19 @@
+pub use crate::audit_log::{AccessLogEntry, AccessLogService, AccessLogsResponse};
+use crate::auth_guard::PanelSessionGuard;
 pub use crate::crypto::{generate_random_str, hash_password, verify_password};
 use crate::crypto::{PBKDF2_PREFIX, constant_time_eq};
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
+use protocol::domain::{AccessLogRecord, AccessOutcome, LinkStatus};
 use protocol::share::{NodeProfile, SubscriptionPayload};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::info;
-
-const MAX_MEM_ACCESS_LOGS: usize = 500;
-const MAX_ACCESS_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB rotation
-const ACCESS_LOG_QUEUE_CAP: usize = 1024;
-
-const SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
-const LOGIN_MAX_FAILURES: u32 = 10;
-const LOGIN_WINDOW: Duration = Duration::from_secs(5 * 60);
-const LOGIN_FAILURES_CAP: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkRecord {
@@ -59,29 +49,6 @@ pub struct PanelConfig {
     #[serde(default = "default_true")]
     pub access_log_enabled: bool,
     pub links: Vec<LinkRecord>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AccessLogEntry {
-    pub id: u64,
-    pub time: String,
-    pub link_id: String,
-    pub link_name: String,
-    pub client_ip: String,
-    pub proto: String,
-    pub root_domain: String,
-    pub target: String,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-    pub duration_ms: u64,
-    pub status: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AccessLogsResponse {
-    pub enabled: bool,
-    pub total_buffered: usize,
-    pub logs: Vec<AccessLogEntry>,
 }
 
 #[derive(Debug, Default)]
@@ -137,7 +104,7 @@ impl Drop for ConnGuard {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkView {
     pub id: String,
     pub name: String,
@@ -152,10 +119,10 @@ pub struct LinkView {
     pub created_at: String,
     pub share_uri: String,
     pub hy2_uri: String,
-    pub status: String, // "active" | "disabled" | "expired" | "over_limit"
+    pub status: LinkStatus,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverviewView {
     pub uptime_secs: u64,
     pub public_host: String,
@@ -169,7 +136,7 @@ pub struct OverviewView {
     pub total_rx_bytes: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateLinkInput {
     pub name: String,
     #[serde(default = "default_true")]
@@ -178,13 +145,11 @@ pub struct CreateLinkInput {
     pub expire_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateLinkInput {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub game_dup: Option<bool>,
-    // Double Option: absent key => None (keep), explicit null => Some(None) (clear),
-    // value => Some(Some(v)). Plain serde would map null to the outer None.
     #[serde(default, deserialize_with = "deserialize_some")]
     pub traffic_limit_gb: Option<Option<f64>>,
     #[serde(default, deserialize_with = "deserialize_some")]
@@ -199,7 +164,7 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateNodeSettingsInput {
     pub public_host: String,
     pub udp_port: u16,
@@ -207,22 +172,13 @@ pub struct UpdateNodeSettingsInput {
     pub insecure: bool,
 }
 
-enum LogOp {
-    Line(String),
-    Truncate(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
-}
-
 pub struct AppState {
     data_path: PathBuf,
     pub config: RwLock<PanelConfig>,
     pub live: DashMap<String, Arc<LiveCounters>>,
-    sessions: DashMap<String, Instant>,
-    login_failures: DashMap<IpAddr, (u32, Instant)>,
+    panel_auth: PanelSessionGuard,
+    audit: AccessLogService,
     next_conn_id: AtomicU64,
-    next_log_id: AtomicU64,
-    access_log_enabled: AtomicBool,
-    access_logs: Mutex<VecDeque<AccessLogEntry>>,
-    log_tx: std::sync::mpsc::SyncSender<LogOp>,
     save_lock: Mutex<()>,
     started_at: Instant,
 }
@@ -244,14 +200,13 @@ impl AppState {
                 .with_context(|| format!("read {:?}", params.data_path))?;
             let mut cfg: PanelConfig = serde_json::from_str(&text)
                 .with_context(|| format!("parse {:?}", params.data_path))?;
-            // Sync runtime CLI udp_port & insecure mode if changed
             cfg.udp_port = params.udp_port;
             cfg.insecure = params.insecure;
             if let Some(pass) = params.initial_panel_pass
-                && !pass.is_empty() {
-                    cfg.admin_pass = hash_password(&pass);
-                }
-            // Transparently migrate legacy plaintext admin_pass to salted PBKDF2-HMAC-SHA256
+                && !pass.is_empty()
+            {
+                cfg.admin_pass = hash_password(&pass);
+            }
             if !cfg.admin_pass.starts_with(PBKDF2_PREFIX) {
                 cfg.admin_pass = hash_password(&cfg.admin_pass);
             }
@@ -295,55 +250,21 @@ impl AppState {
             );
         }
 
-        let access_log_enabled = cfg.access_log_enabled;
         let access_log_path = params
             .data_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.join("access.log"))
             .unwrap_or_else(|| PathBuf::from("access.log"));
-
-        let (log_tx, log_rx) = std::sync::mpsc::sync_channel::<LogOp>(ACCESS_LOG_QUEUE_CAP);
-        let log_path_bg = access_log_path;
-        let _ = std::thread::Builder::new()
-            .name("access-log-writer".to_string())
-            .spawn(move || {
-                while let Ok(op) = log_rx.recv() {
-                    match op {
-                        LogOp::Line(line) => {
-                            if let Ok(meta) = std::fs::metadata(&log_path_bg)
-                                && meta.len() >= MAX_ACCESS_LOG_FILE_BYTES
-                            {
-                                let old = log_path_bg.with_extension("log.old");
-                                let _ = std::fs::rename(&log_path_bg, old);
-                            }
-                            if let Ok(mut f) = OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&log_path_bg)
-                            {
-                                let _ = writeln!(f, "{line}");
-                            }
-                        }
-                        LogOp::Truncate(ack) => {
-                            let res = std::fs::write(&log_path_bg, b"").map_err(|e| e.to_string());
-                            let _ = ack.send(res);
-                        }
-                    }
-                }
-            });
+        let audit = AccessLogService::spawn(access_log_path, cfg.access_log_enabled);
 
         let state = Arc::new(Self {
             data_path: params.data_path,
             config: RwLock::new(cfg),
             live,
-            sessions: DashMap::new(),
-            login_failures: DashMap::new(),
+            panel_auth: PanelSessionGuard::default(),
+            audit,
             next_conn_id: AtomicU64::new(1),
-            next_log_id: AtomicU64::new(1),
-            access_log_enabled: AtomicBool::new(access_log_enabled),
-            access_logs: Mutex::new(VecDeque::with_capacity(MAX_MEM_ACCESS_LOGS)),
-            log_tx,
             save_lock: Mutex::new(()),
             started_at: Instant::now(),
         });
@@ -369,8 +290,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Serialize snapshot generation + disk persistence + in-memory commit under `save_lock`.
-    /// If disk persistence fails, neither `self.config` nor caller side-effects are committed.
     fn mutate_and_save<F, R>(&self, mutate: F) -> Result<R>
     where
         F: FnOnce(&mut PanelConfig) -> Result<R>,
@@ -397,8 +316,6 @@ impl AppState {
         self.mutate_and_save(|_| Ok(()))
     }
 
-    /// Periodically called by the background flush task: disconnects any active sessions
-    /// belonging to links that are now disabled, expired, or over their traffic quota.
     pub fn enforce_limits_and_kick(&self) {
         let to_kick: Vec<String> = {
             let cfg = self.config.read().expect("config read lock");
@@ -407,7 +324,7 @@ impl AppState {
                 .filter_map(|link| {
                     let counters = self.live.get(&link.id)?;
                     let status = evaluate_link_status(link, counters.value());
-                    if status != "active" && counters.online_conns.load(Ordering::Relaxed) > 0 {
+                    if !status.is_active() && counters.online_conns.load(Ordering::Relaxed) > 0 {
                         Some(link.id.clone())
                     } else {
                         None
@@ -417,7 +334,7 @@ impl AppState {
         };
         for link_id in to_kick {
             if let Some(c) = self.live.get(&link_id) {
-                info!("kicking active connections for over-quota/expired/disabled link {link_id}");
+                info!("kicking active connections for non-active link {link_id}");
                 c.kick_all();
             }
         }
@@ -427,10 +344,10 @@ impl AppState {
         &self.data_path
     }
 
-    // ---------- Access Logging (Ring Buffer + Async 10MB Rotating File) ----------
+    // ---------- Access Audit Delegation ----------
 
     pub fn is_access_log_enabled(&self) -> bool {
-        self.access_log_enabled.load(Ordering::Relaxed)
+        self.audit.is_enabled()
     }
 
     pub fn set_access_log_enabled(&self, enabled: bool) -> Result<bool> {
@@ -438,58 +355,24 @@ impl AppState {
             cfg.access_log_enabled = enabled;
             Ok(())
         })?;
-        self.access_log_enabled.store(enabled, Ordering::Relaxed);
+        self.audit.set_enabled_flag(enabled);
         Ok(enabled)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_access_log(
+    pub fn record_access(&self, rec: AccessLogRecord) {
+        self.audit.record(rec);
+    }
+
+    pub fn record_panel_audit(
         &self,
-        link_id: &str,
-        link_name: &str,
+        actor_label: &str,
         client_ip: &str,
-        proto: &str,
-        root_domain: String,
-        target: String,
-        tx_bytes: u64,
-        rx_bytes: u64,
-        duration_ms: u64,
-        status: &str,
+        root: &str,
+        detail: String,
+        outcome: AccessOutcome,
     ) {
-        if !self.is_access_log_enabled() {
-            return;
-        }
-        let id = self.next_log_id.fetch_add(1, Ordering::Relaxed);
-        let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let line = format!(
-            "[{time}] [{status}] [{proto}] user=\"{link_name}\" ip={client_ip} root={root_domain} target={target} tx={tx_bytes} rx={rx_bytes} dur={duration_ms}ms"
-        );
-        let entry = AccessLogEntry {
-            id,
-            time,
-            link_id: link_id.to_string(),
-            link_name: link_name.to_string(),
-            client_ip: client_ip.to_string(),
-            proto: proto.to_string(),
-            root_domain,
-            target,
-            tx_bytes,
-            rx_bytes,
-            duration_ms,
-            status: status.to_string(),
-        };
-
-        {
-            let mut ring = self.access_logs.lock().unwrap_or_else(|e| e.into_inner());
-            if ring.len() >= MAX_MEM_ACCESS_LOGS {
-                ring.pop_front();
-            }
-            ring.push_back(entry);
-        }
-
-        // Non-blocking enqueue to dedicated writer thread; drops log line if saturated
-        // so disk I/O can never stall the UDP/TCP forwarding hot path.
-        let _ = self.log_tx.try_send(LogOp::Line(line));
+        self.audit
+            .record_panel_audit(actor_label, client_ip, root, detail, outcome);
     }
 
     pub fn query_access_logs(
@@ -498,134 +381,44 @@ impl AppState {
         proto: Option<&str>,
         keyword: Option<&str>,
     ) -> AccessLogsResponse {
-        let ring = self.access_logs.lock().unwrap_or_else(|e| e.into_inner());
-        let total_buffered = ring.len();
-        let kw = keyword.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
-        let lid = link_id.map(|s| s.trim()).filter(|s| !s.is_empty());
-        let pr = proto.map(|s| s.trim().to_ascii_uppercase()).filter(|s| !s.is_empty());
-
-        let logs: Vec<AccessLogEntry> = ring
-            .iter()
-            .rev()
-            .filter(|e| {
-                if let Some(id) = lid
-                    && e.link_id != id {
-                        return false;
-                    }
-                if let Some(p) = &pr
-                    && e.proto != *p {
-                        return false;
-                    }
-                if let Some(q) = &kw {
-                    let hit = e.root_domain.to_ascii_lowercase().contains(q)
-                        || e.target.to_ascii_lowercase().contains(q)
-                        || e.link_name.to_ascii_lowercase().contains(q)
-                        || e.client_ip.to_ascii_lowercase().contains(q);
-                    if !hit {
-                        return false;
-                    }
-                }
-                true
-            })
-            .take(200)
-            .cloned()
-            .collect();
-
-        AccessLogsResponse {
-            enabled: self.is_access_log_enabled(),
-            total_buffered,
-            logs,
-        }
+        self.audit.query(link_id, proto, keyword)
     }
 
     pub fn clear_access_logs(&self) -> Result<()> {
-        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-        self.log_tx
-            .send(LogOp::Truncate(ack_tx))
-            .map_err(|_| anyhow::anyhow!("access log writer stopped"))?;
-        match ack_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(())) => {
-                if let Ok(mut ring) = self.access_logs.lock() {
-                    ring.clear();
-                }
-                Ok(())
-            }
-            Ok(Err(e)) => bail!("清空磁盘访问日志失败: {e}"),
-            Err(_) => bail!("清空磁盘访问日志超时"),
-        }
+        self.audit.clear()
     }
 
-    // ---------- Auth & Sessions (Web Panel) ----------
+    // ---------- Panel Auth & Sessions Delegation ----------
 
     pub fn verify_login(&self, user: &str, pass: &str) -> Option<String> {
         let cfg = self.config.read().expect("config read lock");
         if constant_time_eq(user.trim(), &cfg.admin_user) && verify_password(pass, &cfg.admin_pass)
         {
-            let sid = generate_random_str(32);
-            self.sessions.retain(|_, ts| ts.elapsed() < SESSION_TTL);
-            self.sessions.insert(sid.clone(), Instant::now());
-            Some(sid)
+            Some(self.panel_auth.issue_session())
         } else {
             None
         }
     }
 
     pub fn verify_session(&self, sid: &str) -> bool {
-        if let Some(ts) = self.sessions.get(sid)
-            && ts.elapsed() < SESSION_TTL {
-                return true;
-            }
-        self.sessions.remove(sid);
-        false
+        self.panel_auth.verify_session(sid)
     }
 
-    /// Err(remaining lock time) once an IP has too many failed logins inside the window.
     pub fn check_login_throttle(&self, ip: IpAddr) -> std::result::Result<(), Duration> {
-        let snapshot = self.login_failures.get(&ip).map(|e| *e.value());
-        if let Some((count, first)) = snapshot {
-            let elapsed = first.elapsed();
-            if elapsed >= LOGIN_WINDOW {
-                self.login_failures.remove(&ip);
-            } else if count >= LOGIN_MAX_FAILURES {
-                return Err(LOGIN_WINDOW - elapsed);
-            }
-        }
-        Ok(())
+        self.panel_auth.check_throttle(ip)
     }
 
     pub fn record_login_result(&self, ip: IpAddr, success: bool) {
-        if success {
-            self.login_failures.remove(&ip);
-            return;
-        }
-        match self.login_failures.entry(ip) {
-            Entry::Occupied(mut o) => {
-                let (count, first) = o.get_mut();
-                if first.elapsed() >= LOGIN_WINDOW {
-                    *count = 1;
-                    *first = Instant::now();
-                } else {
-                    *count += 1;
-                }
-            }
-            Entry::Vacant(v) => {
-                v.insert((1, Instant::now()));
-            }
-        }
-        if self.login_failures.len() > LOGIN_FAILURES_CAP {
-            self.login_failures
-                .retain(|_, (_, first)| first.elapsed() < LOGIN_WINDOW);
-        }
-    }
-
-    /// Current (sni, public_host), read live so panel setting changes apply without restart.
-    pub fn panel_aliases(&self) -> (String, String) {
-        let cfg = self.config.read().expect("config read lock");
-        (cfg.sni.clone(), cfg.public_host.clone())
+        self.panel_auth.record_login_attempt(ip, success);
     }
 
     pub fn revoke_session(&self, sid: &str) {
-        self.sessions.remove(sid);
+        self.panel_auth.revoke_session(sid);
+    }
+
+    pub fn panel_aliases(&self) -> (String, String) {
+        let cfg = self.config.read().expect("config read lock");
+        (cfg.sni.clone(), cfg.public_host.clone())
     }
 
     pub fn update_admin_password(&self, old_pass: &str, new_pass: &str) -> Result<()> {
@@ -639,11 +432,11 @@ impl AppState {
             cfg.admin_pass = hash_password(new_pass);
             Ok(())
         })?;
-        self.sessions.clear();
+        self.panel_auth.revoke_all();
         Ok(())
     }
 
-    // ---------- QUIC Data-Plane Token Auth & Live Tracking ----------
+    // ---------- QUIC Data-Plane Token Auth & Live Connection Registry ----------
 
     pub fn authenticate_token(&self, token: &str) -> Result<AuthTicket> {
         let cfg = self.config.read().expect("config read lock");
@@ -656,32 +449,29 @@ impl AppState {
         let counters = self
             .live
             .entry(link.id.clone())
-            .or_insert_with(|| Arc::new(LiveCounters::from_persisted(link.tx_bytes, link.rx_bytes)))
+            .or_insert_with(|| {
+                Arc::new(LiveCounters::from_persisted(link.tx_bytes, link.rx_bytes))
+            })
             .clone();
 
-        let status = evaluate_link_status(link, &counters);
-        match status.as_str() {
-            "active" => Ok(AuthTicket {
+        match evaluate_link_status(link, &counters) {
+            LinkStatus::Active => Ok(AuthTicket {
                 link_id: link.id.clone(),
                 link_name: link.name.clone(),
                 token: link.token.clone(),
                 counters,
             }),
-            "disabled" => bail!("link '{}' is disabled", link.name),
-            "expired" => bail!("link '{}' is expired", link.name),
-            "over_limit" => bail!("link '{}' exceeded traffic limit", link.name),
-            other => bail!("link '{}' unavailable ({other})", link.name),
+            LinkStatus::Disabled => bail!("link '{}' is disabled", link.name),
+            LinkStatus::Expired => bail!("link '{}' is expired", link.name),
+            LinkStatus::OverLimit => bail!("link '{}' exceeded traffic limit", link.name),
         }
     }
 
-    /// Re-verify under `config.read()` that the link is still active with the same token
-    /// before registering `conn`, closing the race window between auth and revocation/reset.
-    /// Returns an RAII `ConnGuard` that automatically unregisters on drop (including early `?` exits).
     pub fn register_conn(&self, ticket: &AuthTicket, conn: quinn::Connection) -> Option<ConnGuard> {
         let cfg = self.config.read().expect("config read lock");
         let link = cfg.links.iter().find(|l| l.id == ticket.link_id)?;
         if !constant_time_eq(&link.token, &ticket.token)
-            || evaluate_link_status(link, &ticket.counters) != "active"
+            || !evaluate_link_status(link, &ticket.counters).is_active()
         {
             return None;
         }
@@ -708,8 +498,10 @@ impl AppState {
                 .live
                 .get(&link.id)
                 .map(|c| c.clone())
-                .unwrap_or_else(|| Arc::new(LiveCounters::from_persisted(link.tx_bytes, link.rx_bytes)));
-            if evaluate_link_status(link, &counters) == "active" {
+                .unwrap_or_else(|| {
+                    Arc::new(LiveCounters::from_persisted(link.tx_bytes, link.rx_bytes))
+                });
+            if evaluate_link_status(link, &counters).is_active() {
                 active_links += 1;
             }
             total_online += counters.online_conns.load(Ordering::Relaxed);
@@ -880,8 +672,10 @@ impl AppState {
         Ok(self.overview())
     }
 
-    /// Build a standard `SubscriptionPayload` JSON for our Windows client's "订阅 URL 同步".
-    pub fn build_subscription(&self, token: &str) -> Result<(SubscriptionPayload, u64, u64, Option<u64>)> {
+    pub fn build_subscription(
+        &self,
+        token: &str,
+    ) -> Result<(SubscriptionPayload, u64, u64, Option<u64>)> {
         let cfg = self.config.read().expect("config read lock");
         let link = cfg
             .links
@@ -893,11 +687,13 @@ impl AppState {
             .live
             .get(&link.id)
             .map(|c| c.clone())
-            .unwrap_or_else(|| Arc::new(LiveCounters::from_persisted(link.tx_bytes, link.rx_bytes)));
+            .unwrap_or_else(|| {
+                Arc::new(LiveCounters::from_persisted(link.tx_bytes, link.rx_bytes))
+            });
 
         let status = evaluate_link_status(link, &counters);
-        if status != "active" {
-            bail!("subscription unavailable: {status}");
+        if !status.is_active() {
+            bail!("subscription unavailable: {:?}", status);
         }
 
         let tx = counters.tx_bytes.load(Ordering::Relaxed);
@@ -923,7 +719,9 @@ impl AppState {
             .live
             .get(&link.id)
             .map(|c| c.clone())
-            .unwrap_or_else(|| Arc::new(LiveCounters::from_persisted(link.tx_bytes, link.rx_bytes)));
+            .unwrap_or_else(|| {
+                Arc::new(LiveCounters::from_persisted(link.tx_bytes, link.rx_bytes))
+            });
         let tx = counters.tx_bytes.load(Ordering::Relaxed);
         let rx = counters.rx_bytes.load(Ordering::Relaxed);
         let online = counters.online_conns.load(Ordering::Relaxed);
@@ -976,30 +774,31 @@ fn build_node_profile(cfg: &PanelConfig, link: &LinkRecord) -> NodeProfile {
     }
 }
 
-fn evaluate_link_status(link: &LinkRecord, counters: &LiveCounters) -> String {
+pub fn evaluate_link_status(link: &LinkRecord, counters: &LiveCounters) -> LinkStatus {
     if !link.enabled {
-        return "disabled".to_string();
+        return LinkStatus::Disabled;
     }
     if let Some(exp) = &link.expire_at {
         let today = Local::now().format("%Y-%m-%d").to_string();
         if today.as_str() > exp.as_str() {
-            return "expired".to_string();
+            return LinkStatus::Expired;
         }
     }
     if let Some(limit_gb) = link.traffic_limit_gb {
         let limit_bytes = (limit_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-        let used = counters.tx_bytes.load(Ordering::Relaxed)
-            + counters.rx_bytes.load(Ordering::Relaxed);
+        let used =
+            counters.tx_bytes.load(Ordering::Relaxed) + counters.rx_bytes.load(Ordering::Relaxed);
         if used >= limit_bytes {
-            return "over_limit".to_string();
+            return LinkStatus::OverLimit;
         }
     }
-    "active".to_string()
+    LinkStatus::Active
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth_guard::{LOGIN_MAX_FAILURES, LOGIN_WINDOW};
 
     fn temp_data_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1023,7 +822,6 @@ mod tests {
         assert!(verify_password("MyStrongPass!99", &hashed));
         assert!(!verify_password("wrong-pass", &hashed));
 
-        // Legacy plaintext config auto-migrates to PBKDF2 on load
         let path = temp_data_path("migrate");
         let legacy = PanelConfig {
             admin_user: "admin".to_string(),
@@ -1060,18 +858,15 @@ mod tests {
         .unwrap();
         assert!(gen_pass.is_none());
 
-        // Persisted file must now contain pbkdf2$ hash, not plaintext
         let disk_text = std::fs::read_to_string(&path).unwrap();
         assert!(disk_text.contains("pbkdf2$"));
         assert!(!disk_text.contains("legacyPlain123"));
 
-        // Login with old plaintext succeeds
         let sid = state.verify_login("admin", "legacyPlain123");
         assert!(sid.is_some());
         assert!(state.verify_session(sid.as_deref().unwrap()));
         assert!(state.verify_login("admin", "badpass").is_none());
 
-        // Change password invalidates existing session
         state
             .update_admin_password("legacyPlain123", "newPass456")
             .unwrap();
@@ -1098,7 +893,6 @@ mod tests {
         let ticket = state.authenticate_token("seed-tok-123456").unwrap();
         assert!(state.authenticate_token("wrong-token").is_err());
 
-        // Disable link
         state
             .update_link(
                 &ticket.link_id,
@@ -1113,7 +907,6 @@ mod tests {
             .unwrap();
         assert!(state.authenticate_token("seed-tok-123456").is_err());
 
-        // Re-enable with expired date
         state
             .update_link(
                 &ticket.link_id,
@@ -1128,7 +921,6 @@ mod tests {
             .unwrap();
         assert!(state.authenticate_token("seed-tok-123456").is_err());
 
-        // Clear expiry, set 1 GB quota and exceed it
         state
             .update_link(
                 &ticket.link_id,
@@ -1219,7 +1011,6 @@ mod tests {
         .unwrap();
         assert!(state.is_access_log_enabled());
 
-        // Block writes to `data.json.tmp` by creating a directory at that exact path
         let tmp_blocker = data_path.with_extension("json.tmp");
         std::fs::create_dir_all(&tmp_blocker).unwrap();
 
@@ -1227,7 +1018,6 @@ mod tests {
         assert!(state.is_access_log_enabled());
         assert!(state.config.read().unwrap().access_log_enabled);
 
-        // Creating a link when persistence fails must NOT add it to memory or live map
         let before_count = state.list_links().len();
         assert!(
             state
@@ -1242,15 +1032,18 @@ mod tests {
         assert_eq!(state.list_links().len(), before_count);
         assert_eq!(state.live.len(), before_count);
 
-        // Unblock temp dir and verify reset_link_traffic returns zeroed counters immediately
         std::fs::remove_dir_all(&tmp_blocker).unwrap();
         let link_id = state.list_links()[0].id.clone();
-        state.live.get(&link_id).unwrap().tx_bytes.store(123, Ordering::Relaxed);
+        state
+            .live
+            .get(&link_id)
+            .unwrap()
+            .tx_bytes
+            .store(123, Ordering::Relaxed);
         let reset_view = state.reset_link_traffic(&link_id).unwrap();
         assert_eq!(reset_view.tx_bytes, 0);
         assert_eq!(reset_view.rx_bytes, 0);
 
-        // Blocking access.log must cause clear_access_logs to return Err
         let log_blocker = dir.join("access.log");
         let _ = std::fs::remove_file(&log_blocker);
         std::fs::create_dir_all(&log_blocker).unwrap();

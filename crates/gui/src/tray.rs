@@ -211,8 +211,8 @@ pub fn hide_window_to_tray() {
                     bottom: 0,
                 };
                 if GetWindowRect(hwnd, &mut rc) != 0 && rc.left > -10000 && rc.top > -10000 {
-                    let w = (rc.right - rc.left).max(800);
-                    let h = (rc.bottom - rc.top).max(560);
+                    let w = (rc.right - rc.left).max(780);
+                    let h = (rc.bottom - rc.top).max(508);
                     if let Ok(mut guard) = SAVED_WINDOW_RECT.lock() {
                         *guard = Some((rc.left, rc.top, w, h));
                     }
@@ -296,7 +296,7 @@ fn win32_show_and_focus_window(title: &str) {
                     .lock()
                     .ok()
                     .and_then(|g| *g)
-                    .unwrap_or((160, 90, 940, 660));
+                    .unwrap_or((160, 90, 840, 548));
                 SetWindowPos(hwnd, 0, x, y, w, h, SWP_NOZORDER);
             }
             ShowWindow(hwnd, SW_SHOW);

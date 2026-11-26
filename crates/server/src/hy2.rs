@@ -1,17 +1,15 @@
 //! Native Hysteria2 protocol support sharing the same QUIC/TLS 1.3 (ALPN `h3`) port,
 //! user tokens, traffic counters, quota/expiry enforcement, and access logs as `gacl://`.
-//!
-//! Compatible with Shadowrocket (iOS), Clash Meta / Mihomo, sing-box, v2rayN, and
-//! official Hysteria2 clients.
 
 use crate::dns;
 use crate::masquerade::{serve_masquerade_followup, serve_masquerade_h3};
 use crate::nat::bind_nat_socket;
-use crate::store::{AppState, AuthTicket, LiveCounters, generate_random_str};
-use crate::{PanelRoute, TCP_CONNECT_TIMEOUT};
+use crate::store::{AppState, generate_random_str};
+use crate::{PanelRoute, StreamContext, TCP_CONNECT_TIMEOUT, TcpAuditMeta, splice_and_audit_tcp};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
+use protocol::domain::{AccessLogRecord, AccessOutcome};
 use protocol::frame::TargetAddr;
 use protocol::hy2::{
     HY2_TCP_STREAM_TYPE, Hy2UdpReassembler, decode_hy2_udp_message, encode_h3_control_stream,
@@ -21,7 +19,7 @@ use protocol::hy2::{
 #[cfg(test)]
 pub(crate) use protocol::hy2::encode_varint;
 pub(crate) use protocol::hy2::read_varint;
-use protocol::sniff::{extract_root_domain, sniff_first_packet};
+use protocol::sniff::extract_root_domain;
 use protocol::unix_now_secs as now_secs;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -36,7 +34,6 @@ use tracing::{debug, info};
 
 const HY2_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
 
-/// Reader that yields a small already-peeked prefix before delegating to `inner`.
 struct PrefixedReader<R> {
     prefix: [u8; 4],
     pos: usize,
@@ -70,8 +67,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
     }
 }
 
-/// Handle a Hysteria2 connection after the first 4 bytes of its initial bi-stream
-/// did not match `b"GACL"`.
 pub(crate) async fn handle_hy2_connection(
     conn: quinn::Connection,
     first_four: [u8; 4],
@@ -81,8 +76,6 @@ pub(crate) async fn handle_hy2_connection(
     panel_route: Option<Arc<PanelRoute>>,
     masquerade_dir: Option<Arc<PathBuf>>,
 ) -> Result<()> {
-    // 1. Send server HTTP/3 Control Stream (empty SETTINGS => QPACK dynamic table capacity 0).
-    // Must stay open for the lifetime of the connection (RFC 9114 §6.2.1).
     let _ctrl_send = match conn.open_uni().await {
         Ok(mut s) => {
             let _ = s.write_all(&encode_h3_control_stream()).await;
@@ -91,7 +84,6 @@ pub(crate) async fn handle_hy2_connection(
         Err(_) => None,
     };
 
-    // Drain client's unidirectional HTTP/3 control / QPACK streams in the background.
     let uni_conn = conn.clone();
     let uni_task = tokio::spawn(async move {
         while let Ok(mut uni) = uni_conn.accept_uni().await {
@@ -106,12 +98,17 @@ pub(crate) async fn handle_hy2_connection(
         }
     });
 
-    // 2. Read HTTP/3 HEADERS frame on the first bi-stream and decode QPACK headers.
     let mut reader = PrefixedReader::new(first_four, auth_recv);
     let headers = match read_h3_headers(&mut reader).await {
         Ok(h) => h,
         Err(e) => {
-            let _ = serve_masquerade_h3(&mut auth_send, "GET", "/404", masquerade_dir.as_deref().map(PathBuf::as_path)).await;
+            let _ = serve_masquerade_h3(
+                &mut auth_send,
+                "GET",
+                "/404",
+                masquerade_dir.as_deref().map(PathBuf::as_path),
+            )
+            .await;
             let _ = auth_send.finish();
             uni_task.abort();
             return Err(e).context("decode Hysteria2 HTTP/3 auth request");
@@ -124,10 +121,14 @@ pub(crate) async fn handle_hy2_connection(
     let client_ip = conn.remote_address().ip().to_string();
 
     if !method.eq_ignore_ascii_case("POST") || path != "/auth" || auth_token.is_empty() {
-        let _ = serve_masquerade_h3(&mut auth_send, method, path, masquerade_dir.as_deref().map(PathBuf::as_path)).await;
+        let _ = serve_masquerade_h3(
+            &mut auth_send,
+            method,
+            path,
+            masquerade_dir.as_deref().map(PathBuf::as_path),
+        )
+        .await;
         let _ = auth_send.finish();
-        // Serve follow-up HTTP/3 asset requests (CSS/JS/images) on this same QUIC connection
-        // so real browsers / HTTP/3 probes see a complete working website.
         if let Some(root) = masquerade_dir.as_deref() {
             serve_masquerade_followup(&conn, root).await;
         }
@@ -138,26 +139,31 @@ pub(crate) async fn handle_hy2_connection(
     let ticket = match state.authenticate_token(auth_token) {
         Ok(t) => t,
         Err(e) => {
-            let _ = serve_masquerade_h3(&mut auth_send, "POST", "/auth", masquerade_dir.as_deref().map(PathBuf::as_path)).await;
+            let _ = serve_masquerade_h3(
+                &mut auth_send,
+                "POST",
+                "/auth",
+                masquerade_dir.as_deref().map(PathBuf::as_path),
+            )
+            .await;
             let _ = auth_send.finish();
-            state.record_access_log(
-                "",
-                "未授权客户端 (Hy2)",
-                &client_ip,
-                "AUTH",
-                "-".to_string(),
-                format!("{e:#}"),
-                0,
-                0,
-                0,
-                "denied",
-            );
+            state.record_access(AccessLogRecord {
+                link_id: String::new(),
+                link_name: "未授权客户端 (Hy2)".to_string(),
+                client_ip,
+                proto: "AUTH".to_string(),
+                root_domain: "-".to_string(),
+                target: format!("{e:#}"),
+                tx_bytes: 0,
+                rx_bytes: 0,
+                duration_ms: 0,
+                outcome: AccessOutcome::Denied,
+            });
             uni_task.abort();
             return Err(e);
         }
     };
 
-    // 3. Respond with HTTP/3 233 Auth OK (standard Hysteria2 handshake).
     let padding = generate_random_str(24);
     write_h3_response(
         &mut auth_send,
@@ -181,28 +187,23 @@ pub(crate) async fn handle_hy2_connection(
         uni_task.abort();
         bail!("link '{}' revoked before registration", ticket.link_name);
     };
-    let res = run_hy2_session(conn, &ticket, state.clone(), client_ip, panel_route).await;
+
+    let ctx = Arc::new(StreamContext {
+        counters: ticket.counters.clone(),
+        state,
+        link_id: ticket.link_id.clone(),
+        link_name: ticket.link_name.clone(),
+        client_ip,
+        panel_route,
+    });
+    let res = run_hy2_session(conn, ctx).await;
 
     uni_task.abort();
     res
 }
 
-async fn run_hy2_session(
-    conn: quinn::Connection,
-    ticket: &AuthTicket,
-    state: Arc<AppState>,
-    client_ip: String,
-    panel_route: Option<Arc<PanelRoute>>,
-) -> Result<()> {
-    // Background Hysteria2 UDP datagram relay
-    let udp_nat = Arc::new(Hy2UdpManager::new(
-        conn.clone(),
-        ticket.counters.clone(),
-        state.clone(),
-        ticket.link_id.clone(),
-        ticket.link_name.clone(),
-        client_ip.clone(),
-    ));
+async fn run_hy2_session(conn: quinn::Connection, ctx: Arc<StreamContext>) -> Result<()> {
+    let udp_nat = Arc::new(Hy2UdpManager::new(conn.clone(), ctx.clone()));
     let dgram_conn = conn.clone();
     let dgram_nat = udp_nat.clone();
     let resolve_slots = Arc::new(tokio::sync::Semaphore::new(32));
@@ -225,18 +226,10 @@ async fn run_hy2_session(
         }
     });
 
-    // Accept Hysteria2 TCP proxy streams (`0x401`)
     while let Ok((send, recv)) = conn.accept_bi().await {
-        let counters = ticket.counters.clone();
-        let st = state.clone();
-        let lid = ticket.link_id.clone();
-        let lname = ticket.link_name.clone();
-        let cip = client_ip.clone();
-        let proute = panel_route.clone();
+        let stream_ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_hy2_tcp_stream(send, recv, counters, st, lid, lname, cip, proute).await
-            {
+            if let Err(e) = handle_hy2_tcp_stream(send, recv, &stream_ctx).await {
                 debug!("hy2 tcp stream ended: {:#}", e);
             }
         });
@@ -247,16 +240,10 @@ async fn run_hy2_session(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_hy2_tcp_stream(
     mut quic_send: quinn::SendStream,
     mut quic_recv: quinn::RecvStream,
-    counters: Arc<LiveCounters>,
-    state: Arc<AppState>,
-    link_id: String,
-    link_name: String,
-    client_ip: String,
-    panel_route: Option<Arc<PanelRoute>>,
+    ctx: &StreamContext,
 ) -> Result<()> {
     let started = Instant::now();
     let stream_type = read_varint(&mut quic_recv).await?;
@@ -282,7 +269,8 @@ async fn handle_hy2_tcp_stream(
     }
 
     let target = parse_hy2_addr(&addr_str)?;
-    let internal_panel_addr = panel_route
+    let internal_panel_addr = ctx
+        .panel_route
         .as_ref()
         .and_then(|route| route.resolve_target(&target));
     let is_internal_panel = internal_panel_addr.is_some();
@@ -299,7 +287,6 @@ async fn handle_hy2_tcp_stream(
     let tcp = match dns::connect_tcp(&dial_addr, TCP_CONNECT_TIMEOUT).await {
         Ok(s) => {
             let _ = s.set_nodelay(true);
-            // Hysteria2 TCPResponse: status=0x00, msg_len=0, padding_len=0
             quic_send.write_all(&[0x00, 0x00, 0x00]).await?;
             s
         }
@@ -312,90 +299,38 @@ async fn handle_hy2_tcp_stream(
             let _ = quic_send.write_u8(0x00).await;
             let _ = quic_send.finish();
             if !is_internal_panel {
-                state.record_access_log(
-                    &link_id,
-                    &link_name,
-                    &client_ip,
-                    "TCP",
-                    extract_root_domain(&host_name),
-                    host_port,
-                    0,
-                    0,
-                    started.elapsed().as_millis() as u64,
-                    "error",
-                );
+                ctx.state.record_access(AccessLogRecord {
+                    link_id: ctx.link_id.clone(),
+                    link_name: ctx.link_name.clone(),
+                    client_ip: ctx.client_ip.clone(),
+                    proto: "TCP".to_string(),
+                    root_domain: extract_root_domain(&host_name),
+                    target: host_port,
+                    tx_bytes: 0,
+                    rx_bytes: 0,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    outcome: AccessOutcome::Error,
+                });
             }
             return Err(e).with_context(|| format!("hy2 dial {addr_str}"));
         }
     };
 
-    let (mut tcp_read, mut tcp_write) = tcp.into_split();
-    let c_tx = counters.clone();
-    let c_rx = counters.clone();
-
-    let s2c = tokio::spawn(async move {
-        let rx = protocol::io::copy_with_counter(&mut tcp_read, &mut quic_send, &c_rx.rx_bytes).await;
-        let _ = quic_send.finish();
-        rx
-    });
-
-    let c2s = tokio::spawn(async move {
-        let mut first_buf = vec![0u8; 4096];
-        let mut tx = 0u64;
-        let mut proto = if port == 443 {
-            "HTTPS"
-        } else if port == 80 {
-            "HTTP"
-        } else {
-            "TCP"
-        };
-        let mut final_host = host_name;
-
-        if let Ok(Some(n)) = quic_recv.read(&mut first_buf).await
-            && n > 0
-        {
-            let slice = &first_buf[..n];
-            if let Some((p, h)) = sniff_first_packet(slice) {
-                proto = p;
-                if was_ip || final_host.is_empty() {
-                    final_host = h;
-                }
-            }
-            if tcp_write.write_all(slice).await.is_ok() {
-                c_tx.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                tx += n as u64;
-                tx += protocol::io::copy_with_counter(&mut quic_recv, &mut tcp_write, &c_tx.tx_bytes)
-                    .await;
-            }
-        }
-        let _ = tcp_write.shutdown().await;
-        (tx, proto, final_host)
-    });
-
-    let (tx_res, rx_res) = tokio::join!(c2s, s2c);
-    let (tx_bytes, proto, final_host) = tx_res.unwrap_or((0, "TCP", String::new()));
-    let rx_bytes = rx_res.unwrap_or(0);
-
-    if !is_internal_panel {
-        state.record_access_log(
-            &link_id,
-            &link_name,
-            &client_ip,
-            proto,
-            extract_root_domain(&final_host),
-            format!("{final_host}:{port}"),
-            tx_bytes,
-            rx_bytes,
-            started.elapsed().as_millis() as u64,
-            "ok",
-        );
-    }
-    Ok(())
+    splice_and_audit_tcp(
+        quic_send,
+        quic_recv,
+        tcp,
+        TcpAuditMeta {
+            host_name,
+            port,
+            was_ip,
+            is_internal_panel,
+            started,
+        },
+        ctx,
+    )
+    .await
 }
-
-// ============================================================================
-// Hysteria2 UDP Datagram Relay (with fragmentation & reassembly)
-// ============================================================================
 
 struct Hy2UdpSession {
     socket: Arc<UdpSocket>,
@@ -411,24 +346,13 @@ struct Hy2UdpManager {
     closed: AtomicBool,
     sessions: Arc<DashMap<u32, Arc<Hy2UdpSession>>>,
     reasm: Mutex<Hy2UdpReassembler>,
-    counters: Arc<LiveCounters>,
-    state: Arc<AppState>,
-    link_id: String,
-    link_name: String,
-    client_ip: String,
+    ctx: Arc<StreamContext>,
     tx_packet_id: Arc<AtomicU16>,
     reaper: JoinHandle<()>,
 }
 
 impl Hy2UdpManager {
-    fn new(
-        conn: quinn::Connection,
-        counters: Arc<LiveCounters>,
-        state: Arc<AppState>,
-        link_id: String,
-        link_name: String,
-        client_ip: String,
-    ) -> Self {
+    fn new(conn: quinn::Connection, ctx: Arc<StreamContext>) -> Self {
         let sessions: Arc<DashMap<u32, Arc<Hy2UdpSession>>> = Arc::new(DashMap::new());
         let sessions_bg = sessions.clone();
         let reaper = tokio::spawn(async move {
@@ -459,11 +383,7 @@ impl Hy2UdpManager {
             closed: AtomicBool::new(false),
             sessions,
             reasm: Mutex::new(Hy2UdpReassembler::default()),
-            counters,
-            state,
-            link_id,
-            link_name,
-            client_ip,
+            ctx,
             tx_packet_id: Arc::new(AtomicU16::new(1)),
             reaper,
         }
@@ -528,11 +448,12 @@ impl Hy2UdpManager {
             _ => dst,
         };
         let sent = session.socket.send_to(&payload, send_addr).await?;
-        self.counters
+        self.ctx
+            .counters
             .tx_bytes
             .fetch_add(sent as u64, Ordering::Relaxed);
 
-        if self.state.is_access_log_enabled() && !session.seen_full.load(Ordering::Relaxed) {
+        if self.ctx.state.is_access_log_enabled() && !session.seen_full.load(Ordering::Relaxed) {
             let is_new_target = {
                 let mut seen = session.seen_targets.lock().unwrap_or_else(|e| e.into_inner());
                 if seen.len() >= 64 {
@@ -548,18 +469,18 @@ impl Hy2UdpManager {
             };
             if is_new_target {
                 let log_host = domain_host.unwrap_or_else(|| dst.ip().to_string());
-                self.state.record_access_log(
-                    &self.link_id,
-                    &self.link_name,
-                    &self.client_ip,
-                    "UDP",
-                    extract_root_domain(&log_host),
-                    addr_str,
-                    sent as u64,
-                    0,
-                    0,
-                    "ok",
-                );
+                self.ctx.state.record_access(AccessLogRecord {
+                    link_id: self.ctx.link_id.clone(),
+                    link_name: self.ctx.link_name.clone(),
+                    client_ip: self.ctx.client_ip.clone(),
+                    proto: "UDP".to_string(),
+                    root_domain: extract_root_domain(&log_host),
+                    target: addr_str,
+                    tx_bytes: sent as u64,
+                    rx_bytes: 0,
+                    duration_ms: 0,
+                    outcome: AccessOutcome::Ok,
+                });
             }
         }
         Ok(())
@@ -578,7 +499,7 @@ impl Hy2UdpManager {
 
         let rx_sock = socket.clone();
         let rx_conn = self.conn.clone();
-        let rx_counters = self.counters.clone();
+        let rx_counters = self.ctx.counters.clone();
         let rx_last = last_active.clone();
         let rx_pid = self.tx_packet_id.clone();
 
@@ -591,7 +512,9 @@ impl Hy2UdpManager {
                 let addr_str = src_addr.to_string();
                 let max_dgram = rx_conn.max_datagram_size().unwrap_or(1150);
                 let pid = rx_pid.fetch_add(1, Ordering::Relaxed);
-                for pkt in encode_hy2_udp_datagrams(session_id, pid, &addr_str, &buf[..n], max_dgram) {
+                for pkt in
+                    encode_hy2_udp_datagrams(session_id, pid, &addr_str, &buf[..n], max_dgram)
+                {
                     if rx_conn.send_datagram(pkt).is_err() {
                         break;
                     }
@@ -624,4 +547,3 @@ impl Hy2UdpManager {
         }
     }
 }
-

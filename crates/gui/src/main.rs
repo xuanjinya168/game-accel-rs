@@ -18,10 +18,11 @@ mod widgets;
 use admin::{AdminEvent, AdminState};
 use client::ConnectError;
 use client::socks5::ClientStats;
+use client::telemetry::TelemetrySeries;
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Stroke, Vec2};
 use protocol::share::{NodeProfile, NodeProtocol};
 use reconnect::ReconnectPolicy;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -152,19 +153,12 @@ pub(crate) struct GameAccelApp {
     /// Live split-routing mode shared with the running session (no reconnect needed).
     pub(crate) route_mode_cell: Arc<client::rules::RouteModeCell>,
 
-    // Speed & RTT history
-    pub(crate) last_sample_at: Instant,
-    pub(crate) last_tx_bytes: u64,
-    pub(crate) last_rx_bytes: u64,
-    pub(crate) tx_speed_bps: f64,
-    pub(crate) rx_speed_bps: f64,
-    pub(crate) rtt_history: VecDeque<u64>,
-    pub(crate) speed_history: VecDeque<(f64, f64)>,
+    // Telemetry series (bounded 60s throughput & RTT ring buffer)
+    pub(crate) telemetry: TelemetrySeries,
     pub(crate) chart_mode: ChartMode,
 
     // Nodes & Import UI state
     pub(crate) probes: HashMap<String, ProbeState>,
-    pub(crate) node_picker_open: bool,
     pub(crate) node_editor: Option<NodeEditorState>,
     pub(crate) import_panel_open: bool,
     pub(crate) import_text: String,
@@ -277,16 +271,9 @@ impl GameAccelApp {
             reconnect: ReconnectPolicy::default(),
             pending_mode_reconnect: None,
             session_id: 0,
-            last_sample_at: Instant::now(),
-            last_tx_bytes: 0,
-            last_rx_bytes: 0,
-            tx_speed_bps: 0.0,
-            rx_speed_bps: 0.0,
-            rtt_history: VecDeque::with_capacity(60),
-            speed_history: VecDeque::with_capacity(60),
+            telemetry: TelemetrySeries::new(),
             chart_mode: ChartMode::Traffic,
             probes: HashMap::new(),
-            node_picker_open: false,
             node_editor: None,
             import_panel_open: false,
             import_text: String::new(),
@@ -530,11 +517,10 @@ impl eframe::App for GameAccelApp {
                         handle_frameless_resize(ctx, total_rect);
                     }
 
-                    let sidebar_w = 176.0;
+                    let sidebar_w = 68.0;
                     let split_x = total_rect.min.x + sidebar_w;
 
-                    // Paint left sidebar & right workspace as two non-overlapping rounded halves
-                    // so the 4 outer corners have zero background bleed or double-ring artifacts.
+                    // Paint 68px icon rail & right studio stage as two non-overlapping rounded halves
                     let sidebar_rect = egui::Rect::from_min_max(
                         total_rect.min,
                         Pos2::new(split_x, total_rect.max.y),
@@ -572,7 +558,7 @@ impl eframe::App for GameAccelApp {
                         Stroke::new(1.0_f32, p.border_subtle),
                     );
 
-                    // Split into left sidebar + right main workspace
+                    // Split into 68px icon rail + right Bento stage
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
 
@@ -580,10 +566,11 @@ impl eframe::App for GameAccelApp {
                             Vec2::new(sidebar_w, total_rect.height()),
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                Frame::new().inner_margin(Margin::symmetric(14, 18)).show(
+                                Frame::new().inner_margin(Margin::symmetric(8, 14)).show(
                                     ui,
                                     |ui| {
-                                        ui.set_min_height((total_rect.height() - 36.0).max(200.0));
+                                        ui.set_width(52.0);
+                                        ui.set_min_height((total_rect.height() - 28.0).max(200.0));
                                         self.render_sidebar_contents(ui, ctx, p);
                                     },
                                 );
@@ -595,11 +582,11 @@ impl eframe::App for GameAccelApp {
                             Vec2::new(right_w, total_rect.height()),
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                Frame::new().inner_margin(Margin::symmetric(26, 20)).show(
+                                Frame::new().inner_margin(Margin::symmetric(20, 14)).show(
                                     ui,
                                     |ui| {
-                                        ui.set_width((right_w - 52.0).max(360.0));
-                                        ui.set_min_height((total_rect.height() - 40.0).max(200.0));
+                                        ui.set_width((right_w - 40.0).max(400.0));
+                                        ui.set_min_height((total_rect.height() - 28.0).max(200.0));
                                         self.render_right_workspace(ui, ctx, p);
                                     },
                                 );
@@ -765,8 +752,8 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
-            .with_inner_size([940.0, 660.0])
-            .with_min_inner_size([800.0, 560.0])
+            .with_inner_size([840.0, 548.0])
+            .with_min_inner_size([780.0, 508.0])
             .with_icon(Arc::new(build_app_icon())),
         centered: true,
         persist_window: false,

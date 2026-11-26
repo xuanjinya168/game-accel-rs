@@ -97,7 +97,7 @@ impl GameAccelApp {
         // `sin(t * rate)`, so a changing rate speeds the LED up/down smoothly with no jump.
         let dt = (now_secs - self.floating_pill_led_last).clamp(0.0, 0.25);
         self.floating_pill_led_last = now_secs;
-        let target_k = led_activity(self.tx_speed_bps + self.rx_speed_bps);
+        let target_k = led_activity(self.telemetry.tx_speed_bps + self.telemetry.rx_speed_bps);
         // Ease activity over ~0.6s so the 1s speed samples don't make the rate step.
         let ease = 1.0 - (-dt / 0.6).exp();
         self.floating_pill_led_k += (target_k - self.floating_pill_led_k) * ease as f32;
@@ -248,7 +248,7 @@ impl GameAccelApp {
                         painter.text(
                             Pos2::new(text_x, up_y),
                             Align2::LEFT_CENTER,
-                            format_card_speed(self.tx_speed_bps),
+                            format_card_speed(self.telemetry.tx_speed_bps),
                             FontId::proportional(12.5),
                             up_tint,
                         );
@@ -257,7 +257,7 @@ impl GameAccelApp {
                         painter.text(
                             Pos2::new(text_x, down_y),
                             Align2::LEFT_CENTER,
-                            format_card_speed(self.rx_speed_bps),
+                            format_card_speed(self.telemetry.rx_speed_bps),
                             FontId::proportional(12.5),
                             down_tint,
                         );

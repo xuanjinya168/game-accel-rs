@@ -1,5 +1,6 @@
 use crate::storage::AdminServerProfile;
 use anyhow::{Context, Result, bail};
+use protocol::domain::LinkStatus;
 use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -36,7 +37,7 @@ pub(crate) struct LinkView {
     pub share_uri: String,
     #[serde(default)]
     pub hy2_uri: String,
-    pub status: String,
+    pub status: LinkStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +331,14 @@ pub(crate) async fn api_fetch_dashboard(
     Ok((ov, links))
 }
 
+pub(crate) struct SaveLinkRequest {
+    pub editing_id: Option<String>,
+    pub name: String,
+    pub game_dup: bool,
+    pub traffic_limit_gb: Option<f64>,
+    pub expire_at: Option<String>,
+}
+
 #[derive(Serialize)]
 struct CreateLinkPayload<'a> {
     name: &'a str,
@@ -338,29 +347,24 @@ struct CreateLinkPayload<'a> {
     expire_at: Option<&'a str>,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn api_save_link(
     server: &AdminServerProfile,
     listen_addr: &str,
     cookie: &str,
-    editing_id: Option<&str>,
-    name: &str,
-    game_dup: bool,
-    traffic_limit_gb: Option<f64>,
-    expire_at: Option<&str>,
+    input: SaveLinkRequest,
 ) -> std::result::Result<(), AdminApiErr> {
     let client = build_client(server.via_tunnel, listen_addr)
         .map_err(|e| AdminApiErr::Message(format!("{e:#}")))?;
     let base = normalized_base(&server.base_url);
     let body = serde_json::to_string(&CreateLinkPayload {
-        name,
-        game_dup,
-        traffic_limit_gb,
-        expire_at,
+        name: &input.name,
+        game_dup: input.game_dup,
+        traffic_limit_gb: input.traffic_limit_gb,
+        expire_at: input.expire_at.as_deref(),
     })
     .map_err(|e| AdminApiErr::Message(format!("序列化请求失败: {e}")))?;
 
-    let req = if let Some(id) = editing_id {
+    let req = if let Some(id) = input.editing_id.as_deref() {
         client
             .put(format!("{base}/api/links/{id}"))
             .header(COOKIE, cookie)

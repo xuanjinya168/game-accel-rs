@@ -74,7 +74,7 @@ pub struct AppConfig {
     pub proxy_mode: ProxyMode,
     pub listen_addr: String,
     pub theme_mode: ThemeMode,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub show_admin_menu: bool,
     #[serde(default)]
     pub admin_servers: Vec<AdminServerProfile>,
@@ -123,7 +123,7 @@ impl Default for AppConfig {
             proxy_mode: ProxyMode::SystemProxy,
             listen_addr: "127.0.0.1:1080".to_string(),
             theme_mode: ThemeMode::Light,
-            show_admin_menu: false,
+            show_admin_menu: true,
             admin_servers: vec![default_srv],
             active_admin_server_id,
             route_mode: RouteMode::default(),

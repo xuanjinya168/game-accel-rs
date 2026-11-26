@@ -2,18 +2,13 @@ use crate::AbortOnDrop;
 use crate::error::ConnectError;
 use crate::http_proxy::handle_http_proxy_client;
 pub use crate::relay::{ClientStats, UdpDispatchMap};
-use crate::relay::{
-    SOCKS_FLOW_MAX, SOCKS_FLOW_MIN, open_proxy_tcp_stream, relay_direct, relay_fast_open,
-    reserve_flow_id, send_proxy_udp_packet,
-};
+use crate::relay::{SOCKS_FLOW_MIN, relay_direct};
 use crate::rules::{Route, Router};
+use crate::tunnel::TunnelSession;
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use protocol::dedup::DedupWindow;
 use protocol::frame::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, TargetAddr, UdpFrame};
-use protocol::pacer::UdpDupPacer;
-use protocol::share::NodeProtocol;
-use quinn::Connection;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -23,16 +18,9 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 /// Mixed (HTTP + HTTPS CONNECT + SOCKS5 TCP/UDP) proxy listener on a single port.
-/// Uses `tcp_conn` for TCP streams and dedicated `udp_conn` for SOCKS5 UDP datagrams.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_mixed_proxy_server(
     listen_addr: SocketAddr,
-    tcp_conn: Connection,
-    udp_conn: Connection,
-    pacer: UdpDupPacer,
-    udp_dispatch: UdpDispatchMap,
-    protocol: NodeProtocol,
-    game_dup: bool,
+    tunnel: Arc<TunnelSession>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
     log_tx: Option<mpsc::UnboundedSender<String>>,
@@ -66,22 +54,14 @@ pub async fn run_mixed_proxy_server(
                         continue;
                     }
                 };
-                let tcp_conn = tcp_conn.clone();
-                let udp_conn = udp_conn.clone();
-                let pacer = pacer.clone();
-                let dispatch = udp_dispatch.clone();
+                let tunnel = tunnel.clone();
                 let next_flow_id = next_flow_id.clone();
                 let stats = stats.clone();
                 let router = router.clone();
 
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
-                    if let Err(e) = handle_mixed_client(
-                        stream, tcp_conn, udp_conn, pacer, dispatch, next_flow_id, protocol,
-                        game_dup, stats, router,
-                    )
-                    .await
-                    {
+                    if let Err(e) = handle_mixed_client(stream, tunnel, next_flow_id, stats, router).await {
                         debug!("proxy client {} ended: {:#}", peer, e);
                     }
                 });
@@ -91,16 +71,10 @@ pub async fn run_mixed_proxy_server(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_mixed_client(
     stream: TcpStream,
-    tcp_conn: Connection,
-    udp_conn: Connection,
-    pacer: UdpDupPacer,
-    udp_dispatch: UdpDispatchMap,
+    tunnel: Arc<TunnelSession>,
     next_flow_id: Arc<AtomicU16>,
-    protocol: NodeProtocol,
-    game_dup: bool,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
@@ -110,34 +84,16 @@ async fn handle_mixed_client(
         return Ok(());
     }
     if first[0] == 0x05 {
-        handle_socks5_client(
-            stream,
-            tcp_conn,
-            udp_conn,
-            pacer,
-            udp_dispatch,
-            next_flow_id,
-            protocol,
-            game_dup,
-            stats,
-            router,
-        )
-        .await
+        handle_socks5_client(stream, tunnel, next_flow_id, stats, router).await
     } else {
-        handle_http_proxy_client(stream, tcp_conn, protocol, stats, router).await
+        handle_http_proxy_client(stream, tunnel, stats, router).await
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_socks5_client(
     mut client: TcpStream,
-    tcp_conn: Connection,
-    udp_conn: Connection,
-    pacer: UdpDupPacer,
-    udp_dispatch: UdpDispatchMap,
+    tunnel: Arc<TunnelSession>,
     next_flow_id: Arc<AtomicU16>,
-    protocol: NodeProtocol,
-    game_dup: bool,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
@@ -159,21 +115,8 @@ async fn handle_socks5_client(
     let target = read_socks5_addr(&mut client, req[3]).await?;
 
     match cmd {
-        0x01 => handle_tcp_connect(client, tcp_conn, protocol, target, stats, router).await,
-        0x03 => {
-            handle_udp_associate(
-                client,
-                udp_conn,
-                pacer,
-                udp_dispatch,
-                next_flow_id,
-                protocol,
-                game_dup,
-                stats,
-                router,
-            )
-            .await
-        }
+        0x01 => handle_tcp_connect(client, tunnel, target, stats, router).await,
+        0x03 => handle_udp_associate(client, tunnel, next_flow_id, stats, router).await,
         other => {
             let _ = client
                 .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -185,8 +128,7 @@ async fn handle_socks5_client(
 
 async fn handle_tcp_connect(
     mut client: TcpStream,
-    conn: Connection,
-    protocol: NodeProtocol,
+    tunnel: Arc<TunnelSession>,
     target: TargetAddr,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -206,23 +148,19 @@ async fn handle_tcp_connect(
         .await;
     }
 
-    let (quic_send, quic_recv) = open_proxy_tcp_stream(&conn, protocol, &target).await?;
+    let (quic_send, quic_recv) = tunnel.open_tcp(&target).await?;
     client.write_all(SOCKS_OK).await?;
 
-    relay_fast_open(client, quic_send, quic_recv, protocol, stats, None)
+    tunnel
+        .relay_tcp(client, quic_send, quic_recv, stats, None)
         .await
         .with_context(|| format!("tcp to {}", target.to_host_port()))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_udp_associate(
     mut tcp_ctrl: TcpStream,
-    conn: Connection,
-    pacer: UdpDupPacer,
-    udp_dispatch: UdpDispatchMap,
+    tunnel: Arc<TunnelSession>,
     next_flow_id: Arc<AtomicU16>,
-    protocol: NodeProtocol,
-    game_dup: bool,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
@@ -231,13 +169,7 @@ async fn handle_udp_associate(
     let bind_addr = udp_sock.local_addr()?;
 
     let (tx, mut rx) = mpsc::channel::<UdpFrame>(512);
-    let Some(flow_id) = reserve_flow_id(
-        &next_flow_id,
-        &udp_dispatch,
-        tx,
-        SOCKS_FLOW_MIN,
-        SOCKS_FLOW_MAX,
-    ) else {
+    let Some(flow_id) = tunnel.reserve_socks_flow(&next_flow_id, tx) else {
         let _ = tcp_ctrl
             .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await;
@@ -248,7 +180,7 @@ async fn handle_udp_associate(
     reply.put_slice(&[0x05, 0x00, 0x00]);
     TargetAddr::Ip(bind_addr).encode_into(&mut reply)?;
     if let Err(e) = tcp_ctrl.write_all(&reply).await {
-        udp_dispatch.remove(&flow_id);
+        tunnel.release_flow(flow_id);
         return Err(e.into());
     }
 
@@ -258,7 +190,7 @@ async fn handle_udp_associate(
         Arc::new(tokio::sync::RwLock::new(None));
 
     let sock_in = udp_sock.clone();
-    let conn_out = conn.clone();
+    let tunnel_tx = tunnel.clone();
     let peer_addr_writer = client_udp_addr.clone();
     let stats_tx = stats.clone();
     let tx_task = tokio::spawn(async move {
@@ -323,18 +255,9 @@ async fn handle_udp_associate(
             let cur_seq = seq;
             seq = seq.wrapping_add(1);
             let payload_len = payload.len();
-            let is_game_pkt = game_dup && payload_len < 200;
+            let is_game_pkt = tunnel_tx.game_dup_enabled() && payload_len < 200;
 
-            if !send_proxy_udp_packet(
-                protocol,
-                &conn_out,
-                &pacer,
-                flow_id,
-                cur_seq,
-                is_game_pkt,
-                dst,
-                payload,
-            ) {
+            if !tunnel_tx.send_udp(flow_id, cur_seq, is_game_pkt, dst, payload) {
                 break;
             }
             stats_tx
@@ -346,10 +269,11 @@ async fn handle_udp_associate(
     let sock_out = udp_sock.clone();
     let peer_addr_reader = client_udp_addr.clone();
     let stats_rx = stats.clone();
+    let dedup_rx = tunnel.should_dedup_rx();
     let rx_task = tokio::spawn(async move {
         let mut dedup = DedupWindow::new();
         while let Some(frame) = rx.recv().await {
-            if protocol == NodeProtocol::Gacl && !dedup.check_and_insert(frame.seq) {
+            if dedup_rx && !dedup.check_and_insert(frame.seq) {
                 continue;
             }
             let Some(peer) = *peer_addr_reader.read().await else {
@@ -372,7 +296,7 @@ async fn handle_udp_associate(
 
     tx_task.abort();
     rx_task.abort();
-    udp_dispatch.remove(&flow_id);
+    tunnel.release_flow(flow_id);
     stats.active_udp.fetch_sub(1, Ordering::Relaxed);
     Ok(())
 }

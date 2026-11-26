@@ -1,15 +1,26 @@
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Shadow, Stroke, Vec2,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Shadow, Stroke,
+    Vec2,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Strict integer typography ladder so Microsoft YaHei stays sharp on Windows DPI scaling.
+/// Strict typography ladder tuned for Microsoft YaHei & Consolas on Windows DPI scaling.
 pub const FONT_XS: f32 = 11.0;
 pub const FONT_SM: f32 = 12.0;
 pub const FONT_BODY: f32 = 13.0;
 pub const FONT_SUB: f32 = 15.0;
 pub const FONT_TITLE: f32 = 18.0;
+
+/// Proportional UI font (`msyh.ttc` regular — avoids `msyhbd.ttc` stroke bloat in egui grayscale atlas).
+pub fn font_bold(size: f32) -> FontId {
+    FontId::proportional(size)
+}
+
+/// Tabular monospace font (`consola.ttf` regular — crisp strokes at 11px–18px).
+pub fn font_mono_bold(size: f32) -> FontId {
+    FontId::monospace(size)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeMode {
@@ -17,6 +28,13 @@ pub enum ThemeMode {
     Dark,
 }
 
+/// Norman 1-to-1 Semantic Color System (*The Design of Everyday Things*),
+/// matching `v03_cockpit_preview.html` CSS variables 1-to-1:
+/// - `accent` (Terracotta): Brand mark & idle `开启加速` CTA ONLY
+/// - `success_*` (Emerald): Connected tunnel & healthy low-latency link ONLY
+/// - `warn_*` (Amber): Connecting / Reconnecting / Elevated jitter or latency ONLY
+/// - `danger_*` (Vermilion): Fault / Timeout / Disconnect hover / Destructive action ONLY
+/// - `data_primary` / `data_secondary` (Slate Ink / Sage): Neutral throughput curves ONLY
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct ThemePalette {
@@ -44,6 +62,8 @@ pub struct ThemePalette {
     pub danger: Color32,
     pub danger_soft: Color32,
     pub danger_text: Color32,
+    pub data_primary: Color32,
+    pub data_secondary: Color32,
     pub tag_bg: Color32,
     pub tag_text: Color32,
 }
@@ -51,75 +71,78 @@ pub struct ThemePalette {
 impl ThemePalette {
     pub fn from_mode(mode: ThemeMode) -> Self {
         match mode {
-            // Warm Linen & Terracotta (Light)
+            // Warm Studio Linen (exact match to v03_cockpit_preview.html [data-theme="light"])
             ThemeMode::Light => Self {
                 is_dark: false,
-                bg_root: Color32::from_rgb(250, 249, 245),
-                bg_sidebar: Color32::from_rgb(243, 241, 234),
-                bg_card: Color32::from_rgb(255, 255, 255),
-                bg_card_alt: Color32::from_rgb(246, 244, 238),
+                bg_root: Color32::from_rgb(246, 244, 238),    // #F6F4EE
+                bg_sidebar: Color32::from_rgb(237, 234, 225), // #EDEAE1
+                bg_card: Color32::from_rgb(255, 255, 255),    // #FFFFFF
+                bg_card_alt: Color32::from_rgb(239, 236, 228), // #EFECE4 (--c-well)
                 bg_input: Color32::from_rgb(255, 255, 255),
-                bg_nav_active: Color32::from_rgb(233, 230, 221),
-                bg_nav_hover: Color32::from_rgb(239, 236, 228),
-                border_subtle: Color32::from_rgb(232, 229, 220),
-                border_strong: Color32::from_rgb(211, 206, 194),
+                bg_nav_active: Color32::from_rgb(255, 255, 255),
+                bg_nav_hover: Color32::from_rgb(231, 227, 216), // #E7E3D8 (--c-hover)
+                border_subtle: Color32::from_rgb(231, 228, 219), // rgba(28,27,25,0.08) on canvas
+                border_strong: Color32::from_rgb(211, 207, 196), // rgba(28,27,25,0.16)
                 card_shadow: Shadow {
-                    offset: [0, 2],
-                    blur: 8,
+                    offset: [0, 1],
+                    blur: 4,
                     spread: 0,
-                    color: Color32::from_black_alpha(10),
+                    color: Color32::from_black_alpha(8),
                 },
-                text_primary: Color32::from_rgb(30, 29, 27),
-                text_secondary: Color32::from_rgb(77, 75, 70),
-                text_muted: Color32::from_rgb(128, 124, 115),
-                accent: Color32::from_rgb(217, 119, 87),
-                accent_soft: Color32::from_rgb(248, 234, 227),
-                accent_text: Color32::from_rgb(179, 77, 46),
-                success_soft: Color32::from_rgb(231, 244, 238),
-                success_text: Color32::from_rgb(29, 107, 74),
-                warn_soft: Color32::from_rgb(254, 243, 219),
-                warn_text: Color32::from_rgb(161, 98, 7),
-                danger: Color32::from_rgb(198, 63, 59),
-                danger_soft: Color32::from_rgb(252, 235, 234),
-                danger_text: Color32::from_rgb(168, 44, 41),
+                text_primary: Color32::from_rgb(27, 26, 24),   // #1B1A18
+                text_secondary: Color32::from_rgb(81, 78, 72), // #514E48
+                text_muted: Color32::from_rgb(134, 130, 121),  // #868279
+                accent: Color32::from_rgb(217, 119, 87),       // #D97757
+                accent_soft: Color32::from_rgb(249, 235, 228), // #F9EBE4
+                accent_text: Color32::from_rgb(173, 72, 40),   // #AD4828
+                success_soft: Color32::from_rgb(226, 243, 236), // #E2F3EC
+                success_text: Color32::from_rgb(21, 122, 80),  // #157A50
+                warn_soft: Color32::from_rgb(253, 241, 220),   // #FDF1DC
+                warn_text: Color32::from_rgb(180, 105, 14),    // #B4690E
+                danger: Color32::from_rgb(196, 59, 55),        // #C43B37
+                danger_soft: Color32::from_rgb(252, 234, 233), // #FCEAE9
+                danger_text: Color32::from_rgb(196, 59, 55),
+                data_primary: Color32::from_rgb(73, 99, 122),    // #49637A
+                data_secondary: Color32::from_rgb(127, 161, 142), // #7FA18E
                 tag_bg: Color32::from_rgb(239, 236, 228),
-                tag_text: Color32::from_rgb(94, 91, 84),
+                tag_text: Color32::from_rgb(134, 130, 121),
             },
-            // Warm Charcoal & Terracotta (Dark)
+            // Studio Obsidian (exact match to v03_cockpit_preview.html [data-theme="dark"])
             ThemeMode::Dark => Self {
                 is_dark: true,
-                bg_root: Color32::from_rgb(38, 38, 36),
-                bg_sidebar: Color32::from_rgb(31, 30, 29),
-                bg_card: Color32::from_rgb(47, 46, 43),
-                bg_card_alt: Color32::from_rgb(55, 54, 50),
-                bg_input: Color32::from_rgb(33, 32, 30),
-                bg_nav_active: Color32::from_rgb(54, 53, 49),
-                bg_nav_hover: Color32::from_rgb(44, 43, 40),
-                border_subtle: Color32::from_rgb(65, 63, 58),
-                border_strong: Color32::from_rgb(90, 87, 80),
+                bg_root: Color32::from_rgb(29, 29, 27),       // #1D1D1B
+                bg_sidebar: Color32::from_rgb(22, 22, 21),    // #161615
+                bg_card: Color32::from_rgb(38, 37, 35),       // #262523
+                bg_card_alt: Color32::from_rgb(24, 24, 22),   // #181816 (--c-well)
+                bg_input: Color32::from_rgb(24, 24, 22),
+                bg_nav_active: Color32::from_rgb(38, 37, 35), // #262523 (--c-surface)
+                bg_nav_hover: Color32::from_rgb(49, 48, 44),  // #31302C (--c-hover)
+                border_subtle: Color32::from_rgb(53, 52, 48),
+                border_strong: Color32::from_rgb(74, 72, 66),
                 card_shadow: Shadow::NONE,
-                text_primary: Color32::from_rgb(242, 240, 233),
-                text_secondary: Color32::from_rgb(206, 202, 193),
-                text_muted: Color32::from_rgb(162, 158, 149),
-                accent: Color32::from_rgb(217, 119, 87),
-                accent_soft: Color32::from_rgb(74, 48, 39),
-                accent_text: Color32::from_rgb(242, 165, 138),
-                success_soft: Color32::from_rgb(32, 62, 49),
-                success_text: Color32::from_rgb(134, 224, 184),
-                warn_soft: Color32::from_rgb(68, 53, 25),
-                warn_text: Color32::from_rgb(250, 204, 100),
-                danger: Color32::from_rgb(214, 79, 75),
-                danger_soft: Color32::from_rgb(76, 36, 36),
-                danger_text: Color32::from_rgb(246, 158, 155),
-                tag_bg: Color32::from_rgb(60, 59, 55),
-                tag_text: Color32::from_rgb(196, 192, 183),
+                text_primary: Color32::from_rgb(243, 241, 235),   // #F3F1EB
+                text_secondary: Color32::from_rgb(196, 192, 183), // #C4C0B7
+                text_muted: Color32::from_rgb(139, 135, 126),     // #8B877E
+                accent: Color32::from_rgb(217, 119, 87),          // #D97757
+                accent_soft: Color32::from_rgb(66, 43, 35),       // #422B23
+                accent_text: Color32::from_rgb(243, 166, 140),    // #F3A68C
+                success_soft: Color32::from_rgb(27, 54, 43),      // #1B362B
+                success_text: Color32::from_rgb(71, 209, 149),    // #47D195
+                warn_soft: Color32::from_rgb(59, 46, 24),         // #3B2E18
+                warn_text: Color32::from_rgb(244, 183, 82),       // #F4B752
+                danger: Color32::from_rgb(240, 121, 117),         // #F07975
+                danger_soft: Color32::from_rgb(64, 32, 32),       // #402020
+                danger_text: Color32::from_rgb(240, 121, 117),
+                data_primary: Color32::from_rgb(136, 166, 194),   // #88A6C2
+                data_secondary: Color32::from_rgb(104, 184, 148), // #68B894
+                tag_bg: Color32::from_rgb(24, 24, 22),
+                tag_text: Color32::from_rgb(139, 135, 126),
             },
         }
     }
 }
 
-/// Shared normalized brand lightning geometry (2 convex triangles in [-1, 1] space)
-/// used by both the in-window vector brand mark and the 32x32 taskbar/tray icon.
+/// Shared normalized brand lightning geometry (2 convex triangles in [-1, 1] space).
 pub const BRAND_BOLT_UPPER: [(f32, f32); 3] = [(0.16, -0.66), (-0.54, 0.08), (0.08, 0.08)];
 pub const BRAND_BOLT_LOWER: [(f32, f32); 3] = [(-0.16, 0.66), (0.54, -0.08), (-0.08, -0.08)];
 
@@ -142,9 +165,8 @@ pub fn build_app_icon() -> egui::IconData {
     let bg = [217.0_f32, 119.0, 87.0];
     let fg = [255.0_f32, 255.0, 255.0];
 
-    // 4x4 supersampling for crisp anti-aliased rounded corners & lightning silhouette
     let half = size as f32 * 0.5;
-    let corner_r = size as f32 * 0.25; // matches 8px corner radius on 32px logo
+    let corner_r = size as f32 * 0.25;
     let inner_box = half - corner_r;
 
     for y in 0..size {
@@ -196,7 +218,7 @@ pub fn build_app_icon() -> egui::IconData {
 pub fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
-    // Real tabular monospace font first for IP:port columns and log timestamps
+    // Real tabular monospace font first for IP:port columns, speeds, RTTs, and log timestamps
     let mono_candidates = [
         r"C:\Windows\Fonts\consola.ttf",
         r"C:\Windows\Fonts\CascadiaMono.ttf",
@@ -204,8 +226,9 @@ pub fn configure_fonts(ctx: &egui::Context) {
     ];
     for path in mono_candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            let data = Arc::new(FontData::from_owned(bytes));
-            fonts.font_data.insert("win_mono".to_owned(), data);
+            fonts
+                .font_data
+                .insert("win_mono".to_owned(), Arc::new(FontData::from_owned(bytes)));
             fonts
                 .families
                 .entry(FontFamily::Monospace)
@@ -215,7 +238,7 @@ pub fn configure_fonts(ctx: &egui::Context) {
         }
     }
 
-    // Microsoft YaHei for proportional UI copy, plus a baseline-aligned CJK fallback for Monospace
+    // Crisp Microsoft YaHei Regular (`msyh.ttc`) for UI copy + CJK fallback in Monospace
     let cn_candidates = [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyh.ttf",
@@ -223,8 +246,6 @@ pub fn configure_fonts(ctx: &egui::Context) {
     ];
     for path in cn_candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            // Microsoft YaHei has generous top ascender/line-gap metrics in egui;
-            // shift slightly upward so CJK labels sit optically centered in buttons & pills.
             let mut prop_data = FontData::from_owned(bytes.clone());
             prop_data.tweak.y_offset_factor = -0.10;
             fonts
@@ -236,7 +257,6 @@ pub fn configure_fonts(ctx: &egui::Context) {
                 .or_default()
                 .insert(0, "cn_font".to_owned());
 
-            // Shift CJK fallback slightly upward in Monospace so it aligns with Consolas baseline
             let mut mono_cn = FontData::from_owned(bytes);
             mono_cn.tweak.y_offset_factor = -0.09;
             fonts
@@ -260,12 +280,12 @@ pub fn apply_theme(ctx: &egui::Context, p: ThemePalette) {
     style.spacing.button_padding = Vec2::new(12.0, 6.0);
 
     let mut scroll = egui::style::ScrollStyle::floating();
-    scroll.bar_width = 6.0;
+    scroll.bar_width = 5.0;
     scroll.floating_width = 2.5;
     scroll.floating_allocated_width = 0.0;
     scroll.dormant_handle_opacity = 0.12;
     scroll.active_handle_opacity = 0.28;
-    scroll.interact_handle_opacity = 0.50;
+    scroll.interact_handle_opacity = 0.48;
     style.spacing.scroll = scroll;
 
     let mut visuals = if p.is_dark {
@@ -284,7 +304,6 @@ pub fn apply_theme(ctx: &egui::Context, p: ThemePalette) {
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text_primary);
 
-    // Unified neutral hover/active states matching custom widgets across all pages
     visuals.widgets.inactive.bg_fill = p.bg_card_alt;
     visuals.widgets.inactive.weak_bg_fill = p.bg_card_alt;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);

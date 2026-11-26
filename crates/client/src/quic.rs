@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use protocol::{
     ALPN_PROTOCOL, DATAGRAM_RECV_BUFFER, DATAGRAM_SEND_BUFFER, DEFAULT_INITIAL_MTU,
     KEEP_ALIVE_INTERVAL, MAX_IDLE_TIMEOUT,
@@ -12,28 +12,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Fast synchronous syntax validation for `host:port` / `ip:port` / `[ipv6]:port`.
+/// Fast synchronous syntax validation for `host:port` / `ip:port` / `[ipv6]:port`,
+/// delegating to the domain `ServerEndpoint` value object ("parse, don't validate").
 pub fn validate_server_addr(raw: &str) -> Result<()> {
-    let s = raw.trim();
-    if s.parse::<SocketAddr>().is_ok() {
-        return Ok(());
-    }
-    let (host, port_str) = if let Some(rest) = s.strip_prefix('[') {
-        let (h, after) = rest.split_once(']').context("IPv6 地址缺少 ']'")?;
-        let p = after.strip_prefix(':').context("地址缺少 ':端口'")?;
-        (h.trim(), p.trim())
-    } else {
-        let (h, p) = s.rsplit_once(':').context("地址缺少 ':端口'")?;
-        (h.trim(), p.trim())
-    };
-    if host.is_empty() || host.contains(char::is_whitespace) {
-        bail!("服务器主机名无效");
-    }
-    let port: u16 = port_str.parse().context("端口号无效")?;
-    if port == 0 {
-        bail!("端口号不能为 0");
-    }
-    Ok(())
+    protocol::domain::ServerEndpoint::parse(raw).map(|_| ())
 }
 
 /// Resolve server `IP:port` or `domain:port` (prefers IPv4 first so TUN route pinning works

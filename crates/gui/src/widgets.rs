@@ -1,9 +1,10 @@
 use crate::ConnState;
 use crate::icons;
 use crate::storage::format_speed;
-use crate::theme::{FONT_BODY, FONT_SM, FONT_SUB, FONT_XS, ThemePalette};
+use crate::theme::{FONT_BODY, FONT_SM, FONT_SUB, FONT_XS, ThemePalette, font_bold};
 use eframe::egui::{
-    self, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Sense, Stroke, StrokeKind, Vec2,
+    self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, Pos2, Sense, Stroke,
+    StrokeKind, Vec2,
 };
 use std::collections::VecDeque;
 
@@ -11,9 +12,52 @@ pub fn card_frame(p: ThemePalette) -> Frame {
     Frame::new()
         .fill(p.bg_card)
         .stroke(Stroke::new(1.0_f32, p.border_subtle))
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(14))
         .inner_margin(Margin::symmetric(20, 16))
         .shadow(p.card_shadow)
+}
+
+/// Allocates an exact-size Bento card (`size` outer pixels, `CornerRadius::same(14)`),
+/// guaranteeing 0.0px edge alignment across asymmetric grid rows & columns regardless of
+/// how short or long the inner content is.
+pub fn bento_card_exact<R>(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    pad: Margin,
+    border_col: Color32,
+    p: ThemePalette,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let (outer_rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter();
+    if p.card_shadow != egui::Shadow::NONE {
+        painter.add(p.card_shadow.as_shape(outer_rect, CornerRadius::same(14)));
+    }
+    painter.rect(
+        outer_rect,
+        CornerRadius::same(14),
+        p.bg_card,
+        Stroke::new(1.0_f32, border_col),
+        StrokeKind::Inside,
+    );
+
+    let inner_rect = egui::Rect::from_min_max(
+        Pos2::new(
+            outer_rect.min.x + pad.left as f32,
+            outer_rect.min.y + pad.top as f32,
+        ),
+        Pos2::new(
+            (outer_rect.max.x - pad.right as f32).max(outer_rect.min.x + pad.left as f32 + 1.0),
+            (outer_rect.max.y - pad.bottom as f32).max(outer_rect.min.y + pad.top as f32 + 1.0),
+        ),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner_rect)
+            .layout(Layout::top_down(Align::LEFT)),
+    );
+    child.set_clip_rect(outer_rect);
+    add_contents(&mut child)
 }
 
 /// Crisp 1px horizontal hairline divider replacing raw `ui.separator()`.
@@ -41,6 +85,7 @@ pub fn aligned_row<R>(
         Vec2::new(w, height),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
+            ui.set_min_width(w);
             ui.set_min_height(height);
             add_contents(ui)
         },
@@ -89,7 +134,8 @@ pub fn elide_text(ui: &egui::Ui, text: &str, font: FontId, max_width: f32) -> St
     format!("{prefix}{ellipsis}")
 }
 
-/// Unified painter-drawn segmented control with optical galley centering and optional hover tips.
+/// Borderless recessed-well segmented control matching `v03_cockpit_preview.html`:
+/// soft `--c-well` track without outer stroke, crisp white/elevated active pill with bold ink.
 pub fn segmented_control<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
     id_salt: &str,
@@ -100,19 +146,14 @@ pub fn segmented_control<T: Copy + PartialEq>(
     p: ThemePalette,
 ) -> Option<T> {
     let (pill_rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect(
-        pill_rect,
-        CornerRadius::same(8),
-        p.bg_card_alt,
-        Stroke::new(1.0_f32, p.border_subtle),
-        StrokeKind::Inside,
-    );
+    ui.painter()
+        .rect_filled(pill_rect, CornerRadius::same(8), p.bg_card_alt);
+
     let n = options.len().max(1) as f32;
     let pad = 2.5_f32;
     let gap = 2.0_f32;
     let seg_w = ((size.x - pad * 2.0 - gap * (n - 1.0)) / n).max(16.0);
     let seg_h = (size.y - pad * 2.0).max(14.0);
-    let font = FontId::proportional(font_size);
 
     let mut picked = None;
     for (idx, &(val, lbl, tip)) in options.iter().enumerate() {
@@ -124,28 +165,37 @@ pub fn segmented_control<T: Copy + PartialEq>(
             resp = resp.on_hover_text(tip_text);
         }
         let active = selected == val;
-        let fill = if active {
-            p.bg_card
-        } else if resp.hovered() {
-            p.bg_nav_hover
-        } else {
-            Color32::TRANSPARENT
-        };
-        let stroke = if active {
-            Stroke::new(1.0_f32, p.border_subtle)
-        } else {
-            Stroke::NONE
-        };
-        let fg = if active { p.text_primary } else { p.text_muted };
-        let galley = ui.fonts(|f| f.layout_no_wrap(lbl.to_string(), font.clone(), fg));
         let painter = ui.painter();
-        painter.rect(
-            seg_rect,
-            CornerRadius::same(6),
-            fill,
-            stroke,
-            StrokeKind::Inside,
-        );
+        if active {
+            if !p.is_dark {
+                let sh = egui::Shadow {
+                    offset: [0, 1],
+                    blur: 2,
+                    spread: 0,
+                    color: Color32::from_black_alpha(15),
+                };
+                painter.add(sh.as_shape(seg_rect, CornerRadius::same(6)));
+                painter.rect_filled(seg_rect, CornerRadius::same(6), p.bg_card);
+            } else {
+                painter.rect(
+                    seg_rect,
+                    CornerRadius::same(6),
+                    p.bg_card,
+                    Stroke::new(1.0_f32, p.border_subtle),
+                    StrokeKind::Inside,
+                );
+            }
+        } else if resp.hovered() {
+            painter.rect_filled(seg_rect, CornerRadius::same(6), p.bg_nav_hover);
+        }
+
+        let fg = if active { p.text_primary } else { p.text_muted };
+        let font = if active {
+            font_bold(font_size)
+        } else {
+            FontId::proportional(font_size)
+        };
+        let galley = ui.fonts(|f| f.layout_no_wrap(lbl.to_string(), font, fg));
         painter.galley(
             Pos2::new(
                 seg_rect.center().x - galley.size().x * 0.5,
@@ -163,7 +213,7 @@ pub fn segmented_control<T: Copy + PartialEq>(
 
 /// Unified primary Terracotta button (consistent hover & press feedback everywhere).
 pub fn primary_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette) -> egui::Response {
-    let font = FontId::proportional(FONT_SM);
+    let font = font_bold(FONT_SM);
     let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font, Color32::WHITE));
     let w = (galley.size().x + 26.0).max(76.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
@@ -193,7 +243,7 @@ pub fn primary_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette) -> egui::Resp
     resp
 }
 
-/// Unified secondary outlined button (consistent hover/active fill across all 4 pages).
+/// Unified secondary outlined button.
 pub fn soft_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette) -> egui::Response {
     let font = FontId::proportional(FONT_SM);
     let enabled = ui.is_enabled();
@@ -250,26 +300,26 @@ pub fn chip_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette, is_danger: bool)
     let w = (galley.size().x + 18.0).max(44.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click());
 
-    let (fill, border) = if !enabled {
-        (p.bg_card_alt, p.border_subtle)
+    let fill = if !enabled {
+        p.bg_card_alt
     } else if is_danger && resp.hovered() {
-        (p.danger_soft, p.danger_text)
-    } else if resp.is_pointer_button_down_on() {
-        (p.bg_nav_active, p.border_strong)
-    } else if resp.hovered() {
-        (p.bg_nav_hover, p.border_strong)
+        p.danger_soft
+    } else if resp.is_pointer_button_down_on() || resp.hovered() {
+        p.bg_nav_hover
     } else {
-        (p.bg_card_alt, p.border_subtle)
+        p.bg_card_alt
     };
 
     let painter = ui.painter();
-    painter.rect(
-        rect,
-        CornerRadius::same(7),
-        fill,
-        Stroke::new(1.0_f32, border),
-        StrokeKind::Inside,
-    );
+    painter.rect_filled(rect, CornerRadius::same(6), fill);
+    if is_danger && resp.hovered() {
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0_f32, p.danger_text),
+            StrokeKind::Inside,
+        );
+    }
     painter.galley(
         Pos2::new(
             rect.center().x - galley.size().x * 0.5,
@@ -288,7 +338,7 @@ pub fn accent_chip_btn(
     p: ThemePalette,
     solid: bool,
 ) -> egui::Response {
-    let font = FontId::proportional(FONT_SM);
+    let font = font_bold(FONT_SM);
     let enabled = ui.is_enabled();
     let fg = if solid {
         Color32::WHITE
@@ -339,11 +389,11 @@ pub fn pill(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
     let font = FontId::proportional(FONT_XS);
     let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font, fg));
     let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(galley.size().x + 16.0, galley.size().y + 6.0),
+        Vec2::new(galley.size().x + 14.0, galley.size().y + 5.0),
         Sense::hover(),
     );
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(10), bg);
+    painter.rect_filled(rect, CornerRadius::same(6), bg);
     painter.galley(
         Pos2::new(
             rect.center().x - galley.size().x * 0.5,
@@ -362,109 +412,90 @@ pub fn draw_status_pill(
     fg: Color32,
     stroke_col: Color32,
 ) {
-    let font_id = FontId::proportional(FONT_SM);
+    let font_id = font_bold(FONT_XS);
     let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font_id, fg));
-    let w = galley.size().x + 30.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::hover());
+    let w = galley.size().x + 26.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::hover());
     let painter = ui.painter();
     painter.rect(
         rect,
-        CornerRadius::same(13),
+        CornerRadius::same(12),
         bg,
         Stroke::new(1.0_f32, stroke_col),
         StrokeKind::Inside,
     );
-    painter.circle_filled(Pos2::new(rect.left() + 12.0, rect.center().y), 3.3, dot_col);
+    painter.circle_filled(Pos2::new(rect.left() + 10.5, rect.center().y), 3.1, dot_col);
     painter.galley(
-        Pos2::new(rect.left() + 20.0, rect.center().y - galley.size().y * 0.5),
+        Pos2::new(rect.left() + 18.0, rect.center().y - galley.size().y * 0.5),
         galley,
         fg,
     );
 }
 
-/// Primary Hero connection CTA capsule (`228 x 46`).
-pub fn draw_hero_power_button(
+/// Hero Deck Action Button (`138 x 46` locked slot, `CornerRadius::same(12)`), matching
+/// `v03_cockpit_preview.html` pixel-for-pixel (Norman State-vs-Action separation).
+pub fn draw_hero_action_button(
     ui: &mut egui::Ui,
     state: ConnState,
-    reconnect: Option<(u32, u64)>,
     has_nodes: bool,
     p: ThemePalette,
 ) -> egui::Response {
-    let desired = Vec2::new(228.0, 46.0);
+    let desired = Vec2::new(138.0, 46.0);
     let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
     let painter = ui.painter();
 
-    let (fill, border_stroke, halo_col, fg_col, label) = match state {
+    let (fill, border_stroke, fg_col, label) = match state {
         ConnState::Disconnected => {
             let base = p.accent;
             let f = if resp.is_pointer_button_down_on() {
                 base.linear_multiply(0.90)
             } else if resp.hovered() {
-                base.linear_multiply(1.06)
+                base.linear_multiply(1.05)
             } else {
                 base
             };
-            let lbl = if has_nodes {
-                "开启加速"
-            } else {
-                "添加节点"
-            }
-            .to_string();
-            (
-                f,
-                Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
-                Color32::from_rgba_unmultiplied(217, 119, 87, if resp.hovered() { 44 } else { 20 }),
-                Color32::WHITE,
-                lbl,
-            )
+            let lbl = if has_nodes { "开启加速" } else { "添加节点" };
+            (f, Stroke::new(1.0_f32, base), Color32::WHITE, lbl)
         }
         ConnState::Connecting => {
-            let lbl = match reconnect {
-                Some((attempt, _)) => format!("重连中 (#{attempt})…"),
-                None => "连接中…".to_string(),
+            let f = if resp.hovered() {
+                p.warn_soft.linear_multiply(0.96)
+            } else {
+                p.warn_soft
             };
-            (
-                p.accent,
-                Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
-                Color32::from_rgba_unmultiplied(217, 119, 87, 46),
-                Color32::WHITE,
-                lbl,
-            )
+            (f, Stroke::new(1.0_f32, p.warn_text), p.warn_text, "取消连接")
         }
         ConnState::Connected => {
             if resp.hovered() {
                 (
                     p.danger_soft,
-                    Stroke::new(1.5_f32, p.danger_text),
-                    Color32::from_rgba_unmultiplied(198, 63, 59, 26),
+                    Stroke::new(1.0_f32, p.danger_text),
                     p.danger_text,
-                    "断开连接".to_string(),
+                    "断开连接",
                 )
             } else {
                 (
-                    p.success_soft,
-                    Stroke::new(1.5_f32, p.success_text),
-                    Color32::from_rgba_unmultiplied(29, 107, 74, if p.is_dark { 34 } else { 20 }),
-                    p.success_text,
-                    "加速中".to_string(),
+                    p.bg_card_alt,
+                    Stroke::new(1.0_f32, p.border_strong),
+                    p.text_primary,
+                    "断开连接",
                 )
             }
         }
     };
 
-    painter.rect_filled(rect.expand(4.0), CornerRadius::same(27), halo_col);
     painter.rect(
         rect,
-        CornerRadius::same(23),
+        CornerRadius::same(12),
         fill,
         border_stroke,
         StrokeKind::Inside,
     );
 
-    let font_id = FontId::proportional(FONT_SUB);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label, font_id, fg_col));
-    let icon_w = 16.0;
-    let gap = 9.0;
+    let font_id = font_bold(14.0);
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font_id, fg_col));
+    let icon_w = 15.0;
+    let gap = 7.5;
     let total_w = icon_w + gap + galley.size().x;
     let start_x = rect.center().x - total_w * 0.5;
 
@@ -586,44 +617,82 @@ pub fn styled_search_input(
         });
 }
 
+fn draw_idle_chart_grid(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    labels: [&str; 3],
+    hint: &str,
+    p: ThemePalette,
+) {
+    let left_pad = 48.0;
+    let inner = egui::Rect::from_min_max(
+        Pos2::new(rect.left() + left_pad, rect.top() + 8.0),
+        Pos2::new(rect.right() - 6.0, rect.bottom() - 8.0),
+    );
+    let grid_col = if p.is_dark {
+        Color32::from_white_alpha(12)
+    } else {
+        Color32::from_black_alpha(11)
+    };
+    for (i, lbl) in labels.iter().enumerate() {
+        let frac = i as f32 * 0.5;
+        let y = inner.top() + frac * inner.height();
+        painter.line_segment(
+            [Pos2::new(inner.left(), y), Pos2::new(inner.right(), y)],
+            Stroke::new(1.0_f32, grid_col),
+        );
+        painter.text(
+            Pos2::new(inner.left() - 6.0, y),
+            egui::Align2::RIGHT_CENTER,
+            *lbl,
+            FontId::monospace(FONT_XS),
+            p.text_muted.gamma_multiply(0.75),
+        );
+    }
+    painter.text(
+        inner.center(),
+        egui::Align2::CENTER_CENTER,
+        hint,
+        FontId::proportional(FONT_SM),
+        p.text_muted,
+    );
+}
+
 pub fn draw_rtt_sparkline(
     ui: &mut egui::Ui,
     history: &VecDeque<u64>,
     is_connected: bool,
     p: ThemePalette,
 ) {
-    let height = ui.available_height().clamp(88.0, 260.0);
+    let height = ui.available_height().max(72.0);
     let desired = Vec2::new(ui.available_width(), height);
     let (rect, _resp) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
 
     if !is_connected || history.len() < 2 {
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "连接后展示实时曲线",
-            FontId::proportional(FONT_SM),
-            p.text_muted,
+        draw_idle_chart_grid(
+            &painter,
+            rect,
+            ["100 ms", "50 ms", "0 ms"],
+            "连接开启后实时绘制延迟曲线",
+            p,
         );
         return;
     }
 
     let peak = history.iter().copied().max().unwrap_or(100).max(50);
     let max_val = ((peak as f32 * 1.35) / 10.0).ceil() * 10.0;
-    let left_pad = 48.0;
-    let right_pad = 8.0;
-    let top_pad = 8.0;
-    let bot_pad = 8.0;
+    let left_pad = 46.0;
     let inner = egui::Rect::from_min_max(
-        Pos2::new(rect.left() + left_pad, rect.top() + top_pad),
-        Pos2::new(rect.right() - right_pad, rect.bottom() - bot_pad),
+        Pos2::new(rect.left() + left_pad, rect.top() + 8.0),
+        Pos2::new(rect.right() - 6.0, rect.bottom() - 8.0),
     );
     let step_x = inner.width() / (history.len().saturating_sub(1).max(1) as f32);
 
     let grid_col = if p.is_dark {
         Color32::from_white_alpha(14)
     } else {
-        Color32::from_black_alpha(14)
+        Color32::from_black_alpha(12)
     };
     for (frac, lbl) in [
         (0.0_f32, format!("{} ms", max_val as u64)),
@@ -655,9 +724,10 @@ pub fn draw_rtt_sparkline(
         })
         .collect();
 
+    let line_col = p.success_text;
     let mut mesh = egui::Mesh::default();
-    let top_col = Color32::from_rgba_unmultiplied(217, 119, 87, if p.is_dark { 58 } else { 42 });
-    let bot_col = Color32::from_rgba_unmultiplied(217, 119, 87, 0);
+    let top_col = line_col.gamma_multiply(if p.is_dark { 0.20 } else { 0.14 });
+    let bot_col = line_col.gamma_multiply(0.0);
     for (i, pt) in points.iter().enumerate() {
         let base_idx = (i * 2) as u32;
         mesh.colored_vertex(*pt, top_col);
@@ -672,37 +742,33 @@ pub fn draw_rtt_sparkline(
 
     painter.add(egui::Shape::line(
         points.clone(),
-        Stroke::new(2.0_f32, p.accent),
+        Stroke::new(2.0_f32, line_col),
     ));
     if let Some(&last_pt) = points.last() {
-        painter.circle_filled(
-            last_pt,
-            6.0,
-            Color32::from_rgba_unmultiplied(217, 119, 87, 60),
-        );
-        painter.circle_filled(last_pt, 3.0, p.accent);
+        painter.circle_filled(last_pt, 5.5, line_col.gamma_multiply(0.22));
+        painter.circle_filled(last_pt, 3.0, line_col);
     }
 }
 
-/// Real-time traffic throughput sparkline embedded seamlessly inside the monitor card.
+/// Real-time traffic throughput sparkline using calm Slate-Ink (`p.data_primary` / `p.data_secondary`).
 pub fn draw_traffic_sparkline(
     ui: &mut egui::Ui,
     history: &VecDeque<(f64, f64)>,
     is_connected: bool,
     p: ThemePalette,
 ) {
-    let height = ui.available_height().clamp(88.0, 260.0);
+    let height = ui.available_height().max(72.0);
     let desired = Vec2::new(ui.available_width(), height);
     let (rect, _resp) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
 
     if !is_connected || history.len() < 2 {
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "连接后展示实时曲线",
-            FontId::proportional(FONT_SM),
-            p.text_muted,
+        draw_idle_chart_grid(
+            &painter,
+            rect,
+            ["16 KB/s", "8 KB/s", "0 B/s"],
+            "连接开启后实时绘制链路曲线",
+            p,
         );
         return;
     }
@@ -713,20 +779,17 @@ pub fn draw_traffic_sparkline(
         .fold(0.0_f64, f64::max);
     let scale_max = (peak_bps * 1.30).max(16.0 * 1024.0);
 
-    let left_pad = 64.0;
-    let right_pad = 8.0;
-    let top_pad = 8.0;
-    let bot_pad = 8.0;
+    let left_pad = 58.0;
     let inner = egui::Rect::from_min_max(
-        Pos2::new(rect.left() + left_pad, rect.top() + top_pad),
-        Pos2::new(rect.right() - right_pad, rect.bottom() - bot_pad),
+        Pos2::new(rect.left() + left_pad, rect.top() + 8.0),
+        Pos2::new(rect.right() - 6.0, rect.bottom() - 8.0),
     );
     let step_x = inner.width() / (history.len().saturating_sub(1).max(1) as f32);
 
     let grid_col = if p.is_dark {
         Color32::from_white_alpha(14)
     } else {
-        Color32::from_black_alpha(14)
+        Color32::from_black_alpha(12)
     };
     for (frac, lbl) in [
         (0.0_f32, format_speed(scale_max)),
@@ -770,8 +833,8 @@ pub fn draw_traffic_sparkline(
         .collect();
 
     let mut mesh = egui::Mesh::default();
-    let top_col = Color32::from_rgba_unmultiplied(217, 119, 87, if p.is_dark { 58 } else { 42 });
-    let bot_col = Color32::from_rgba_unmultiplied(217, 119, 87, 0);
+    let top_col = p.data_primary.gamma_multiply(if p.is_dark { 0.22 } else { 0.14 });
+    let bot_col = p.data_primary.gamma_multiply(0.0);
     for (i, pt) in rx_points.iter().enumerate() {
         let base_idx = (i * 2) as u32;
         mesh.colored_vertex(*pt, top_col);
@@ -786,24 +849,19 @@ pub fn draw_traffic_sparkline(
 
     painter.add(egui::Shape::line(
         tx_points,
-        Stroke::new(1.5_f32, p.success_text),
+        Stroke::new(1.5_f32, p.data_secondary),
     ));
     painter.add(egui::Shape::line(
         rx_points.clone(),
-        Stroke::new(2.0_f32, p.accent),
+        Stroke::new(2.0_f32, p.data_primary),
     ));
     if let Some(&last_pt) = rx_points.last() {
-        painter.circle_filled(
-            last_pt,
-            5.5,
-            Color32::from_rgba_unmultiplied(217, 119, 87, 56),
-        );
-        painter.circle_filled(last_pt, 2.8, p.accent);
+        painter.circle_filled(last_pt, 5.2, p.data_primary.gamma_multiply(0.24));
+        painter.circle_filled(last_pt, 2.8, p.data_primary);
     }
 }
 
-/// Renders a centered floating modal dialog with a dimmed backdrop, Esc/backdrop/close handling,
-/// and consistent card styling. Returns `true` if the user requested to close the modal.
+/// Renders a centered floating modal dialog with a dimmed backdrop, Esc/backdrop/close handling.
 pub fn modal_dialog(
     ctx: &egui::Context,
     id: &str,
@@ -850,8 +908,7 @@ pub fn modal_dialog(
             aligned_row(ui, 28.0, |ui| {
                 ui.label(
                     egui::RichText::new(title)
-                        .size(FONT_SUB)
-                        .strong()
+                        .font(font_bold(FONT_SUB))
                         .color(p.text_primary),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

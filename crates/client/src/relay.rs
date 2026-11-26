@@ -1,15 +1,14 @@
 use crate::rules::Router;
 use anyhow::{Context, Result, bail};
-use bytes::Bytes;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use protocol::auth::AUTH_OK;
-use protocol::frame::{FLAG_GAME_MODE, TargetAddr, UdpFrame};
-use protocol::pacer::{UdpDupPacer, send_datagram_checked};
+use protocol::domain::LinkQuality;
+use protocol::frame::{TargetAddr, UdpFrame};
 use protocol::share::NodeProtocol;
 use quinn::Connection;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -32,6 +31,14 @@ pub struct ClientStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub rtt_ms: AtomicU64,
+    /// Smoothed RFC 3550 jitter in tenths of a millisecond (`18` => `±1.8 ms`).
+    pub jitter_tenths_ms: AtomicU32,
+    /// Recent UDP lane packet loss ratio in basis points (`100` => `1.0%`).
+    pub loss_bps: AtomicU32,
+    /// Whether adaptive `< 200B` game packet dual-send is currently engaged.
+    pub dup_active: AtomicBool,
+    /// Unix timestamp (seconds) when the current tunnel session authenticated.
+    pub connected_at_unix: AtomicU64,
 }
 
 impl ClientStats {
@@ -42,6 +49,31 @@ impl ClientStats {
         self.tx_bytes.store(0, Ordering::Relaxed);
         self.rx_bytes.store(0, Ordering::Relaxed);
         self.rtt_ms.store(0, Ordering::Relaxed);
+        self.jitter_tenths_ms.store(0, Ordering::Relaxed);
+        self.loss_bps.store(0, Ordering::Relaxed);
+        self.dup_active.store(false, Ordering::Relaxed);
+        self.connected_at_unix.store(0, Ordering::Relaxed);
+    }
+
+    pub fn link_quality(&self) -> LinkQuality {
+        LinkQuality {
+            rtt_ms: self.rtt_ms.load(Ordering::Relaxed),
+            jitter_tenths_ms: self.jitter_tenths_ms.load(Ordering::Relaxed),
+            loss_bps: self.loss_bps.load(Ordering::Relaxed),
+            dup_active: self.dup_active.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn uptime_secs(&self) -> u64 {
+        if !self.connected.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let started = self.connected_at_unix.load(Ordering::Relaxed);
+        if started == 0 {
+            0
+        } else {
+            protocol::unix_now_secs().saturating_sub(started)
+        }
     }
 }
 
@@ -102,60 +134,6 @@ pub(crate) async fn open_proxy_tcp_stream(
     Ok((quic_send, quic_recv))
 }
 
-/// Encode and send a proxied UDP packet on `conn` using either `GACL` (`UdpFrame` + optional
-/// game dual-send) or `Hysteria2` (with automatic fragmentation when larger than `max_dgram`).
-/// Returns `false` if the QUIC connection is closed.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn send_proxy_udp_packet(
-    protocol: NodeProtocol,
-    conn: &Connection,
-    pacer: &UdpDupPacer,
-    flow_id: u16,
-    seq: u16,
-    is_game_pkt: bool,
-    dst: TargetAddr,
-    payload: Bytes,
-) -> bool {
-    match protocol {
-        NodeProtocol::Gacl => {
-            let flags = if is_game_pkt { FLAG_GAME_MODE } else { 0 };
-            let frame = UdpFrame {
-                flow_id,
-                seq,
-                flags,
-                addr: dst,
-                payload,
-            };
-            if let Ok(encoded) = frame.encode() {
-                if !send_datagram_checked(conn, encoded.clone()) {
-                    return false;
-                }
-                if is_game_pkt {
-                    pacer.schedule_dup(encoded);
-                }
-            }
-            true
-        }
-        NodeProtocol::Hysteria2 => {
-            let max_dgram = conn.max_datagram_size().unwrap_or(1150);
-            let addr_str = dst.to_host_port();
-            let pkts = protocol::hy2::encode_hy2_udp_datagrams(
-                flow_id as u32,
-                seq,
-                &addr_str,
-                &payload,
-                max_dgram,
-            );
-            for pkt in pkts {
-                if !send_datagram_checked(conn, pkt) {
-                    return false;
-                }
-            }
-            true
-        }
-    }
-}
-
 /// Fast-open TCP relay over an already-opened QUIC stream whose open header has been
 /// written but whose dial status has NOT been awaited.
 pub(crate) async fn relay_fast_open<S>(
@@ -202,7 +180,6 @@ where
     if ok {
         let _ = u.await;
     } else {
-        // Remote dial failed: stop forwarding local bytes into a dead stream.
         u.abort();
     }
     stats.active_tcp.fetch_sub(1, Ordering::Relaxed);

@@ -1,594 +1,561 @@
-use crate::icons;
-use crate::storage::{ProxyMode, RouteMode, format_bytes, format_speed, save_config};
-use crate::theme::{FONT_BODY, FONT_SM, FONT_TITLE, FONT_XS, ThemePalette};
+//! Asymmetric Bento Desktop Studio Dashboard (`840 × 548`), matching `v03_cockpit_preview.html`
+//! pixel-for-pixel via `bento_card_exact` deterministic geometry locks.
+
+use crate::storage::{ProxyMode, RouteMode, format_bytes, format_speed};
+use crate::theme::{FONT_SM, FONT_TITLE, FONT_XS, ThemePalette, font_bold, font_mono_bold};
 use crate::widgets::{
-    aligned_row, card_frame, draw_hero_power_button, draw_rtt_sparkline, draw_traffic_sparkline,
-    elide_text, hairline_divider, segmented_control,
+    aligned_row, bento_card_exact, chip_btn, draw_hero_action_button, draw_rtt_sparkline,
+    draw_traffic_sparkline, elide_text, hairline_divider, segmented_control,
 };
 use crate::{ChartMode, ConnState, GameAccelApp, NavTab, ProbeState};
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, Pos2, RichText, ScrollArea,
-    Sense, Stroke, Vec2,
+    self, Align, Color32, CornerRadius, FontId, Layout, Margin, Pos2, RichText, ScrollArea, Sense,
+    Stroke, Vec2,
 };
+use protocol::share::NodeProtocol;
 use std::sync::atomic::Ordering;
+
+fn format_hms(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
 
 impl GameAccelApp {
     pub(super) fn render_dashboard(&mut self, ui: &mut egui::Ui, p: ThemePalette) {
-        ScrollArea::vertical()
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                self.render_dashboard_inner(ui, p);
-            });
+        let full_w = ui.available_width();
+        let gap = 12.0_f32;
+        ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
+
+        // =========================================================================
+        // ZONE 1: Full-Width Hero Command Deck (`full_w × 114px` exact outer bounds)
+        // =========================================================================
+        self.render_hero_deck(ui, full_w, p);
+
+        // =========================================================================
+        // ZONE 2: Asymmetric 7:5 Bento Split (Left Telemetry | Right Controls+Lines)
+        // =========================================================================
+        let bottom_h = ui.available_height().max(240.0);
+        let right_w = (full_w * (5.0 / 12.0)).round().clamp(268.0, 360.0);
+        let left_w = (full_w - right_w - gap).max(280.0);
+
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            self.render_telemetry_bento(ui, left_w, bottom_h, p);
+
+            ui.allocate_ui_with_layout(
+                Vec2::new(right_w, bottom_h),
+                Layout::top_down(Align::LEFT),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = gap;
+                    self.render_control_stack(ui, right_w, bottom_h, gap, p);
+                },
+            );
+        });
     }
 
-    fn render_dashboard_inner(&mut self, ui: &mut egui::Ui, p: ThemePalette) {
-        let rtt = self.stats.rtt_ms.load(Ordering::Relaxed);
+    fn render_hero_deck(&mut self, ui: &mut egui::Ui, full_w: f32, p: ThemePalette) {
+        let active_node = self.cfg.active_node().cloned();
+        let has_nodes = !self.cfg.nodes.is_empty();
+        let reconnect = self.reconnect_status();
+        let is_live = self.state == ConnState::Connected;
+
+        let hero_border = match self.state {
+            ConnState::Connected => p.success_text.gamma_multiply(0.38),
+            ConnState::Connecting => p.warn_text.gamma_multiply(0.45),
+            ConnState::Disconnected => p.border_subtle,
+        };
+
+        let mut toggle_clicked = false;
+        let mut jump_to_nodes = false;
+
+        bento_card_exact(
+            ui,
+            Vec2::new(full_w, 114.0),
+            Margin::symmetric(20, 16),
+            hero_border,
+            p,
+            |ui| {
+                let inner_w = ui.available_width();
+                let action_slot_w = 144.0;
+                let col_gap = 16.0;
+                let runway_w = (inner_w - action_slot_w - col_gap).max(160.0);
+
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = col_gap;
+
+                    // Left Anti-Squeeze Text Runway (strictly locked to `runway_w`)
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(runway_w, 82.0),
+                        Layout::top_down(Align::LEFT),
+                        |ui| {
+                            ui.set_min_width(runway_w);
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 5.0);
+
+                            // Row 1 (22px): Pure State Capsule + Timer + Protocol Tag
+                            aligned_row(ui, 22.0, |ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let (badge_txt, dot_col, badge_bg, badge_fg) =
+                                    match (self.state, reconnect) {
+                                        (ConnState::Connected, _) => (
+                                            "隧道保护中".to_string(),
+                                            p.success_text,
+                                            p.success_soft,
+                                            p.success_text,
+                                        ),
+                                        (ConnState::Connecting, Some((attempt, 0))) => (
+                                            format!("重连中 #{attempt}…"),
+                                            p.warn_text,
+                                            p.warn_soft,
+                                            p.warn_text,
+                                        ),
+                                        (ConnState::Connecting, Some((attempt, secs))) => (
+                                            format!("重连中 #{attempt} ({secs}s)"),
+                                            p.warn_text,
+                                            p.warn_soft,
+                                            p.warn_text,
+                                        ),
+                                        (ConnState::Connecting, None) => (
+                                            "正在握手…".to_string(),
+                                            p.warn_text,
+                                            p.warn_soft,
+                                            p.warn_text,
+                                        ),
+                                        (ConnState::Disconnected, _) => (
+                                            "待机就绪".to_string(),
+                                            p.text_muted,
+                                            p.bg_card_alt,
+                                            p.text_muted,
+                                        ),
+                                    };
+                                draw_state_capsule(ui, &badge_txt, dot_col, badge_bg, badge_fg);
+
+                                if is_live {
+                                    ui.label(
+                                        RichText::new(format_hms(self.stats.uptime_secs()))
+                                            .size(FONT_SM)
+                                            .monospace()
+                                            .color(p.text_muted),
+                                    );
+                                }
+
+                                if let Some(ref node) = active_node {
+                                    let proto_lbl = match node.protocol {
+                                        NodeProtocol::Gacl => "GACL · 双通道",
+                                        NodeProtocol::Hysteria2 => "HY2 · 双通道",
+                                    };
+                                    draw_mono_tag(ui, proto_lbl, p);
+                                }
+                            });
+
+                            // Row 2 (28px): Active Node Headline (18px Native Bold, single-line elided)
+                            aligned_row(ui, 28.0, |ui| {
+                                if let Some(ref node) = active_node {
+                                    let shown_title = elide_text(
+                                        ui,
+                                        &node.name,
+                                        font_bold(FONT_TITLE),
+                                        runway_w - 4.0,
+                                    );
+                                    ui.add(egui::Label::new(
+                                        RichText::new(shown_title)
+                                            .font(font_bold(FONT_TITLE))
+                                            .color(p.text_primary),
+                                    ))
+                                    .on_hover_text(format!("{}  ({})", node.name, node.server));
+                                } else {
+                                    let resp = ui.add(
+                                        egui::Label::new(
+                                            RichText::new("尚未配置加速节点 · 点击导入或新建")
+                                                .font(font_bold(FONT_TITLE))
+                                                .color(p.accent_text),
+                                        )
+                                        .sense(Sense::click()),
+                                    );
+                                    if resp.clicked() {
+                                        jump_to_nodes = true;
+                                    }
+                                }
+                            });
+
+                            // Row 3 (20px): Explicit System Takeover & Split-Routing Feedback
+                            aligned_row(ui, 20.0, |ui| {
+                                let (raw_desc, desc_col) = if let Some(err) = &self.last_error {
+                                    (format!("连接提示：{err}"), p.danger_text)
+                                } else {
+                                    (self.plain_takeover_summary(), p.text_secondary)
+                                };
+                                let shown_desc = elide_text(
+                                    ui,
+                                    &raw_desc,
+                                    FontId::proportional(FONT_SM),
+                                    runway_w - 4.0,
+                                );
+                                let lbl = ui.label(
+                                    RichText::new(shown_desc).size(FONT_SM).color(desc_col),
+                                );
+                                if raw_desc.chars().count() > 36 {
+                                    lbl.on_hover_text(raw_desc);
+                                }
+                            });
+                        },
+                    );
+
+                    // Right Fixed 144px Action Slot (flush right, vertically centered)
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(action_slot_w, 82.0),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            ui.set_min_width(action_slot_w);
+                            if draw_hero_action_button(ui, self.state, has_nodes, p).clicked() {
+                                toggle_clicked = true;
+                            }
+                        },
+                    );
+                });
+            },
+        );
+
+        if jump_to_nodes {
+            self.active_tab = NavTab::Nodes;
+            self.import_panel_open = true;
+        }
+        if toggle_clicked {
+            if !has_nodes && self.state == ConnState::Disconnected {
+                self.active_tab = NavTab::Nodes;
+                self.import_panel_open = true;
+                self.show_toast("请先导入节点链接或新建节点");
+            } else {
+                match self.state {
+                    ConnState::Disconnected => self.start_connect(),
+                    ConnState::Connecting | ConnState::Connected => self.stop_connect(),
+                }
+            }
+        }
+    }
+
+    fn plain_takeover_summary(&self) -> String {
+        let routing = match self.cfg.route_mode {
+            RouteMode::Rule => "大陆网站直连，海外与游戏流量走加速隧道",
+            RouteMode::Global => "全部连接均通过加密隧道转发",
+            RouteMode::Direct => "全部流量直连本地物理网卡（用于延迟对比）",
+        };
+        match (self.state, self.cfg.proxy_mode) {
+            (ConnState::Connected, ProxyMode::Tun) => {
+                format!("已接管全局虚拟网卡 (Wintun) · {routing}")
+            }
+            (ConnState::Connected, ProxyMode::SystemProxy) => {
+                format!("已接管 Windows 系统代理 · {routing}")
+            }
+            (ConnState::Connected, ProxyMode::Manual) => {
+                format!("仅监听本地混合端口（未修改系统设置） · {routing}")
+            }
+            (ConnState::Connecting, _) => "正在与目标节点协商 1-RTT QUIC 双通道加密连接…".to_string(),
+            (ConnState::Disconnected, ProxyMode::Tun) => {
+                format!("开启后将接管「全局虚拟网卡 (Wintun)」 · {routing}")
+            }
+            (ConnState::Disconnected, ProxyMode::SystemProxy) => {
+                format!("开启后将启用「Windows 系统代理」 · {routing}")
+            }
+            (ConnState::Disconnected, ProxyMode::Manual) => {
+                format!("开启后仅监听本地端口 {} · {routing}", self.cfg.listen_addr)
+            }
+        }
+    }
+
+    fn render_telemetry_bento(
+        &mut self,
+        ui: &mut egui::Ui,
+        card_w: f32,
+        card_h: f32,
+        p: ThemePalette,
+    ) {
+        let lq = self.stats.link_quality();
         let tcp = self.stats.active_tcp.load(Ordering::Relaxed);
         let udp = self.stats.active_udp.load(Ordering::Relaxed);
         let tx = self.stats.tx_bytes.load(Ordering::Relaxed);
         let rx = self.stats.rx_bytes.load(Ordering::Relaxed);
-        let has_nodes = !self.cfg.nodes.is_empty();
+        let is_live = self.state == ConnState::Connected;
 
-        // 1. Primary Connection & 4-Column Telemetry Card
-        card_frame(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.add_space(4.0);
+        bento_card_exact(
+            ui,
+            Vec2::new(card_w, card_h),
+            Margin::same(16),
+            p.border_subtle,
+            p,
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
 
-            ui.vertical_centered(|ui| {
-                if draw_hero_power_button(ui, self.state, self.reconnect_status(), has_nodes, p)
-                    .clicked()
-                {
-                    if !has_nodes {
-                        self.active_tab = NavTab::Nodes;
-                        self.import_panel_open = true;
-                        self.show_toast("请先导入节点链接或新建节点");
+                // 1. Clean 2-Line 4-Column Tabular Metric Strip (matches v03_cockpit_preview.html!)
+                let strip_w = ui.available_width();
+                let (strip_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(strip_w, 42.0), Sense::hover());
+                let col_w = strip_w / 4.0;
+
+                let (rtt_val, rtt_col) = if is_live && lq.rtt_ms > 0 {
+                    let c = if lq.rtt_ms < 80 {
+                        p.success_text
+                    } else if lq.rtt_ms < 160 {
+                        p.warn_text
                     } else {
-                        match self.state {
-                            ConnState::Disconnected => self.start_connect(),
-                            ConnState::Connecting | ConnState::Connected => self.stop_connect(),
-                        }
+                        p.danger_text
+                    };
+                    (format!("{} ms", lq.rtt_ms), c)
+                } else {
+                    ("--".to_string(), p.text_muted)
+                };
+
+                let (jit_val, jit_col) = if is_live && lq.rtt_ms > 0 {
+                    let j = lq.jitter_ms();
+                    let c = if j < 5.0 {
+                        p.text_primary
+                    } else if j < 15.0 {
+                        p.warn_text
+                    } else {
+                        p.danger_text
+                    };
+                    (format!("±{j:.1} ms"), c)
+                } else {
+                    ("--".to_string(), p.text_muted)
+                };
+
+                let (loss_val, loss_col) = if is_live {
+                    let pct = lq.loss_percent();
+                    if lq.dup_active {
+                        (format!("{pct:.1}% 双发"), p.warn_text)
+                    } else if pct >= 1.0 {
+                        (format!("{pct:.1}%"), p.warn_text)
+                    } else {
+                        (format!("{pct:.1}%"), p.text_primary)
                     }
+                } else {
+                    ("--".to_string(), p.text_muted)
+                };
+
+                let (conn_val, conn_col) = if is_live {
+                    (format!("{}", tcp + udp), p.text_primary)
+                } else {
+                    ("0".to_string(), p.text_muted)
+                };
+
+                let cells = [
+                    ("游戏延迟", rtt_val, rtt_col),
+                    ("网络抖动", jit_val, jit_col),
+                    ("丢包双发", loss_val, loss_col),
+                    ("活跃并发", conn_val, conn_col),
+                ];
+
+                let painter = ui.painter();
+                for (i, (title, val, val_col)) in cells.iter().enumerate() {
+                    let x0 = strip_rect.left() + col_w * (i as f32);
+                    let cell_rect = egui::Rect::from_min_size(
+                        Pos2::new(x0, strip_rect.top()),
+                        Vec2::new(col_w, strip_rect.height()),
+                    );
+                    if i > 0 {
+                        painter.line_segment(
+                            [
+                                Pos2::new(x0, strip_rect.top() + 2.0),
+                                Pos2::new(x0, strip_rect.bottom() - 2.0),
+                            ],
+                            Stroke::new(1.0_f32, p.border_subtle),
+                        );
+                    }
+                    let pad_x = if i == 0 { 0.0 } else { 10.0 };
+                    let max_cell_w = (col_w - pad_x - 4.0).max(32.0);
+                    painter.text(
+                        Pos2::new(cell_rect.left() + pad_x, cell_rect.top() + 7.5),
+                        egui::Align2::LEFT_CENTER,
+                        *title,
+                        FontId::proportional(11.5),
+                        p.text_muted,
+                    );
+                    let val_font = font_mono_bold(17.0);
+                    let shown_val = elide_text(ui, val, val_font.clone(), max_cell_w);
+                    painter.text(
+                        Pos2::new(cell_rect.left() + pad_x, cell_rect.bottom() - 10.0),
+                        egui::Align2::LEFT_CENTER,
+                        shown_val,
+                        val_font,
+                        *val_col,
+                    );
                 }
 
-                ui.add_space(12.0);
+                hairline_divider(ui, p);
 
-                // Node Picker Pill (custom Popover menu)
-                let mut pill_rect = egui::Rect::NOTHING;
-                let mut trigger_clicked = false;
-                ui.horizontal(|ui| {
-                    let pill_w = 332.0;
-                    let pad = ((ui.available_width() - pill_w) * 0.5).max(0.0);
-                    ui.add_space(pad);
+                // 2. Sparkline Header (26px locked height)
+                aligned_row(ui, 26.0, |ui| {
+                    if let Some(cm) = segmented_control(
+                        ui,
+                        "bento_chart_seg",
+                        self.chart_mode,
+                        &[
+                            (ChartMode::Traffic, "实时吞吐", None),
+                            (ChartMode::Rtt, "延迟曲线", None),
+                        ],
+                        Vec2::new(138.0, 25.0),
+                        11.5,
+                        p,
+                    ) {
+                        self.chart_mode = cm;
+                    }
 
-                    let pill_stroke = if self.node_picker_open {
-                        p.accent
-                    } else {
-                        p.border_strong
-                    };
-                    let frame_resp = Frame::new()
-                        .fill(p.bg_card_alt)
-                        .stroke(Stroke::new(1.0_f32, pill_stroke))
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(Margin::symmetric(8, 3))
-                        .show(ui, |ui| {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(pill_w - 16.0, 28.0),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-
-                                    let active_name = self
-                                        .cfg
-                                        .active_node()
-                                        .map(|n| n.name.clone())
-                                        .unwrap_or_else(|| "尚未添加节点 · 点击配置".to_string());
-
-                                    let can_switch = self.state == ConnState::Disconnected;
-                                    let has_active = self.cfg.active_node().is_some();
-                                    let trigger_w = if has_active {
-                                        pill_w - 58.0
-                                    } else {
-                                        pill_w - 16.0
-                                    };
-                                    let (t_rect, t_resp) = ui.allocate_exact_size(
-                                        Vec2::new(trigger_w, 28.0),
-                                        if can_switch {
-                                            Sense::click()
-                                        } else {
-                                            Sense::hover()
-                                        },
-                                    );
-                                    if can_switch && (t_resp.hovered() || self.node_picker_open) {
-                                        ui.painter().rect_filled(
-                                            t_rect,
-                                            CornerRadius::same(7),
-                                            p.bg_nav_hover,
-                                        );
-                                    }
-
-                                    let dot_col = match self.state {
-                                        ConnState::Connected => p.success_text,
-                                        ConnState::Connecting => p.accent,
-                                        ConnState::Disconnected => {
-                                            if has_active {
-                                                p.text_muted
-                                            } else {
-                                                p.accent
-                                            }
-                                        }
-                                    };
-                                    ui.painter().circle_filled(
-                                        Pos2::new(t_rect.left() + 10.0, t_rect.center().y),
-                                        3.4,
-                                        dot_col,
-                                    );
-
-                                    let chevron_reserve =
-                                        if can_switch && has_active { 24.0 } else { 8.0 };
-                                    let max_lbl_w =
-                                        (t_rect.width() - 22.0 - chevron_reserve).max(40.0);
-                                    let shown_lbl = elide_text(
-                                        ui,
-                                        &active_name,
-                                        FontId::proportional(FONT_BODY),
-                                        max_lbl_w,
-                                    );
-                                    let fg = if !has_active {
-                                        p.accent_text
-                                    } else if can_switch {
-                                        p.text_primary
-                                    } else {
-                                        p.text_secondary
-                                    };
-                                    let galley = ui.fonts(|f| {
-                                        f.layout_no_wrap(
-                                            shown_lbl,
-                                            FontId::proportional(FONT_BODY),
-                                            fg,
-                                        )
-                                    });
-                                    ui.painter().galley(
-                                        Pos2::new(
-                                            t_rect.left() + 22.0,
-                                            t_rect.center().y - galley.size().y * 0.5,
-                                        ),
-                                        galley,
-                                        fg,
-                                    );
-
-                                    if can_switch && has_active {
-                                        icons::draw_chevron(
-                                            ui.painter(),
-                                            Pos2::new(t_rect.right() - 12.0, t_rect.center().y),
-                                            self.node_picker_open,
-                                            if self.node_picker_open {
-                                                p.accent
-                                            } else {
-                                                p.text_muted
-                                            },
-                                        );
-                                    }
-
-                                    if can_switch && t_resp.clicked() {
-                                        if has_active {
-                                            trigger_clicked = true;
-                                        } else {
-                                            self.active_tab = NavTab::Nodes;
-                                            self.import_panel_open = true;
-                                        }
-                                    }
-
-                                    if let Some(node) = self.cfg.active_node().cloned() {
-                                        let (div_r, _) = ui.allocate_exact_size(
-                                            Vec2::new(1.0, 16.0),
-                                            Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            div_r,
-                                            CornerRadius::ZERO,
-                                            p.border_subtle,
-                                        );
-
-                                        let (s_rect, s_resp) = ui.allocate_exact_size(
-                                            Vec2::new(26.0, 26.0),
-                                            Sense::click(),
-                                        );
-                                        if s_resp.hovered() {
-                                            ui.painter().rect_filled(
-                                                s_rect,
-                                                CornerRadius::same(7),
-                                                p.bg_nav_active,
-                                            );
-                                        }
-                                        icons::draw_share_icon(
-                                            ui.painter(),
-                                            s_rect.center(),
-                                            if s_resp.hovered() {
-                                                p.accent
-                                            } else {
-                                                p.text_secondary
-                                            },
-                                        );
-                                        if s_resp.on_hover_text("复制分享链接").clicked() {
-                                            ui.ctx().copy_text(node.to_share_uri());
-                                            self.show_toast(format!(
-                                                "已复制「{}」的分享链接",
-                                                node.name
-                                            ));
-                                        }
-                                    }
-                                },
-                            );
-                        })
-                        .response;
-                    pill_rect = frame_resp.rect;
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        match self.chart_mode {
+                            ChartMode::Traffic => {
+                                let (rx_txt, tx_txt) = if is_live {
+                                    (
+                                        format!("↓ {}", format_speed(self.telemetry.rx_speed_bps)),
+                                        format!("↑ {}", format_speed(self.telemetry.tx_speed_bps)),
+                                    )
+                                } else {
+                                    ("↓ 0 B/s".to_string(), "↑ 0 B/s".to_string())
+                                };
+                                ui.label(
+                                    RichText::new(tx_txt)
+                                        .size(11.5)
+                                        .monospace()
+                                        .color(p.text_muted),
+                                )
+                                .on_hover_text(format!("累计上传 {}", format_bytes(tx)));
+                                ui.label(
+                                    RichText::new(rx_txt)
+                                        .size(11.5)
+                                        .monospace()
+                                        .color(p.text_secondary),
+                                )
+                                .on_hover_text(format!("累计下载 {}", format_bytes(rx)));
+                            }
+                            ChartMode::Rtt => {
+                                let summary = if is_live
+                                    && let Some(&last) = self.telemetry.rtt_history.back()
+                                {
+                                    let avg: u64 = self.telemetry.rtt_history.iter().sum::<u64>()
+                                        / self.telemetry.rtt_history.len().max(1) as u64;
+                                    format!("当前 {last} ms · 均值 {avg} ms")
+                                } else {
+                                    "1s 实时采样".to_string()
+                                };
+                                ui.label(
+                                    RichText::new(summary)
+                                        .size(11.5)
+                                        .monospace()
+                                        .color(p.text_muted),
+                                );
+                            }
+                        }
+                    });
                 });
 
-                if trigger_clicked {
-                    self.node_picker_open = !self.node_picker_open;
-                }
-                if self.state != ConnState::Disconnected || !has_nodes {
-                    self.node_picker_open = false;
-                }
-
-                // Popover menu anchored cleanly below the node pill
-                if self.node_picker_open {
-                    let popup_pos = Pos2::new(pill_rect.left(), pill_rect.bottom() + 6.0);
-                    let popup_w = pill_rect.width().max(332.0);
-                    let nodes_snapshot = self.cfg.nodes.clone();
-                    let mut picked_id: Option<String> = None;
-
-                    let area_resp = egui::Area::new(egui::Id::new("node_picker_popover"))
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(popup_pos)
-                        .show(ui.ctx(), |ui| {
-                            Frame::new()
-                                .fill(p.bg_card)
-                                .stroke(Stroke::new(1.0_f32, p.border_subtle))
-                                .corner_radius(CornerRadius::same(12))
-                                .inner_margin(Margin::same(6))
-                                .shadow(egui::Shadow {
-                                    offset: [0, 8],
-                                    blur: 20,
-                                    spread: 0,
-                                    color: Color32::from_black_alpha(if p.is_dark {
-                                        85
-                                    } else {
-                                        24
-                                    }),
-                                })
-                                .show(ui, |ui| {
-                                    ui.set_width(popup_w - 12.0);
-                                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 3.0);
-
-                                    ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
-                                        for node in &nodes_snapshot {
-                                            let selected = self.cfg.active_node_id == node.id;
-                                            let (r, resp) = ui.allocate_exact_size(
-                                                Vec2::new(ui.available_width(), 40.0),
-                                                Sense::click(),
-                                            );
-                                            let bg = if selected {
-                                                p.accent_soft
-                                            } else if resp.hovered() {
-                                                p.bg_nav_hover
-                                            } else {
-                                                Color32::TRANSPARENT
-                                            };
-                                            let painter = ui.painter();
-                                            painter.rect_filled(r, CornerRadius::same(8), bg);
-
-                                            let mut right_x = r.right() - 12.0;
-                                            if selected {
-                                                icons::draw_check_icon(
-                                                    painter,
-                                                    Pos2::new(right_x, r.center().y),
-                                                    p.accent,
-                                                );
-                                                right_x -= 18.0;
-                                            }
-                                            if let Some(ProbeState::Ok(ms)) =
-                                                self.probes.get(&node.id)
-                                            {
-                                                let c = if *ms < 100 {
-                                                    p.success_text
-                                                } else if *ms < 200 {
-                                                    p.warn_text
-                                                } else {
-                                                    p.danger_text
-                                                };
-                                                let rtt_galley = ui.fonts(|f| {
-                                                    f.layout_no_wrap(
-                                                        format!("{ms} ms"),
-                                                        FontId::monospace(FONT_XS),
-                                                        c,
-                                                    )
-                                                });
-                                                let rw = rtt_galley.size().x;
-                                                painter.galley(
-                                                    Pos2::new(
-                                                        right_x - rw,
-                                                        r.center().y - rtt_galley.size().y * 0.5,
-                                                    ),
-                                                    rtt_galley,
-                                                    c,
-                                                );
-                                                right_x -= rw + 10.0;
-                                            }
-
-                                            let max_w = (right_x - r.left() - 14.0).max(60.0);
-                                            let title_str = elide_text(
-                                                ui,
-                                                &node.name,
-                                                FontId::proportional(FONT_BODY),
-                                                max_w,
-                                            );
-                                            painter.text(
-                                                Pos2::new(r.left() + 10.0, r.top() + 13.0),
-                                                egui::Align2::LEFT_CENTER,
-                                                title_str,
-                                                FontId::proportional(FONT_BODY),
-                                                if selected {
-                                                    p.accent_text
-                                                } else {
-                                                    p.text_primary
-                                                },
-                                            );
-
-                                            let sub_str = elide_text(
-                                                ui,
-                                                &node.server,
-                                                FontId::monospace(FONT_XS),
-                                                max_w,
-                                            );
-                                            painter.text(
-                                                Pos2::new(r.left() + 10.0, r.bottom() - 10.5),
-                                                egui::Align2::LEFT_CENTER,
-                                                sub_str,
-                                                FontId::monospace(FONT_XS),
-                                                p.text_muted,
-                                            );
-
-                                            if resp.clicked() {
-                                                picked_id = Some(node.id.clone());
-                                            }
-                                        }
-                                    });
-                                });
-                        })
-                        .response;
-
-                    if let Some(id) = picked_id {
-                        self.cfg.active_node_id = id;
-                        save_config(&self.cfg);
-                        self.node_picker_open = false;
-                    } else if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
-                        self.node_picker_open = false;
-                    } else if !trigger_clicked
-                        && ui.ctx().input(|i| i.pointer.any_pressed())
-                        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-                        && !area_resp.rect.contains(pos)
-                        && !pill_rect.contains(pos)
-                    {
-                        self.node_picker_open = false;
+                // 3. Live Canvas filling exact remaining height
+                match self.chart_mode {
+                    ChartMode::Traffic => {
+                        draw_traffic_sparkline(ui, &self.telemetry.speed_history, is_live, p)
+                    }
+                    ChartMode::Rtt => {
+                        draw_rtt_sparkline(ui, &self.telemetry.rtt_history, is_live, p)
                     }
                 }
-            });
+            },
+        );
+    }
 
-            ui.add_space(14.0);
-            hairline_divider(ui, p);
-            ui.add_space(12.0);
-
-            // 4-column telemetry strip with 1px hairline vertical dividers
-            let is_live = self.state == ConnState::Connected;
-            let metric_col = if is_live {
-                p.text_primary
-            } else {
-                p.text_muted
-            };
-            let strip_rect = ui
-                .scope(|ui| {
-                    ui.columns(4, |cols| {
-                        cols[0].vertical_centered(|ui| {
-                            let (val, col) = if is_live {
-                                let c = if rtt < 100 {
-                                    p.success_text
-                                } else if rtt < 200 {
-                                    p.warn_text
-                                } else {
-                                    p.danger_text
-                                };
-                                (format!("{rtt} ms"), c)
-                            } else {
-                                ("--".to_string(), p.text_muted)
-                            };
-                            ui.label(
-                                RichText::new(val)
-                                    .size(FONT_TITLE)
-                                    .strong()
-                                    .monospace()
-                                    .color(col),
-                            );
-                            ui.label(RichText::new("QUIC 延迟").size(FONT_XS).color(p.text_muted));
-                        });
-
-                        cols[1].vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new(if is_live {
-                                    format_speed(self.rx_speed_bps)
-                                } else {
-                                    "--".to_string()
-                                })
-                                .size(FONT_TITLE)
-                                .strong()
-                                .monospace()
-                                .color(metric_col),
-                            );
-                            ui.label(
-                                RichText::new(format!("下载 · {}", format_bytes(rx)))
-                                    .size(FONT_XS)
-                                    .color(p.text_muted),
-                            );
-                        });
-
-                        cols[2].vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new(if is_live {
-                                    format_speed(self.tx_speed_bps)
-                                } else {
-                                    "--".to_string()
-                                })
-                                .size(FONT_TITLE)
-                                .strong()
-                                .monospace()
-                                .color(metric_col),
-                            );
-                            ui.label(
-                                RichText::new(format!("上传 · {}", format_bytes(tx)))
-                                    .size(FONT_XS)
-                                    .color(p.text_muted),
-                            );
-                        });
-
-                        cols[3].vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new(if is_live {
-                                    format!("{}", tcp + udp)
-                                } else {
-                                    "0".to_string()
-                                })
-                                .size(FONT_TITLE)
-                                .strong()
-                                .monospace()
-                                .color(metric_col),
-                            );
-                            ui.label(
-                                RichText::new(format!("TCP {tcp} / UDP {udp}"))
-                                    .size(FONT_XS)
-                                    .color(p.text_muted),
-                            );
-                        });
-                    });
-                })
-                .response
-                .rect;
-
-            let col_w = strip_rect.width() / 4.0;
-            for i in 1..4 {
-                let x = strip_rect.left() + col_w * (i as f32);
-                ui.painter().line_segment(
-                    [
-                        Pos2::new(x, strip_rect.center().y - 12.0),
-                        Pos2::new(x, strip_rect.center().y + 12.0),
-                    ],
-                    Stroke::new(1.0_f32, p.border_subtle),
-                );
-            }
-
-            if let Some(err) = &self.last_error {
-                ui.add_space(10.0);
-                Frame::new()
-                    .fill(p.danger_soft)
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(RichText::new(err).size(FONT_SM).color(p.danger_text));
-                    });
-            }
-
-            ui.add_space(2.0);
-        });
-
-        ui.add_space(4.0);
-
-        // 2. Side-by-Side 2-Column Mode Control Cards (hover tooltips replace bloated subtitle lines)
+    fn render_control_stack(
+        &mut self,
+        ui: &mut egui::Ui,
+        col_w: f32,
+        col_h: f32,
+        gap: f32,
+        p: ThemePalette,
+    ) {
+        let top_card_h = 94.0_f32;
         let mut picked_proxy: Option<ProxyMode> = None;
         let mut picked_route: Option<RouteMode> = None;
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-            ui.columns(2, |cols| {
-                card_frame(p)
-                    .inner_margin(Margin::symmetric(14, 7))
-                    .show(&mut cols[0], |ui| {
-                        aligned_row(ui, 30.0, |ui| {
-                            ui.label(
-                                RichText::new("代理模式")
-                                    .size(FONT_SM)
-                                    .color(p.text_secondary),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let w = ui.available_width().clamp(150.0, 268.0);
-                                picked_proxy = segmented_control(
-                                    ui,
-                                    "dash_proxy_seg",
-                                    self.cfg.proxy_mode,
-                                    &[
-                                        (
-                                            ProxyMode::Tun,
-                                            "TUN 全局",
-                                            Some("虚拟网卡接管全局 TCP/UDP，适合游戏加速"),
-                                        ),
-                                        (
-                                            ProxyMode::SystemProxy,
-                                            "系统代理",
-                                            Some("自动设置系统代理，适合浏览器与桌面软件"),
-                                        ),
-                                        (
-                                            ProxyMode::Manual,
-                                            "仅端口",
-                                            Some("仅监听本地混合端口，不修改系统代理"),
-                                        ),
-                                    ],
-                                    Vec2::new(w, 30.0),
-                                    FONT_SM,
-                                    p,
-                                );
-                            });
-                        });
-                    });
 
-                card_frame(p)
-                    .inner_margin(Margin::symmetric(14, 7))
-                    .show(&mut cols[1], |ui| {
-                        aligned_row(ui, 30.0, |ui| {
-                            ui.label(
-                                RichText::new("分流策略")
-                                    .size(FONT_SM)
-                                    .color(p.text_secondary),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let w = ui.available_width().clamp(140.0, 244.0);
-                                picked_route = segmented_control(
-                                    ui,
-                                    "dash_route_seg",
-                                    self.cfg.route_mode,
-                                    &[
-                                        (
-                                            RouteMode::Rule,
-                                            "规则",
-                                            Some("大陆网站与 IP 直连，海外与游戏走加速隧道"),
-                                        ),
-                                        (
-                                            RouteMode::Global,
-                                            "全局",
-                                            Some("全部连接均通过加速隧道转发"),
-                                        ),
-                                        (
-                                            RouteMode::Direct,
-                                            "直连",
-                                            Some("全部连接直接走本地网络（用于延迟对比）"),
-                                        ),
-                                    ],
-                                    Vec2::new(w, 30.0),
-                                    FONT_SM,
-                                    p,
-                                );
-                            });
-                        });
-                    });
-            });
-        });
+        // Top Card (94px exact): Fixed-Token Mode Controls (`flex-1` full-width segmented wells)
+        bento_card_exact(
+            ui,
+            Vec2::new(col_w, top_card_h),
+            Margin::symmetric(14, 13),
+            p.border_subtle,
+            p,
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+
+                aligned_row(ui, 28.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.label(
+                        RichText::new("接管")
+                            .font(font_bold(FONT_SM))
+                            .color(p.text_secondary),
+                    );
+                    let seg_w = ui.available_width().max(140.0);
+                    picked_proxy = segmented_control(
+                        ui,
+                        "bento_proxy_seg",
+                        self.cfg.proxy_mode,
+                        &[
+                            (
+                                ProxyMode::Tun,
+                                "游戏 TUN",
+                                Some("Wintun 虚拟网卡接管全局 TCP/UDP，游戏加速首选"),
+                            ),
+                            (
+                                ProxyMode::SystemProxy,
+                                "系统代理",
+                                Some("自动配置 Windows 系统代理，适合网页与桌面应用"),
+                            ),
+                            (
+                                ProxyMode::Manual,
+                                "仅端口",
+                                Some("仅监听本地混合端口，不改动系统网络配置"),
+                            ),
+                        ],
+                        Vec2::new(seg_w, 28.0),
+                        FONT_SM,
+                        p,
+                    );
+                });
+
+                aligned_row(ui, 28.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.label(
+                        RichText::new("分流")
+                            .font(font_bold(FONT_SM))
+                            .color(p.text_secondary),
+                    );
+                    let seg_w = ui.available_width().max(140.0);
+                    picked_route = segmented_control(
+                        ui,
+                        "bento_route_seg",
+                        self.cfg.route_mode,
+                        &[
+                            (
+                                RouteMode::Rule,
+                                "大陆直连",
+                                Some("大陆网站与 IP 直连，海外与游戏走加速隧道"),
+                            ),
+                            (
+                                RouteMode::Global,
+                                "全局代理",
+                                Some("所有流量全部经加速隧道转发"),
+                            ),
+                            (
+                                RouteMode::Direct,
+                                "纯直连",
+                                Some("全部流量直接走本地网卡，方便对比延迟"),
+                            ),
+                        ],
+                        Vec2::new(seg_w, 28.0),
+                        FONT_SM,
+                        p,
+                    );
+                });
+            },
+        );
+
         if let Some(m) = picked_proxy {
             self.switch_proxy_mode(m);
         }
@@ -596,98 +563,265 @@ impl GameAccelApp {
             self.switch_route_mode(r);
         }
 
-        ui.add_space(4.0);
+        // Bottom Card: Borderless Quick Node Switcher (`快捷换线` + `全部线路 ›`, matches HTML!)
+        let bot_card_h = (col_h - top_card_h - gap).max(120.0);
+        let mut picked_node_id: Option<String> = None;
+        let mut trigger_probe_all = false;
+        let mut open_nodes_tab = false;
+        let mut open_import = false;
 
-        // 3. Unified Realtime Monitor Card (Integrated header + sparkline canvas)
-        card_frame(p)
-            .inner_margin(Margin::symmetric(16, 12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                aligned_row(ui, 26.0, |ui| {
-                    if let Some(cm) = segmented_control(
-                        ui,
-                        "dash_chart_seg",
-                        self.chart_mode,
-                        &[
-                            (ChartMode::Traffic, "实时流量", None),
-                            (ChartMode::Rtt, "延迟曲线", None),
-                        ],
-                        Vec2::new(148.0, 26.0),
-                        FONT_XS,
-                        p,
-                    ) {
-                        self.chart_mode = cm;
-                    }
+        bento_card_exact(
+            ui,
+            Vec2::new(col_w, bot_card_h),
+            Margin::symmetric(14, 13),
+            p.border_subtle,
+            p,
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                let node_count = self.cfg.nodes.len();
+                let any_probing = self
+                    .probes
+                    .values()
+                    .any(|v| matches!(v, ProbeState::Probing));
 
+                aligned_row(ui, 22.0, |ui| {
+                    ui.label(
+                        RichText::new("快捷换线")
+                            .font(font_bold(FONT_SM))
+                            .color(p.text_secondary),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        match self.chart_mode {
-                            ChartMode::Traffic => {
-                                let (rx_txt, tx_txt) = if self.state == ConnState::Connected {
-                                    (
-                                        format!("下载 {}", format_speed(self.rx_speed_bps)),
-                                        format!("上传 {}", format_speed(self.tx_speed_bps)),
-                                    )
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        let all_resp = ui.add(
+                            egui::Label::new(
+                                RichText::new("全部线路 ›")
+                                    .font(font_bold(11.5))
+                                    .color(p.accent_text),
+                            )
+                            .sense(Sense::click()),
+                        );
+                        if all_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if all_resp.clicked() {
+                            open_nodes_tab = true;
+                        }
+
+                        if node_count > 0 {
+                            let probe_lbl = if any_probing { "测速中…" } else { "测速" };
+                            let pr = ui.add(
+                                egui::Label::new(
+                                    RichText::new(probe_lbl).size(11.5).color(p.text_muted),
+                                )
+                                .sense(if any_probing {
+                                    Sense::hover()
                                 } else {
-                                    ("下载".to_string(), "上传".to_string())
-                                };
-                                ui.label(
-                                    RichText::new(tx_txt)
-                                        .size(FONT_XS)
-                                        .monospace()
-                                        .color(p.text_muted),
-                                );
-                                let (r_tx, _) =
-                                    ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                                ui.painter()
-                                    .circle_filled(r_tx.center(), 3.2, p.success_text);
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(rx_txt)
-                                        .size(FONT_XS)
-                                        .monospace()
-                                        .color(p.text_muted),
-                                );
-                                let (r_rx, _) =
-                                    ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                                ui.painter().circle_filled(r_rx.center(), 3.2, p.accent);
+                                    Sense::click()
+                                }),
+                            );
+                            if !any_probing && pr.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
-                            ChartMode::Rtt => {
-                                let summary = if self.state == ConnState::Connected
-                                    && let Some(&last) = self.rtt_history.back()
-                                {
-                                    let avg: u64 = self.rtt_history.iter().sum::<u64>()
-                                        / self.rtt_history.len().max(1) as u64;
-                                    format!("当前 {last} ms · 均值 {avg} ms")
-                                } else {
-                                    "QUIC 延迟".to_string()
-                                };
-                                ui.label(
-                                    RichText::new(summary)
-                                        .size(FONT_XS)
-                                        .monospace()
-                                        .color(p.text_muted),
-                                );
+                            if !any_probing && pr.clicked() {
+                                trigger_probe_all = true;
                             }
                         }
                     });
                 });
 
-                ui.add_space(4.0);
-                match self.chart_mode {
-                    ChartMode::Traffic => draw_traffic_sparkline(
-                        ui,
-                        &self.speed_history,
-                        self.state == ConnState::Connected,
-                        p,
-                    ),
-                    ChartMode::Rtt => draw_rtt_sparkline(
-                        ui,
-                        &self.rtt_history,
-                        self.state == ConnState::Connected,
-                        p,
-                    ),
+                let list_avail_h = ui.available_height().max(64.0);
+                if self.cfg.nodes.is_empty() {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), list_avail_h),
+                        Layout::top_down(Align::Center),
+                        |ui| {
+                            ui.add_space((list_avail_h * 0.5 - 24.0).max(4.0));
+                            ui.label(
+                                RichText::new("尚未添加加速线路")
+                                    .size(FONT_XS)
+                                    .color(p.text_muted),
+                            );
+                            ui.add_space(6.0);
+                            if chip_btn(ui, "+ 导入或新建", p, false).clicked() {
+                                open_import = true;
+                            }
+                        },
+                    );
+                } else {
+                    let active_id = self.cfg.active_node_id.clone();
+                    let is_live = self.state == ConnState::Connected;
+                    let live_rtt = self.stats.rtt_ms.load(Ordering::Relaxed);
+
+                    ScrollArea::vertical()
+                        .id_salt("bento_quick_nodes_scroll")
+                        .max_height(list_avail_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 4.0;
+
+                            for node in &self.cfg.nodes {
+                                let is_selected = node.id == active_id;
+                                let row_w = ui.available_width();
+                                let (rect, resp) =
+                                    ui.allocate_exact_size(Vec2::new(row_w, 34.0), Sense::click());
+                                if resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                let resp =
+                                    resp.on_hover_text(format!("{}\n{}", node.name, node.server));
+
+                                // Exact match to HTML: borderless recessed `--c-well` when selected,
+                                // transparent when idle, soft `--c-hover` on pointer hover.
+                                let bg = if is_selected {
+                                    p.bg_card_alt
+                                } else if resp.hovered() {
+                                    p.bg_nav_hover
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let painter = ui.painter();
+                                if bg != Color32::TRANSPARENT {
+                                    painter.rect_filled(rect, CornerRadius::same(8), bg);
+                                }
+
+                                let dot_col = if is_selected {
+                                    if is_live { p.success_text } else { p.accent }
+                                } else {
+                                    p.border_strong
+                                };
+                                painter.circle_filled(
+                                    Pos2::new(rect.left() + 12.0, rect.center().y),
+                                    3.25,
+                                    dot_col,
+                                );
+
+                                // Strict 56px right-locked tabular RTT slot
+                                let rtt_slot_w = 56.0;
+                                let (rtt_txt, rtt_col) = if is_selected && is_live && live_rtt > 0 {
+                                    let c = if live_rtt < 80 {
+                                        p.success_text
+                                    } else if live_rtt < 160 {
+                                        p.warn_text
+                                    } else {
+                                        p.danger_text
+                                    };
+                                    (format!("{live_rtt} ms"), c)
+                                } else {
+                                    match self.probes.get(&node.id) {
+                                        Some(ProbeState::Probing) => {
+                                            ("测速…".to_string(), p.text_muted)
+                                        }
+                                        Some(ProbeState::Ok(ms)) => {
+                                            let c = if *ms < 80 {
+                                                p.success_text
+                                            } else if *ms < 160 {
+                                                p.warn_text
+                                            } else {
+                                                p.danger_text
+                                            };
+                                            (format!("{ms} ms"), c)
+                                        }
+                                        Some(ProbeState::Err(_)) => {
+                                            ("超时".to_string(), p.danger_text)
+                                        }
+                                        None => ("--".to_string(), p.text_muted),
+                                    }
+                                };
+
+                                let rtt_galley = ui.fonts(|f| {
+                                    f.layout_no_wrap(rtt_txt, FontId::monospace(11.5), rtt_col)
+                                });
+                                painter.galley(
+                                    Pos2::new(
+                                        rect.right() - 10.0 - rtt_galley.size().x,
+                                        rect.center().y - rtt_galley.size().y * 0.5,
+                                    ),
+                                    rtt_galley,
+                                    rtt_col,
+                                );
+
+                                let name_font = if is_selected {
+                                    font_bold(12.5)
+                                } else {
+                                    FontId::proportional(12.5)
+                                };
+                                let max_name_w = (rect.width() - 24.0 - rtt_slot_w - 8.0).max(40.0);
+                                let shown_name =
+                                    elide_text(ui, &node.name, name_font.clone(), max_name_w);
+                                let name_galley = ui.fonts(|f| {
+                                    f.layout_no_wrap(shown_name, name_font, p.text_primary)
+                                });
+                                painter.galley(
+                                    Pos2::new(
+                                        rect.left() + 24.0,
+                                        rect.center().y - name_galley.size().y * 0.5,
+                                    ),
+                                    name_galley,
+                                    p.text_primary,
+                                );
+
+                                if resp.clicked() && !is_selected {
+                                    picked_node_id = Some(node.id.clone());
+                                }
+                            }
+                        });
                 }
-            });
+            },
+        );
+
+        if let Some(id) = picked_node_id {
+            self.switch_active_node(id);
+        }
+        if trigger_probe_all {
+            self.probe_all_nodes();
+        }
+        if open_nodes_tab {
+            self.active_tab = NavTab::Nodes;
+        }
+        if open_import {
+            self.active_tab = NavTab::Nodes;
+            self.import_panel_open = true;
+        }
     }
+}
+
+fn draw_state_capsule(
+    ui: &mut egui::Ui,
+    text: &str,
+    dot_col: Color32,
+    bg: Color32,
+    fg: Color32,
+) {
+    let font = font_bold(11.5);
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font, fg));
+    let w = galley.size().x + 25.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 22.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(11), bg);
+    painter.circle_filled(Pos2::new(rect.left() + 10.0, rect.center().y), 3.25, dot_col);
+    painter.galley(
+        Pos2::new(rect.left() + 17.5, rect.center().y - galley.size().y * 0.5),
+        galley,
+        fg,
+    );
+}
+
+fn draw_mono_tag(ui: &mut egui::Ui, text: &str, p: ThemePalette) {
+    let font = FontId::monospace(FONT_XS);
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font, p.tag_text));
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x + 12.0, 20.0),
+        Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(4), p.tag_bg);
+    painter.galley(
+        Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        p.tag_text,
+    );
 }

@@ -6,7 +6,9 @@ pub(crate) mod quic;
 pub mod relay;
 pub mod rules;
 pub mod socks5;
+pub mod telemetry;
 pub mod tun_mode;
+pub mod tunnel;
 
 pub use error::{ConnectError, classify};
 
@@ -16,6 +18,8 @@ use crate::quic::{bind_tuned_udp_socket, build_client_config, unspecified_bind_f
 use crate::relay::{ClientStats, UdpDispatchMap};
 use crate::rules::{RouteModeCell, Router, RuleData};
 use crate::socks5::run_mixed_proxy_server;
+use crate::telemetry::JitterEstimator;
+use crate::tunnel::TunnelSession;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use protocol::auth::{AUTH_OK, write_auth_request};
@@ -226,15 +230,20 @@ pub async fn run_client_with_shutdown(
         return Ok(());
     }
 
-    stats.connected.store(true, Ordering::Relaxed);
+    let initial_rtt = udp_conn.rtt().as_millis() as u64;
     stats
-        .rtt_ms
-        .store(udp_conn.rtt().as_millis() as u64, Ordering::Relaxed);
+        .connected_at_unix
+        .store(protocol::unix_now_secs(), Ordering::Relaxed);
+    stats.rtt_ms.store(initial_rtt, Ordering::Relaxed);
+    stats.jitter_tenths_ms.store(0, Ordering::Relaxed);
+    stats.loss_bps.store(0, Ordering::Relaxed);
+    stats.dup_active.store(false, Ordering::Relaxed);
+    stats.connected.store(true, Ordering::Relaxed);
     emit(format!(
         "双通道已连接并认证成功 [{}] ({}，游戏 UDP 通道初始 RTT {} ms)",
         opts.protocol.label(),
         server_addr,
-        udp_conn.rtt().as_millis()
+        initial_rtt
     ));
 
     // Watchdog: if EITHER lane dies (idle timeout / server restart / network change),
@@ -250,19 +259,34 @@ pub async fn run_client_with_shutdown(
         let _ = watchdog_tx.send(true);
     }));
 
-    // Periodic RTT updater: tracks the dedicated unbloated UDP game lane
+    // Dedicated UDP duplicate pacer: samples loss ONLY on `udp_conn`, immune to TCP BBR loss
+    let pacer = UdpDupPacer::spawn(udp_conn.clone());
+
+    // Periodic 1s Game Link Health sampler: tracks RTT, RFC 3550 jitter, loss %, and dual-send state
     let rtt_conn = udp_conn.clone();
     let rtt_stats = stats.clone();
+    let rtt_pacer = pacer.clone();
     let rtt_task = tokio::spawn(async move {
+        let mut jitter_est = JitterEstimator::default();
+        let _ = jitter_est.observe_rtt_ms(initial_rtt);
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
             if rtt_conn.close_reason().is_some() {
                 break;
             }
+            let rtt = rtt_conn.rtt().as_millis() as u64;
+            let jitter_tenths = jitter_est.observe_rtt_ms(rtt);
+            rtt_stats.rtt_ms.store(rtt, Ordering::Relaxed);
             rtt_stats
-                .rtt_ms
-                .store(rtt_conn.rtt().as_millis() as u64, Ordering::Relaxed);
+                .jitter_tenths_ms
+                .store(jitter_tenths, Ordering::Relaxed);
+            rtt_stats
+                .loss_bps
+                .store(rtt_pacer.loss_bps(), Ordering::Relaxed);
+            rtt_stats
+                .dup_active
+                .store(rtt_pacer.is_dup_active(), Ordering::Relaxed);
         }
     });
 
@@ -309,8 +333,14 @@ pub async fn run_client_with_shutdown(
         }
     });
 
-    // Dedicated UDP duplicate pacer: samples loss ONLY on `udp_conn`, immune to TCP BBR loss
-    let pacer = UdpDupPacer::spawn(udp_conn.clone());
+    let tunnel = TunnelSession::new(
+        tcp_conn.clone(),
+        udp_conn.clone(),
+        pacer,
+        udp_dispatch,
+        opts.protocol,
+        opts.game_dup,
+    );
 
     // Split-routing tables (~140k entries) are parsed once per process, off the runtime.
     // Built before TUN starts: the mixed proxy and the TUN share one router + dialer.
@@ -328,33 +358,22 @@ pub async fn run_client_with_shutdown(
     // Optional TUN virtual NIC mode (runs alongside the local mixed proxy)
     let tun_handle = if opts.enable_tun {
         let server_ip = server_addr.ip();
-        let tun_tcp_conn = tcp_conn.clone();
-        let tun_udp_conn = udp_conn.clone();
-        let tun_pacer = pacer.clone();
-        let tun_dispatch = udp_dispatch.clone();
+        let tun_tunnel = tunnel.clone();
         let tun_stats = stats.clone();
         let tun_log_tx = log_tx.clone();
         let tun_shutdown = shutdown_rx.clone();
         let tun_router = router.clone();
-        let game_dup = opts.game_dup && opts.protocol == NodeProtocol::Gacl;
-        let tun_proto = opts.protocol;
         let tun_err_tx = log_tx.clone();
         Some(tokio::spawn(async move {
             let res = tun_mode::run_tun_mode(
                 server_ip,
-                tun_tcp_conn,
-                tun_udp_conn,
-                tun_pacer,
-                tun_dispatch,
-                tun_proto,
-                game_dup,
+                tun_tunnel,
                 tun_stats,
                 tun_router,
                 tun_log_tx,
                 tun_shutdown,
             )
             .await;
-            // Report right away: this handle is only joined when the whole session ends.
             if let Err(e) = &res {
                 info!("TUN 模式异常: {e:#}");
                 if let Some(tx) = &tun_err_tx {
@@ -369,12 +388,7 @@ pub async fn run_client_with_shutdown(
 
     let res = run_mixed_proxy_server(
         opts.listen,
-        tcp_conn.clone(),
-        udp_conn.clone(),
-        pacer,
-        udp_dispatch,
-        opts.protocol,
-        opts.game_dup && opts.protocol == NodeProtocol::Gacl,
+        tunnel,
         stats.clone(),
         router,
         log_tx.clone(),

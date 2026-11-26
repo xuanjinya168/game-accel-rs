@@ -1,9 +1,8 @@
-use crate::relay::{ClientStats, open_proxy_tcp_stream, relay_direct, relay_fast_open};
+use crate::relay::{ClientStats, relay_direct};
 use crate::rules::{Route, Router};
+use crate::tunnel::TunnelSession;
 use anyhow::{Context, Result, bail};
 use protocol::frame::TargetAddr;
-use protocol::share::NodeProtocol;
-use quinn::Connection;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -13,8 +12,7 @@ use tokio::net::TcpStream;
 /// Handle HTTP / HTTPS (CONNECT) proxy requests on the mixed port.
 pub(crate) async fn handle_http_proxy_client(
     mut client: TcpStream,
-    conn: Connection,
-    protocol: NodeProtocol,
+    tunnel: Arc<TunnelSession>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
@@ -47,19 +45,15 @@ pub(crate) async fn handle_http_proxy_client(
     const BAD_GATEWAY: &[u8] =
         b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-    // `ok_reply` is written to the local client once the upstream path is ready;
-    // `upstream_preamble` is the first bytes to send upstream (rebuilt request + body).
     let (target, ok_reply, upstream_preamble, fail_reply) =
         if method.eq_ignore_ascii_case("CONNECT") {
             (
                 parse_host_port(raw_target, 443)?,
                 Some(&b"HTTP/1.1 200 Connection Established\r\n\r\n"[..]),
                 leftover.to_vec(),
-                // After 200 was sent (proxy fast-open) there is no way to report an error.
                 None,
             )
         } else {
-            // Plain HTTP proxy request: e.g. GET http://example.com/path HTTP/1.1
             let (target, path) = parse_http_url(raw_target)?;
             let mut rebuilt = String::with_capacity(header_str.len() + 32);
             rebuilt.push_str(method);
@@ -82,7 +76,6 @@ pub(crate) async fn handle_http_proxy_client(
                 rebuilt.push_str(line);
                 rebuilt.push_str("\r\n");
             }
-            // One origin per proxy connection so keep-alive browsers cannot reuse it for another host.
             rebuilt.push_str("Connection: close\r\n\r\n");
             let mut preamble = rebuilt.into_bytes();
             preamble.extend_from_slice(leftover);
@@ -98,7 +91,7 @@ pub(crate) async fn handle_http_proxy_client(
         return relay_direct(&router, client, &target, ok_reply, &upstream_preamble, fail).await;
     }
 
-    let (mut quic_send, quic_recv) = open_proxy_tcp_stream(&conn, protocol, &target).await?;
+    let (mut quic_send, quic_recv) = tunnel.open_tcp(&target).await?;
     if let Some(reply) = ok_reply {
         client.write_all(reply).await?;
     }
@@ -108,7 +101,9 @@ pub(crate) async fn handle_http_proxy_client(
             .tx_bytes
             .fetch_add(upstream_preamble.len() as u64, Ordering::Relaxed);
     }
-    relay_fast_open(client, quic_send, quic_recv, protocol, stats, fail_reply).await
+    tunnel
+        .relay_tcp(client, quic_send, quic_recv, stats, fail_reply)
+        .await
 }
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {

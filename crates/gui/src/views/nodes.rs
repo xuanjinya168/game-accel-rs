@@ -412,9 +412,8 @@ impl GameAccelApp {
             return;
         }
 
-        // Node List Cards (Whole-card click selection when disconnected; clean subtitle)
+        // Node List Cards (Whole-card 1-click selection; hot-reconnects if currently connected)
         let nodes = self.cfg.nodes.clone();
-        let can_select = self.state == ConnState::Disconnected;
         let modal_open =
             self.node_editor.is_some() || self.import_panel_open || self.sub_panel_open;
         let mut select_id: Option<String> = None;
@@ -564,7 +563,7 @@ impl GameAccelApp {
                     });
 
                 // Whole-card click to select without overlapping right-side action buttons
-                if !modal_open && can_select && !is_active && !action_interacted {
+                if !modal_open && !is_active && !action_interacted {
                     let card_rect = frame_resp.response.rect;
                     if ui.rect_contains_pointer(card_rect) {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -585,9 +584,7 @@ impl GameAccelApp {
         });
 
         if let Some(id) = select_id {
-            self.cfg.active_node_id = id;
-            save_config(&self.cfg);
-            self.show_toast("已切换当前节点");
+            self.switch_active_node(id);
         }
         if let Some(id) = delete_id {
             self.cfg.nodes.retain(|n| n.id != id);

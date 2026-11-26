@@ -552,17 +552,19 @@ impl GameAccelApp {
                                                     .strong()
                                                     .color(p.text_primary),
                                             );
-                                            match l.status.as_str() {
-                                                "active" => {
+                                            match l.status {
+                                                protocol::domain::LinkStatus::Active => {
                                                     pill(ui, "启用中", p.success_soft, p.success_text)
                                                 }
-                                                "disabled" => {
+                                                protocol::domain::LinkStatus::Disabled => {
                                                     pill(ui, "已禁用", p.bg_card, p.text_muted)
                                                 }
-                                                "expired" => {
+                                                protocol::domain::LinkStatus::Expired => {
                                                     pill(ui, "已过期", p.warn_soft, p.warn_text)
                                                 }
-                                                _ => pill(ui, "超额", p.danger_soft, p.danger_text),
+                                                protocol::domain::LinkStatus::OverLimit => {
+                                                    pill(ui, "流量超额", p.danger_soft, p.danger_text)
+                                                }
                                             }
                                             if l.online_conns > 0 {
                                                 pill(

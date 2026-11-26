@@ -108,7 +108,7 @@ impl GameAccelApp {
 
                             let dot_col = match self.state {
                                 ConnState::Connected => p.success_text,
-                                ConnState::Connecting => p.accent,
+                                ConnState::Connecting => p.warn_text,
                                 ConnState::Disconnected => p.text_muted,
                             };
                             let (dot_r, _) =
@@ -157,9 +157,9 @@ impl GameAccelApp {
                                     let (status_txt, status_col) = match (self.state, reconnect) {
                                         (ConnState::Connected, _) => ("已加速", p.success_text),
                                         (ConnState::Connecting, Some(_)) => {
-                                            ("重连中…", p.accent_text)
+                                            ("重连中…", p.warn_text)
                                         }
-                                        (ConnState::Connecting, None) => ("连接中…", p.accent_text),
+                                        (ConnState::Connecting, None) => ("连接中…", p.warn_text),
                                         (ConnState::Disconnected, _) => ("未连接", p.text_muted),
                                     };
                                     ui.label(
@@ -249,7 +249,7 @@ impl GameAccelApp {
                                         );
                                         ui.spacing_mut().item_spacing.x = 3.0;
                                         ui.label(
-                                            RichText::new(format_speed(self.tx_speed_bps))
+                                            RichText::new(format_speed(self.telemetry.tx_speed_bps))
                                                 .size(FONT_XS)
                                                 .monospace()
                                                 .color(p.text_secondary),
@@ -267,7 +267,7 @@ impl GameAccelApp {
                                             down_col,
                                         );
                                         ui.label(
-                                            RichText::new(format_speed(self.rx_speed_bps))
+                                            RichText::new(format_speed(self.telemetry.rx_speed_bps))
                                                 .size(FONT_XS)
                                                 .monospace()
                                                 .color(p.text_secondary),
@@ -317,11 +317,11 @@ impl GameAccelApp {
                                     }
                                     ConnState::Connecting => {
                                         let f = if btn_resp.hovered() {
-                                            p.accent_soft.linear_multiply(0.95)
+                                            p.warn_soft.linear_multiply(0.95)
                                         } else {
-                                            p.accent_soft
+                                            p.warn_soft
                                         };
-                                        (f, Stroke::new(1.0_f32, p.accent), p.accent_text, "取消连接")
+                                        (f, Stroke::new(1.0_f32, p.warn_text), p.warn_text, "取消连接")
                                     }
                                     ConnState::Connected => {
                                         let f = if btn_resp.hovered() {
@@ -694,14 +694,7 @@ impl GameAccelApp {
                     self.switch_route_mode(mode);
                 }
                 PopoverAction::SelectNode(id) => {
-                    if self.cfg.active_node_id != id {
-                        self.cfg.active_node_id = id;
-                        save_config(&self.cfg);
-                        if self.state != ConnState::Disconnected {
-                            self.stop_connect();
-                            self.start_connect();
-                        }
-                    }
+                    self.switch_active_node(id);
                 }
                 PopoverAction::ProbeAll => {
                     self.probe_all_nodes();

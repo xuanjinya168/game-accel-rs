@@ -3,7 +3,7 @@ use quinn::{Connection, SendDatagramError};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -62,25 +62,31 @@ impl AdaptiveDupPolicy {
         }
     }
 
-    fn update(&mut self, sent_packets: u64, lost_packets: u64, now: Instant) -> bool {
+    fn update(&mut self, sent_packets: u64, lost_packets: u64, now: Instant) -> (bool, u32) {
         let delta_sent = sent_packets.saturating_sub(self.prev_sent);
         let delta_lost = lost_packets.saturating_sub(self.prev_lost);
         self.prev_sent = sent_packets;
         self.prev_lost = lost_packets;
 
-        let loss_ratio = delta_lost as f64 / delta_sent.max(1) as f64;
+        let loss_ratio = if delta_sent > 0 {
+            (delta_lost as f64 / delta_sent as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let loss_bps = (loss_ratio * 10_000.0).round() as u32;
+
         if delta_lost >= MIN_LOST_PACKETS_TO_TRIGGER && loss_ratio >= LOSS_RATIO_THRESHOLD {
             self.hold_until = Some(now + ADAPTIVE_HOLD_DURATION);
-            return true;
+            return (true, loss_bps);
         }
 
         if let Some(until) = self.hold_until {
             if now < until {
-                return true;
+                return (true, loss_bps);
             }
             self.hold_until = None;
         }
-        false
+        (false, loss_bps)
     }
 }
 
@@ -94,6 +100,7 @@ impl AdaptiveDupPolicy {
 pub struct UdpDupPacer {
     tx: mpsc::Sender<(Instant, Bytes)>,
     dup_active: Arc<AtomicBool>,
+    loss_bps: Arc<AtomicU32>,
     jitter_seq: Arc<AtomicU64>,
 }
 
@@ -101,7 +108,9 @@ impl UdpDupPacer {
     pub fn spawn(conn: Connection) -> Self {
         let (tx, mut rx) = mpsc::channel::<(Instant, Bytes)>(PACER_QUEUE_CAP);
         let dup_active = Arc::new(AtomicBool::new(false));
+        let loss_bps = Arc::new(AtomicU32::new(0));
         let dup_flag = dup_active.clone();
+        let loss_slot = loss_bps.clone();
 
         tokio::spawn(async move {
             let mut loss_tick = tokio::time::interval(LOSS_SAMPLE_INTERVAL);
@@ -118,14 +127,16 @@ impl UdpDupPacer {
                             break;
                         }
                         let st = conn.stats().path;
-                        let active = policy.update(st.sent_packets, st.lost_packets, Instant::now());
+                        let (active, bps) = policy.update(st.sent_packets, st.lost_packets, Instant::now());
+                        loss_slot.store(bps, Ordering::Relaxed);
                         let prev = dup_flag.swap(active, Ordering::Relaxed);
                         if active != prev {
                             debug!(
-                                "adaptive UDP dual-send {} (sent={}, lost={})",
+                                "adaptive UDP dual-send {} (sent={}, lost={}, bps={})",
                                 if active { "ENGAGED" } else { "DISENGAGED" },
                                 st.sent_packets,
-                                st.lost_packets
+                                st.lost_packets,
+                                bps
                             );
                         }
                     }
@@ -167,14 +178,19 @@ impl UdpDupPacer {
         Self {
             tx,
             dup_active,
+            loss_bps,
             jitter_seq: Arc::new(AtomicU64::new(0x9e37_79b9_7f4a_7c15)),
         }
     }
 
     /// Returns whether loss-adaptive UDP dual-send is currently engaged on this connection.
-    #[allow(dead_code)]
     pub fn is_dup_active(&self) -> bool {
         self.dup_active.load(Ordering::Relaxed)
+    }
+
+    /// Returns the most recently sampled packet loss ratio in basis points (`100` = `1.0%`).
+    pub fn loss_bps(&self) -> u32 {
+        self.loss_bps.load(Ordering::Relaxed)
     }
 
     /// Schedule a zero-copy `Bytes` duplicate ONLY when QUIC path loss has engaged adaptive
@@ -239,11 +255,11 @@ mod tests {
         let t0 = Instant::now();
 
         // Clean path: 0 lost out of 500
-        assert!(!p.update(500, 0, t0));
+        assert_eq!(p.update(500, 0, t0), (false, 0));
         // Isolated single lost packet (< MIN_LOST_PACKETS_TO_TRIGGER)
-        assert!(!p.update(1000, 1, t0 + Duration::from_secs(2)));
+        assert!(!p.update(1000, 1, t0 + Duration::from_secs(2)).0);
         // Tiny ratio: 2 lost out of 2000 (0.1% < 0.5%)
-        assert!(!p.update(3000, 3, t0 + Duration::from_secs(4)));
+        assert_eq!(p.update(3000, 3, t0 + Duration::from_secs(4)), (false, 10));
     }
 
     #[test]
@@ -251,17 +267,17 @@ mod tests {
         let mut p = AdaptiveDupPolicy::new();
         let t0 = Instant::now();
 
-        assert!(!p.update(100, 0, t0));
+        assert_eq!(p.update(100, 0, t0), (false, 0));
 
         // 3 lost out of 200 (1.5% >= 0.5%) -> engages immediately
         let t1 = t0 + Duration::from_secs(2);
-        assert!(p.update(300, 3, t1));
+        assert_eq!(p.update(300, 3, t1), (true, 150));
 
         // Next window is completely clean, still inside 15s hold window -> stays active
-        assert!(p.update(500, 3, t1 + Duration::from_secs(10)));
+        assert_eq!(p.update(500, 3, t1 + Duration::from_secs(10)), (true, 0));
 
         // Once 15s clean window elapses -> disengages automatically
-        assert!(!p.update(700, 3, t1 + Duration::from_secs(16)));
+        assert_eq!(p.update(700, 3, t1 + Duration::from_secs(16)), (false, 0));
     }
 
     #[test]
