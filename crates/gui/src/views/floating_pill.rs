@@ -1,4 +1,4 @@
-use crate::storage::save_config;
+use crate::storage::{PillLightStyle, save_config};
 use crate::theme::{FONT_SM, ThemePalette};
 use crate::tray::{clamp_popover_position, wake_window};
 use crate::widgets::hairline_divider;
@@ -101,15 +101,14 @@ impl GameAccelApp {
         // Ease activity over ~0.6s so the 1s speed samples don't make the rate step.
         let ease = 1.0 - (-dt / 0.6).exp();
         self.floating_pill_led_k += (target_k - self.floating_pill_led_k) * ease as f32;
-        let led_k = self.floating_pill_led_k as f64;
-        // Breathing: ~3.1s period when idle -> ~0.7s at >= 10 MB/s.
-        self.floating_pill_led_phase =
-            (self.floating_pill_led_phase + dt * (2.0 + 7.0 * led_k)) % std::f64::consts::TAU;
-        // Ripple ring: ~2.2s -> ~0.7s.
-        self.floating_pill_ring_phase =
-            (self.floating_pill_ring_phase + dt * (0.45 + 0.95 * led_k)).fract();
-        let led_phase = self.floating_pill_led_phase;
-        let ring_phase = self.floating_pill_ring_phase;
+        let activity = self.floating_pill_led_k;
+        let period = if self.state == ConnState::Connecting {
+            1.15
+        } else {
+            3.0 - 1.5 * f64::from(activity)
+        };
+        self.floating_pill_led_phase = (self.floating_pill_led_phase + dt / period).fract();
+        let phase = self.floating_pill_led_phase as f32;
         let anim_interval = self.pill_anim_interval();
         let force_raise = if self.floating_pill_raise_frames > 0 {
             self.floating_pill_raise_frames -= 1;
@@ -217,65 +216,18 @@ impl GameAccelApp {
 
                         // Left breathing status LED
                         let led_center = Pos2::new(rect.left() + 13.0, cy);
-                        match self.state {
-                            ConnState::Connected => {
-                                let wave = (led_phase.sin() * 0.5 + 0.5) as f32;
-                                let ring_t = ring_phase as f32;
-
-                                let ripple_r = 3.2 + ring_t * 6.0;
-                                let ripple_alpha = ((1.0 - ring_t).powi(2) * 165.0) as u8;
-                                painter.circle_filled(
-                                    led_center,
-                                    ripple_r,
-                                    Color32::from_rgba_unmultiplied(
-                                        down_col.r(),
-                                        down_col.g(),
-                                        down_col.b(),
-                                        ripple_alpha,
-                                    ),
-                                );
-
-                                let glow_r = 4.2 + wave * 2.2;
-                                let glow_alpha = (55.0 + wave * 95.0) as u8;
-                                painter.circle_filled(
-                                    led_center,
-                                    glow_r,
-                                    Color32::from_rgba_unmultiplied(
-                                        down_col.r(),
-                                        down_col.g(),
-                                        down_col.b(),
-                                        glow_alpha,
-                                    ),
-                                );
-
-                                let core_r = 2.6 + wave * 0.9;
-                                let core_col = lerp_color(
-                                    down_col.linear_multiply(0.75),
-                                    Color32::from_rgb(56, 204, 102),
-                                    wave,
-                                );
-                                painter.circle_filled(led_center, core_r, core_col);
-                            }
-                            ConnState::Connecting => {
-                                let wave = ((now_secs * 5.2).sin() * 0.5 + 0.5) as f32;
-                                let glow_r = 4.0 + wave * 3.2;
-                                let glow_alpha = (55.0 + wave * 120.0) as u8;
-                                painter.circle_filled(
-                                    led_center,
-                                    glow_r,
-                                    Color32::from_rgba_unmultiplied(
-                                        up_col.r(),
-                                        up_col.g(),
-                                        up_col.b(),
-                                        glow_alpha,
-                                    ),
-                                );
-                                let core_r = 2.5 + wave * 1.0;
-                                painter.circle_filled(led_center, core_r, up_col);
-                            }
-                            ConnState::Disconnected => {
-                                painter.circle_filled(led_center, 2.7, p.border_strong);
-                            }
+                        if self.state == ConnState::Disconnected {
+                            painter.circle_filled(led_center, 2.7, p.border_strong);
+                        } else {
+                            let connecting = self.state == ConnState::Connecting;
+                            draw_light(
+                                painter,
+                                led_center,
+                                self.cfg.floating_pill_light,
+                                phase,
+                                if connecting { 0.3 } else { activity },
+                                if connecting { up_col } else { down_col },
+                            );
                         }
 
                         // Two crisp stacked rows: upload (top) & download (bottom)
@@ -599,15 +551,54 @@ fn menu_row(
     resp
 }
 
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let mix = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
-    Color32::from_rgba_unmultiplied(
-        mix(a.r(), b.r()),
-        mix(a.g(), b.g()),
-        mix(a.b(), b.b()),
-        mix(a.a(), b.a()),
-    )
+fn draw_light(
+    painter: &egui::Painter,
+    center: Pos2,
+    style: PillLightStyle,
+    phase: f32,
+    activity: f32,
+    color: Color32,
+) {
+    use std::f32::consts::{PI, TAU};
+    let angle = phase * TAU;
+    match style {
+        PillLightStyle::Glow => {
+            let radius = 6.0 + 1.5 * (1.0 - angle.cos());
+            for layer in (1..=8).rev() {
+                painter.circle_filled(
+                    center,
+                    radius * layer as f32 / 8.0,
+                    color.gamma_multiply(0.085),
+                );
+            }
+            painter.circle_filled(center, 2.7, color);
+        }
+        PillLightStyle::Ripple => {
+            let tint = color.gamma_multiply(0.68 * (PI * phase).sin());
+            painter.circle_stroke(center, 3.5 + 5.0 * phase, Stroke::new(1.0_f32, tint));
+            painter.circle_filled(center, 2.7, color);
+        }
+        PillLightStyle::Orbit => {
+            painter.circle_stroke(center, 6.0, Stroke::new(1.2_f32, color.gamma_multiply(0.19)));
+            let points = (0..=10)
+                .map(|i| center + Vec2::angled(angle + 1.7 * i as f32 / 10.0) * 6.0)
+                .collect();
+            painter.add(egui::Shape::line(points, Stroke::new(1.7_f32, color)));
+            painter.circle_filled(center, 1.7, color);
+        }
+        PillLightStyle::Bars => {
+            for i in 0..3 {
+                let wave = (1.0 + (angle + i as f32 * 1.4).sin()) * 0.5;
+                let height = 3.0 + (3.0 + 4.0 * activity) * wave;
+                let pos = center + Vec2::new(4.0 * (i as f32 - 1.0), 0.0);
+                painter.rect_filled(
+                    egui::Rect::from_center_size(pos, Vec2::new(2.4, height)),
+                    1,
+                    color,
+                );
+            }
+        }
+    }
 }
 
 /// Draw a crisp vector up/down arrow centered at `c`.

@@ -201,7 +201,6 @@ pub(crate) struct GameAccelApp {
     /// the timestamp of the last advance.
     pub(crate) floating_pill_led_k: f32,
     pub(crate) floating_pill_led_phase: f64,
-    pub(crate) floating_pill_ring_phase: f64,
     pub(crate) floating_pill_led_last: f64,
     /// GitHub Releases based auto-updater.
     pub(crate) updater: updater::Updater,
@@ -315,7 +314,6 @@ impl GameAccelApp {
             floating_pill_spawn_pos: None,
             floating_pill_led_k: 0.0,
             floating_pill_led_phase: 0.0,
-            floating_pill_ring_phase: 0.0,
             floating_pill_led_last: 0.0,
             updater: updater::Updater::default(),
             update_notified: None,

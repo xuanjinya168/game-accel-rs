@@ -18,6 +18,15 @@ pub enum TrayStyle {
     Menu,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PillLightStyle {
+    #[default]
+    Glow,
+    Ripple,
+    Orbit,
+    Bars,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionEntry {
     pub name: String,
@@ -80,6 +89,8 @@ pub struct AppConfig {
     /// Desktop floating mini speed pill visibility.
     #[serde(default)]
     pub show_floating_pill: bool,
+    #[serde(default)]
+    pub floating_pill_light: PillLightStyle,
     /// Saved logical screen position `[x, y]` of the floating speed pill.
     #[serde(default)]
     pub floating_pill_pos: Option<[f32; 2]>,
@@ -118,6 +129,7 @@ impl Default for AppConfig {
             route_mode: RouteMode::default(),
             tray_style: TrayStyle::default(),
             show_floating_pill: false,
+            floating_pill_light: PillLightStyle::default(),
             floating_pill_pos: None,
             floating_pill_always_on_top: true,
             floating_pill_hide_fullscreen: true,
@@ -234,6 +246,7 @@ pub fn load_config() -> AppConfig {
             route_mode: RouteMode::default(),
             tray_style: TrayStyle::default(),
             show_floating_pill: false,
+            floating_pill_light: PillLightStyle::default(),
             floating_pill_pos: None,
             floating_pill_always_on_top: true,
             floating_pill_hide_fullscreen: true,

@@ -1,5 +1,5 @@
 use crate::logger;
-use crate::storage::{TrayStyle, config_dir, save_config};
+use crate::storage::{PillLightStyle, TrayStyle, config_dir, save_config};
 use crate::theme::{FONT_BODY, FONT_SM, ThemeMode, ThemePalette, apply_theme};
 use crate::widgets::{card_frame, hairline_divider, primary_btn, soft_btn, styled_input};
 use crate::{ConnState, GameAccelApp, NavTab};
@@ -343,6 +343,23 @@ impl GameAccelApp {
                 });
             });
 
+            ui.add_space(12.0);
+            hairline_divider(ui, p);
+            ui.add_space(12.0);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("悬浮窗灯效").size(FONT_BODY).strong().color(p.text_primary));
+                for (style, label) in [
+                    (PillLightStyle::Glow, "柔光"),
+                    (PillLightStyle::Ripple, "微波纹"),
+                    (PillLightStyle::Orbit, "星轨"),
+                    (PillLightStyle::Bars, "律动"),
+                ] {
+                    if ui.selectable_value(&mut self.cfg.floating_pill_light, style, label).changed() {
+                        save_config(&self.cfg);
+                    }
+                }
+            });
             ui.add_space(12.0);
             hairline_divider(ui, p);
             ui.add_space(12.0);
