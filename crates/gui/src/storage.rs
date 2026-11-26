@@ -77,6 +77,12 @@ pub struct AppConfig {
     /// Tray right-click behavior: floating popover panel vs native context menu.
     #[serde(default)]
     pub tray_style: TrayStyle,
+    /// Desktop floating mini speed pill visibility.
+    #[serde(default)]
+    pub show_floating_pill: bool,
+    /// Saved logical screen position `[x, y]` of the floating speed pill.
+    #[serde(default)]
+    pub floating_pill_pos: Option<[f32; 2]>,
 }
 
 impl Default for AppConfig {
@@ -95,6 +101,8 @@ impl Default for AppConfig {
             active_admin_server_id,
             route_mode: RouteMode::default(),
             tray_style: TrayStyle::default(),
+            show_floating_pill: false,
+            floating_pill_pos: None,
         }
     }
 }
@@ -204,6 +212,8 @@ pub fn load_config() -> AppConfig {
             active_admin_server_id,
             route_mode: RouteMode::default(),
             tray_style: TrayStyle::default(),
+            show_floating_pill: false,
+            floating_pill_pos: None,
         };
         save_config(&migrated);
         return migrated;

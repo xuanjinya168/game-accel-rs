@@ -108,7 +108,7 @@ pub fn apply_win11_rounded_corners() {
 /// Find the top-level window belonging to the current process with the exact `title`.
 /// Scoping by PID prevents interfering with another running instance of GameAccel.
 #[cfg(target_os = "windows")]
-fn find_own_window(title: &str) -> isize {
+pub(crate) fn find_own_window(title: &str) -> isize {
     use std::ffi::c_void;
     type Hwnd = *mut c_void;
     type EnumProc = unsafe extern "system" fn(Hwnd, isize) -> i32;

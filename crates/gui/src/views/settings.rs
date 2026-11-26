@@ -250,6 +250,94 @@ impl GameAccelApp {
             hairline_divider(ui, p);
             ui.add_space(12.0);
 
+            // Row 1.3: Desktop floating mini speed pill
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(
+                        RichText::new("桌面网速悬浮窗")
+                            .size(FONT_BODY)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.label(
+                        RichText::new("置顶极简双行网速小卡片，带呼吸灯与实时上下行网速（可拖动、右键隐藏）")
+                            .size(FONT_SM)
+                            .color(p.text_muted),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (pill_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(130.0, 30.0), Sense::hover());
+                    ui.painter().rect(
+                        pill_rect,
+                        CornerRadius::same(9),
+                        p.bg_card_alt,
+                        Stroke::new(1.0_f32, p.border_subtle),
+                        egui::StrokeKind::Inside,
+                    );
+                    let seg_w = 60.0;
+                    let seg_h = 24.0;
+                    for (idx, (val, lbl)) in [(false, "隐藏"), (true, "显示")].into_iter().enumerate()
+                    {
+                        let x = pill_rect.left() + 3.0 + idx as f32 * (seg_w + 4.0);
+                        let seg_rect = egui::Rect::from_min_size(
+                            Pos2::new(x, pill_rect.top() + 3.0),
+                            Vec2::new(seg_w, seg_h),
+                        );
+                        let resp = ui.interact(
+                            seg_rect,
+                            ui.id().with(("floating_pill_seg", idx)),
+                            Sense::click(),
+                        );
+                        let active = self.cfg.show_floating_pill == val;
+                        let fill = if active {
+                            p.bg_card
+                        } else if resp.hovered() {
+                            p.bg_nav_hover
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let stroke = if active {
+                            Stroke::new(1.0_f32, p.border_subtle)
+                        } else {
+                            Stroke::NONE
+                        };
+                        ui.painter().rect(
+                            seg_rect,
+                            CornerRadius::same(6),
+                            fill,
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            seg_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            lbl,
+                            FontId::proportional(FONT_SM),
+                            if active {
+                                p.text_primary
+                            } else {
+                                p.text_muted
+                            },
+                        );
+                        if resp.clicked() && self.cfg.show_floating_pill != val {
+                            self.cfg.show_floating_pill = val;
+                            save_config(&self.cfg);
+                            self.show_toast(if val {
+                                "已开启桌面网速悬浮窗"
+                            } else {
+                                "已隐藏桌面网速悬浮窗"
+                            });
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            hairline_divider(ui, p);
+            ui.add_space(12.0);
+
             // Row 1.5: Show/Hide Server Admin Menu
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {

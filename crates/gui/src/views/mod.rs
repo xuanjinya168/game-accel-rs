@@ -1,4 +1,5 @@
 mod dashboard;
+pub(crate) mod floating_pill;
 mod logs;
 mod nodes;
 mod settings;

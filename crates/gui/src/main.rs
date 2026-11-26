@@ -28,7 +28,7 @@ use theme::{ThemePalette, apply_theme, build_app_icon, configure_fonts};
 use tokio::sync::{mpsc, watch};
 use tray::{TrayCmd, TrayHandle, init_tray};
 
-pub(crate) const APP_VERSION: &str = "v0.2.0";
+pub(crate) const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NavTab {
@@ -181,6 +181,7 @@ pub(crate) struct GameAccelApp {
     pub(crate) tray_popover_just_opened: bool,
     pub(crate) tray_popover_ever_focused: bool,
     pub(crate) tray_popover_search: String,
+    pub(crate) floating_pill_pos_dirty: Option<Instant>,
     pub(crate) really_quit: bool,
 }
 
@@ -274,6 +275,7 @@ impl GameAccelApp {
             tray_popover_just_opened: false,
             tray_popover_ever_focused: false,
             tray_popover_search: String::new(),
+            floating_pill_pos_dirty: None,
             really_quit: false,
         };
         app.push_log(if is_admin {
@@ -404,7 +406,9 @@ impl eframe::App for GameAccelApp {
             self.window_hidden_to_tray = false;
         }
         let is_background = self.window_hidden_to_tray || is_minimized;
-        if is_background && !self.tray_popover_open {
+        let pill_animating =
+            self.cfg.show_floating_pill && self.state != ConnState::Disconnected;
+        if is_background && !self.tray_popover_open && !pill_animating {
             std::thread::sleep(Duration::from_millis(24));
         }
 
@@ -424,13 +428,16 @@ impl eframe::App for GameAccelApp {
             .probes
             .values()
             .any(|v| matches!(v, ProbeState::Probing));
-        if self.state != ConnState::Disconnected
+        if pill_animating {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.state != ConnState::Disconnected
             || any_probing
             || self.sub_loading
             || self.admin.busy
             || (self.active_tab == NavTab::Admin && self.admin.session_cookie.is_some())
             || self.toast.is_some()
             || self.tray_popover_open
+            || self.floating_pill_pos_dirty.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -541,6 +548,7 @@ impl eframe::App for GameAccelApp {
         }
 
         self.render_tray_popover(ctx, p);
+        self.render_floating_pill(ctx, p);
     }
 }
 

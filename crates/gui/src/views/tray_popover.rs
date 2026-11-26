@@ -3,7 +3,7 @@ use crate::logger::log_line;
 use crate::storage::{ProxyMode, RouteMode, format_speed, save_config};
 use crate::theme::{FONT_BODY, FONT_SM, FONT_XS, ThemePalette};
 use crate::tray::{apply_win11_rounded_corners, wake_window};
-use crate::widgets::{chip_btn, hairline_divider, pill};
+use crate::widgets::{accent_chip_btn, chip_btn, hairline_divider, pill};
 use crate::{ConnState, GameAccelApp, NavTab, ProbeState};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, Pos2, RichText, ScrollArea,
@@ -18,6 +18,7 @@ pub(crate) const TRAY_POPOVER_H: f32 = 428.0;
 enum PopoverAction {
     OpenMain(Option<NavTab>),
     ToggleConnect,
+    ToggleFloatingPill,
     SwitchProxyMode(ProxyMode),
     SwitchRouteMode(RouteMode),
     SelectNode(String),
@@ -123,6 +124,22 @@ impl GameAccelApp {
                                     if chip_btn(ui, "主界面", p, false).clicked() {
                                         actions.push(PopoverAction::OpenMain(None));
                                         close_popover = true;
+                                    }
+
+                                    let pill_btn = if self.cfg.show_floating_pill {
+                                        accent_chip_btn(ui, "悬浮窗", p, false)
+                                    } else {
+                                        chip_btn(ui, "悬浮窗", p, false)
+                                    };
+                                    if pill_btn
+                                        .on_hover_text(if self.cfg.show_floating_pill {
+                                            "点击隐藏桌面网速悬浮窗"
+                                        } else {
+                                            "点击显示桌面网速悬浮窗"
+                                        })
+                                        .clicked()
+                                    {
+                                        actions.push(PopoverAction::ToggleFloatingPill);
                                     }
                                 });
                             },
@@ -559,6 +576,15 @@ impl GameAccelApp {
                     ConnState::Disconnected => self.start_connect(),
                     ConnState::Connecting | ConnState::Connected => self.stop_connect(),
                 },
+                PopoverAction::ToggleFloatingPill => {
+                    self.cfg.show_floating_pill = !self.cfg.show_floating_pill;
+                    save_config(&self.cfg);
+                    self.show_toast(if self.cfg.show_floating_pill {
+                        "已开启桌面网速悬浮窗"
+                    } else {
+                        "已隐藏桌面网速悬浮窗"
+                    });
+                }
                 PopoverAction::SwitchProxyMode(mode) => {
                     self.switch_proxy_mode(mode);
                 }
