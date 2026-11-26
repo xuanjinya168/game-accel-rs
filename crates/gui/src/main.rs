@@ -173,8 +173,14 @@ pub(crate) struct GameAccelApp {
     // Server Admin UI state (in-memory session; passwords are never persisted)
     pub(crate) admin: AdminState,
 
-    // System tray
-    _tray: Option<TrayHandle>,
+    // System tray & floating popover
+    pub(crate) tray: Option<TrayHandle>,
+    pub(crate) window_hidden_to_tray: bool,
+    pub(crate) tray_popover_open: bool,
+    pub(crate) tray_popover_pos: Pos2,
+    pub(crate) tray_popover_just_opened: bool,
+    pub(crate) tray_popover_ever_focused: bool,
+    pub(crate) tray_popover_search: String,
     pub(crate) really_quit: bool,
 }
 
@@ -199,6 +205,7 @@ impl GameAccelApp {
         let quit_proxy_flag = sys_proxy_flag.clone();
         let tray = init_tray(
             cc.egui_ctx.clone(),
+            cfg.tray_style,
             move |cmd| {
                 let _ = tray_tx.send(AsyncEvent::Tray(cmd));
             },
@@ -260,7 +267,13 @@ impl GameAccelApp {
             sub_url_input: String::new(),
             sub_loading: false,
             admin: admin_state,
-            _tray: tray,
+            tray,
+            window_hidden_to_tray: false,
+            tray_popover_open: false,
+            tray_popover_pos: Pos2::new(800.0, 300.0),
+            tray_popover_just_opened: false,
+            tray_popover_ever_focused: false,
+            tray_popover_search: String::new(),
             really_quit: false,
         };
         app.push_log(if is_admin {
@@ -386,12 +399,22 @@ impl eframe::App for GameAccelApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if ctx.input(|i| i.focused) && !is_minimized {
+            self.window_hidden_to_tray = false;
+        }
+        let is_background = self.window_hidden_to_tray || is_minimized;
+        if is_background && !self.tray_popover_open {
+            std::thread::sleep(Duration::from_millis(24));
+        }
+
         self.poll_async(ctx);
 
-        if ctx.input(|i| i.viewport().close_requested()) && !self.really_quit && self._tray.is_some()
+        if ctx.input(|i| i.viewport().close_requested()) && !self.really_quit && self.tray.is_some()
         {
+            self.window_hidden_to_tray = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            tray::hide_window_to_tray();
             return;
         }
 
@@ -407,6 +430,7 @@ impl eframe::App for GameAccelApp {
             || self.admin.busy
             || (self.active_tab == NavTab::Admin && self.admin.session_cookie.is_some())
             || self.toast.is_some()
+            || self.tray_popover_open
         {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -515,6 +539,8 @@ impl eframe::App for GameAccelApp {
         if toast_workspace_rect.is_positive() {
             self.render_toast_overlay(ctx, toast_workspace_rect, p);
         }
+
+        self.render_tray_popover(ctx, p);
     }
 }
 

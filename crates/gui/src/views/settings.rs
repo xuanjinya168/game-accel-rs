@@ -1,5 +1,5 @@
 use crate::logger;
-use crate::storage::{config_dir, save_config};
+use crate::storage::{TrayStyle, config_dir, save_config};
 use crate::theme::{FONT_BODY, FONT_SM, ThemeMode, ThemePalette, apply_theme};
 use crate::widgets::{card_frame, hairline_divider, primary_btn, soft_btn, styled_input};
 use crate::{ConnState, GameAccelApp, NavTab, relaunch_as_admin};
@@ -143,6 +143,104 @@ impl GameAccelApp {
                             self.cfg.theme_mode = mode;
                             apply_theme(ctx, ThemePalette::from_mode(mode));
                             save_config(&self.cfg);
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            hairline_divider(ui, p);
+            ui.add_space(12.0);
+
+            // Row 1.2: Tray right-click style (floating popover vs native menu)
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(
+                        RichText::new("托盘右键样式")
+                            .size(FONT_BODY)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.label(
+                        RichText::new("悬浮面板支持快捷切节点/模式与测速，原生菜单为系统极简菜单")
+                            .size(FONT_SM)
+                            .color(p.text_muted),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (pill_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(150.0, 30.0), Sense::hover());
+                    ui.painter().rect(
+                        pill_rect,
+                        CornerRadius::same(9),
+                        p.bg_card_alt,
+                        Stroke::new(1.0_f32, p.border_subtle),
+                        egui::StrokeKind::Inside,
+                    );
+                    let seg_w = 70.0;
+                    let seg_h = 24.0;
+                    for (idx, (style, lbl)) in [
+                        (TrayStyle::Panel, "悬浮面板"),
+                        (TrayStyle::Menu, "原生菜单"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let x = pill_rect.left() + 3.0 + idx as f32 * (seg_w + 4.0);
+                        let seg_rect = egui::Rect::from_min_size(
+                            Pos2::new(x, pill_rect.top() + 3.0),
+                            Vec2::new(seg_w, seg_h),
+                        );
+                        let resp = ui.interact(
+                            seg_rect,
+                            ui.id().with(("tray_style_seg", idx)),
+                            Sense::click(),
+                        );
+                        let active = self.cfg.tray_style == style;
+                        let fill = if active {
+                            p.bg_card
+                        } else if resp.hovered() {
+                            p.bg_nav_hover
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let stroke = if active {
+                            Stroke::new(1.0_f32, p.border_subtle)
+                        } else {
+                            Stroke::NONE
+                        };
+                        ui.painter().rect(
+                            seg_rect,
+                            CornerRadius::same(6),
+                            fill,
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            seg_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            lbl,
+                            FontId::proportional(FONT_SM),
+                            if active {
+                                p.text_primary
+                            } else {
+                                p.text_muted
+                            },
+                        );
+                        if resp.clicked() && self.cfg.tray_style != style {
+                            self.cfg.tray_style = style;
+                            save_config(&self.cfg);
+                            if style == TrayStyle::Menu {
+                                self.tray_popover_open = false;
+                            }
+                            if let Some(ref tray) = self.tray {
+                                tray.set_style(style);
+                            }
+                            self.show_toast(match style {
+                                TrayStyle::Panel => "已切换为托盘悬浮面板",
+                                TrayStyle::Menu => "已切换为系统原生托盘菜单",
+                            });
                         }
                     }
                 });

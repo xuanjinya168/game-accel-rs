@@ -11,6 +11,13 @@ pub enum ProxyMode {
     Manual,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TrayStyle {
+    #[default]
+    Panel,
+    Menu,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionEntry {
     pub name: String,
@@ -67,6 +74,9 @@ pub struct AppConfig {
     /// Split routing: Rule (CN direct, rest proxied) / Global / Direct.
     #[serde(default)]
     pub route_mode: RouteMode,
+    /// Tray right-click behavior: floating popover panel vs native context menu.
+    #[serde(default)]
+    pub tray_style: TrayStyle,
 }
 
 impl Default for AppConfig {
@@ -84,6 +94,7 @@ impl Default for AppConfig {
             admin_servers: vec![default_srv],
             active_admin_server_id,
             route_mode: RouteMode::default(),
+            tray_style: TrayStyle::default(),
         }
     }
 }
@@ -192,6 +203,7 @@ pub fn load_config() -> AppConfig {
             admin_servers: vec![default_srv],
             active_admin_server_id,
             route_mode: RouteMode::default(),
+            tray_style: TrayStyle::default(),
         };
         save_config(&migrated);
         return migrated;

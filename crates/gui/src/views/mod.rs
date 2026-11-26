@@ -2,6 +2,7 @@ mod dashboard;
 mod logs;
 mod nodes;
 mod settings;
+pub(crate) mod tray_popover;
 
 use crate::icons;
 use crate::storage::save_config;

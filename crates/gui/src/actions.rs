@@ -430,13 +430,33 @@ impl GameAccelApp {
                 }
                 AsyncEvent::Tray(cmd) => match cmd {
                     TrayCmd::Show => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.window_hidden_to_tray = false;
+                        self.tray_popover_open = false;
+                        crate::tray::wake_window(ctx);
                     }
                     TrayCmd::ToggleConnect => match self.state {
                         ConnState::Disconnected => self.start_connect(),
                         ConnState::Connecting | ConnState::Connected => self.stop_connect(),
                     },
+                    TrayCmd::TogglePopover(px, py) => {
+                        if self.tray_popover_open {
+                            self.tray_popover_open = false;
+                            self.tray_popover_ever_focused = false;
+                        } else {
+                            let ppp = ctx.pixels_per_point().max(1.0);
+                            self.tray_popover_pos = crate::tray::clamp_popover_position(
+                                px,
+                                py,
+                                crate::views::tray_popover::TRAY_POPOVER_W,
+                                crate::views::tray_popover::TRAY_POPOVER_H,
+                                ppp,
+                            );
+                            self.tray_popover_just_opened = true;
+                            self.tray_popover_ever_focused = false;
+                            self.tray_popover_search.clear();
+                            self.tray_popover_open = true;
+                        }
+                    }
                     TrayCmd::Quit => {
                         self.stop_connect();
                         self.really_quit = true;
