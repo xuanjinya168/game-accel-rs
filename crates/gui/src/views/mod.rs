@@ -238,7 +238,11 @@ impl GameAccelApp {
                     p.text_secondary,
                 );
                 if x_resp
-                    .on_hover_text(if is_maximized { "还原窗口" } else { "最大化" })
+                    .on_hover_text(if is_maximized {
+                        "还原窗口"
+                    } else {
+                        "最大化"
+                    })
                     .clicked()
                 {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
@@ -308,12 +312,9 @@ impl GameAccelApp {
                         p.success_text,
                     ),
                     ConnState::Connecting => (p.accent, p.accent_soft, p.accent_text, p.accent),
-                    ConnState::Disconnected => (
-                        p.text_muted,
-                        p.bg_card,
-                        p.text_secondary,
-                        p.border_subtle,
-                    ),
+                    ConnState::Disconnected => {
+                        (p.text_muted, p.bg_card, p.text_secondary, p.border_subtle)
+                    }
                 };
                 draw_status_pill(ui, &pill, dot_col, bg, fg, stroke_col);
 
@@ -366,5 +367,4 @@ impl GameAccelApp {
             );
         });
     }
-
 }

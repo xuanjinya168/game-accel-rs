@@ -1,5 +1,6 @@
 pub mod direct;
 pub(crate) mod dns_msg;
+pub mod error;
 pub(crate) mod http_proxy;
 pub(crate) mod quic;
 pub mod relay;
@@ -7,13 +8,15 @@ pub mod rules;
 pub mod socks5;
 pub mod tun_mode;
 
+pub use error::{ConnectError, classify};
+
 pub use quic::{resolve_server_addr, validate_server_addr};
 
 use crate::quic::{bind_tuned_udp_socket, build_client_config, unspecified_bind_for};
 use crate::relay::{ClientStats, UdpDispatchMap};
 use crate::rules::{RouteModeCell, Router, RuleData};
 use crate::socks5::run_mixed_proxy_server;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use protocol::auth::{AUTH_OK, write_auth_request};
 use protocol::frame::UdpFrame;
@@ -51,11 +54,6 @@ pub struct ClientOptions {
     /// override the embedded rule data.
     pub rules_dir: Option<std::path::PathBuf>,
 }
-
-/// Markers inside connect error messages that mean retrying cannot help.
-/// Callers (GUI reconnect policy) match on these instead of duplicating the wording.
-pub const ERR_AUTH_REJECTED: &str = "服务端拒绝鉴权";
-pub const ERR_PORT_IN_USE: &str = "被占用，无法监听";
 
 pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
@@ -159,7 +157,9 @@ pub async fn run_client_with_shutdown(
             return Ok(());
         }
         if attempt > 1 {
-            emit(format!("首次握手/鉴权超时，正在自动重试 ({attempt}/{MAX_ATTEMPTS})..."));
+            emit(format!(
+                "首次握手/鉴权超时，正在自动重试 ({attempt}/{MAX_ATTEMPTS})..."
+            ));
         }
 
         let attempt_fut = async {
@@ -196,9 +196,7 @@ pub async fn run_client_with_shutdown(
                 break;
             }
             Ok(Err(e)) => {
-                let msg = format!("{e:#}");
-                // Do not retry explicit server auth rejection
-                if msg.contains(ERR_AUTH_REJECTED) {
+                if !classify(&e).is_retryable() {
                     close_endpoints(&tcp_endpoint, &udp_endpoint, b"auth_failed");
                     return Err(e);
                 }
@@ -423,8 +421,7 @@ async fn connect_and_auth(
 
     match protocol {
         NodeProtocol::Gacl => {
-            let (mut auth_send, mut auth_recv) =
-                conn.open_bi().await.context("打开鉴权流失败")?;
+            let (mut auth_send, mut auth_recv) = conn.open_bi().await.context("打开鉴权流失败")?;
             write_auth_request(&mut auth_send, token)
                 .await
                 .context("发送鉴权请求失败")?;
@@ -432,7 +429,10 @@ async fn connect_and_auth(
             let resp = auth_recv.read_u8().await.context("读取鉴权响应失败")?;
             if resp != AUTH_OK {
                 conn.close(0u32.into(), b"auth_failed");
-                bail!("{ERR_AUTH_REJECTED} (code={resp})");
+                return Err(ConnectError::AuthRejected {
+                    detail: format!("服务端拒绝鉴权 (code={resp})"),
+                }
+                .into());
             }
             Ok(AuthedConn {
                 conn,
@@ -477,7 +477,10 @@ async fn connect_and_auth(
             let status = header_val(&headers, ":status").unwrap_or("unknown");
             if status != "233" {
                 conn.close(0u32.into(), b"auth_failed");
-                bail!("{ERR_AUTH_REJECTED} (Hy2 HTTP/3 status={status})");
+                return Err(ConnectError::AuthRejected {
+                    detail: format!("服务端拒绝鉴权 (Hy2 HTTP/3 status={status})"),
+                }
+                .into());
             }
             Ok(AuthedConn {
                 conn,
@@ -504,8 +507,7 @@ pub async fn probe_node_rtt(
         let server_addr = resolve_server_addr(server).await?;
         let mut endpoint = Endpoint::client(unspecified_bind_for(server_addr))?;
         endpoint.set_default_client_config(client_config);
-        let authed =
-            connect_and_auth(&endpoint, server_addr, server_name, token, protocol).await?;
+        let authed = connect_and_auth(&endpoint, server_addr, server_name, token, protocol).await?;
         let rtt_ms = authed.conn.rtt().as_millis() as u64;
         authed.conn.close(0u32.into(), b"probe_done");
         endpoint.close(0u32.into(), b"probe_done");
@@ -551,7 +553,10 @@ mod tests {
             tokio::task::spawn_blocking(move || tx.send(true)),
         )
         .await;
-        assert!(sent.expect("send(true) blocked").is_ok(), "no receiver left");
+        assert!(
+            sent.expect("send(true) blocked").is_ok(),
+            "no receiver left"
+        );
 
         let exited = tokio::time::timeout(Duration::from_secs(3), client).await;
         assert!(
@@ -663,12 +668,16 @@ mod tests {
                             if read_varint(&mut tr).await.ok() != Some(HY2_TCP_STREAM_TYPE) {
                                 return;
                             }
-                            let Ok(alen) = read_varint(&mut tr).await else { return };
+                            let Ok(alen) = read_varint(&mut tr).await else {
+                                return;
+                            };
                             let mut abuf = vec![0u8; alen as usize];
                             if tr.read_exact(&mut abuf).await.is_err() {
                                 return;
                             }
-                            let Ok(plen) = read_varint(&mut tr).await else { return };
+                            let Ok(plen) = read_varint(&mut tr).await else {
+                                return;
+                            };
                             if plen > 0 {
                                 let mut pbuf = vec![0u8; plen as usize];
                                 if tr.read_exact(&mut pbuf).await.is_err() {
@@ -695,15 +704,27 @@ mod tests {
 
         // 2. Probe valid & invalid tokens over Hysteria2
         let srv_str = srv_addr.to_string();
-        probe_node_rtt(&srv_str, "localhost", "hy2-test-token", true, NodeProtocol::Hysteria2)
-            .await
-            .expect("valid hy2 probe should succeed");
-        let bad_err = probe_node_rtt(&srv_str, "localhost", "wrong-token", true, NodeProtocol::Hysteria2)
-            .await
-            .unwrap_err();
+        probe_node_rtt(
+            &srv_str,
+            "localhost",
+            "hy2-test-token",
+            true,
+            NodeProtocol::Hysteria2,
+        )
+        .await
+        .expect("valid hy2 probe should succeed");
+        let bad_err = probe_node_rtt(
+            &srv_str,
+            "localhost",
+            "wrong-token",
+            true,
+            NodeProtocol::Hysteria2,
+        )
+        .await
+        .unwrap_err();
         assert!(
-            format!("{bad_err:#}").contains(ERR_AUTH_REJECTED),
-            "expected ERR_AUTH_REJECTED, got: {bad_err:#}"
+            matches!(classify(&bad_err), ConnectError::AuthRejected { .. }),
+            "expected auth rejection, got: {bad_err:#}"
         );
 
         // 3. Start full client in Hysteria2 + Global mode and test SOCKS5 TCP + UDP echo
@@ -747,7 +768,9 @@ mod tests {
         s5.read_exact(&mut greet).await.unwrap();
         assert_eq!(greet, [0x05, 0x00]);
         // CONNECT 1.1.1.1:80
-        s5.write_all(&[0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80]).await.unwrap();
+        s5.write_all(&[0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80])
+            .await
+            .unwrap();
         let mut rep = [0u8; 10];
         s5.read_exact(&mut rep).await.unwrap();
         assert_eq!(rep[1], 0x00);
@@ -761,7 +784,9 @@ mod tests {
         let mut ctrl = tokio::net::TcpStream::connect(free_port).await.unwrap();
         ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         ctrl.read_exact(&mut greet).await.unwrap();
-        ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
         ctrl.read_exact(&mut rep).await.unwrap();
         assert_eq!(rep[1], 0x00);
         let udp_relay = SocketAddr::new(
@@ -774,10 +799,11 @@ mod tests {
             pkt.extend_from_slice(msg);
             local_udp.send_to(&pkt, udp_relay).await.unwrap();
             let mut rbuf = [0u8; 256];
-            let (n, _) = tokio::time::timeout(Duration::from_secs(2), local_udp.recv_from(&mut rbuf))
-                .await
-                .expect("udp echo timeout")
-                .unwrap();
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(2), local_udp.recv_from(&mut rbuf))
+                    .await
+                    .expect("udp echo timeout")
+                    .unwrap();
             assert_eq!(&rbuf[10..n], msg);
         }
 

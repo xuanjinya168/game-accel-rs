@@ -104,12 +104,7 @@ pub fn soft_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette) -> egui::Respons
 }
 
 /// Compact inline action button (`26px` height) for node rows, filters, and log toolbar.
-pub fn chip_btn(
-    ui: &mut egui::Ui,
-    text: &str,
-    p: ThemePalette,
-    is_danger: bool,
-) -> egui::Response {
+pub fn chip_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette, is_danger: bool) -> egui::Response {
     let font = FontId::proportional(FONT_SM);
     let enabled = ui.is_enabled();
     let fg = if !enabled {
@@ -556,7 +551,10 @@ pub fn draw_rtt_sparkline(
     }
     painter.add(egui::Shape::mesh(mesh));
 
-    painter.add(egui::Shape::line(points.clone(), Stroke::new(2.0_f32, p.accent)));
+    painter.add(egui::Shape::line(
+        points.clone(),
+        Stroke::new(2.0_f32, p.accent),
+    ));
     if let Some(&last_pt) = points.last() {
         painter.circle_filled(
             last_pt,
@@ -567,7 +565,11 @@ pub fn draw_rtt_sparkline(
     }
 
     // Header legend (left) & live stats (right)
-    painter.circle_filled(Pos2::new(rect.left() + 14.0, rect.top() + 14.0), 3.2, p.accent);
+    painter.circle_filled(
+        Pos2::new(rect.left() + 14.0, rect.top() + 14.0),
+        3.2,
+        p.accent,
+    );
     painter.text(
         Pos2::new(rect.left() + 22.0, rect.top() + 14.0),
         egui::Align2::LEFT_CENTER,

@@ -108,7 +108,8 @@ impl Default for AppConfig {
             active_node_id: String::new(),
             nodes: Vec::new(),
             subscriptions: Vec::new(),
-            proxy_mode: ProxyMode::Tun,
+            // Works without admin rights; TUN asks for elevation when selected.
+            proxy_mode: ProxyMode::SystemProxy,
             listen_addr: "127.0.0.1:1080".to_string(),
             theme_mode: ThemeMode::Light,
             show_admin_menu: false,

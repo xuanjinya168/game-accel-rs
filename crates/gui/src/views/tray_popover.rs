@@ -60,9 +60,9 @@ impl GameAccelApp {
                 } else if self.tray_popover_ever_focused && focused == Some(false) {
                     close_popover = true;
                 }
-                if vctx.input(|i| {
-                    i.key_pressed(egui::Key::Escape) || i.viewport().close_requested()
-                }) {
+                if vctx
+                    .input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
+                {
                     close_popover = true;
                 }
 
@@ -166,7 +166,9 @@ impl GameAccelApp {
                                             let _ = attempt;
                                             ("重连中...", p.accent_text)
                                         }
-                                        (ConnState::Connecting, None) => ("连接中...", p.accent_text),
+                                        (ConnState::Connecting, None) => {
+                                            ("连接中...", p.accent_text)
+                                        }
                                         (ConnState::Disconnected, _) => ("未连接", p.text_muted),
                                     };
                                     ui.label(
@@ -189,9 +191,17 @@ impl GameAccelApp {
                                     );
 
                                     if let Some(ref node) = active_node {
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            pill(ui, node.protocol.label(), p.tag_bg, p.tag_text);
-                                        });
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                pill(
+                                                    ui,
+                                                    node.protocol.label(),
+                                                    p.tag_bg,
+                                                    p.tag_text,
+                                                );
+                                            },
+                                        );
                                     }
                                 });
 
@@ -383,7 +393,11 @@ impl GameAccelApp {
                                 ui.add_enabled_ui(node_count > 0 && !any_probing, |ui| {
                                     if chip_btn(
                                         ui,
-                                        if any_probing { "测速中..." } else { "全部测速" },
+                                        if any_probing {
+                                            "测速中..."
+                                        } else {
+                                            "全部测速"
+                                        },
                                         p,
                                         false,
                                     )
@@ -470,7 +484,8 @@ impl GameAccelApp {
                                         );
 
                                         // Left selection indicator dot
-                                        let dot_col = if is_active { p.accent } else { p.border_strong };
+                                        let dot_col =
+                                            if is_active { p.accent } else { p.border_strong };
                                         ui.painter().circle_filled(
                                             Pos2::new(rect.left() + 12.0, rect.center().y),
                                             3.0,
@@ -520,7 +535,8 @@ impl GameAccelApp {
                                         );
 
                                         if resp.clicked() && !is_active {
-                                            actions.push(PopoverAction::SelectNode(node.id.clone()));
+                                            actions
+                                                .push(PopoverAction::SelectNode(node.id.clone()));
                                         }
                                     }
                                 }
@@ -609,7 +625,10 @@ impl GameAccelApp {
                     self.show_toast("已复制本地代理地址");
                 }
                 PopoverAction::ForceQuit => {
-                    log_line("INFO", "从托盘面板执行彻底退出：清理连接、TUN 路由与系统代理...");
+                    log_line(
+                        "INFO",
+                        "从托盘面板执行彻底退出：清理连接、TUN 路由与系统代理...",
+                    );
                     self.stop_connect();
                     self.really_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -654,8 +673,10 @@ fn render_compact_segmented_row<T: Copy + PartialEq>(
 
             for (idx, &(val, lbl)) in options.iter().enumerate() {
                 let x = pill_rect.left() + pad + idx as f32 * (seg_w + gap);
-                let seg_rect =
-                    egui::Rect::from_min_size(Pos2::new(x, pill_rect.top() + pad), Vec2::new(seg_w, seg_h));
+                let seg_rect = egui::Rect::from_min_size(
+                    Pos2::new(x, pill_rect.top() + pad),
+                    Vec2::new(seg_w, seg_h),
+                );
                 let resp = ui.interact(seg_rect, ui.id().with((id_salt, idx)), Sense::click());
                 let active = current == val;
                 let fill = if active {

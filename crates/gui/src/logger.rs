@@ -21,10 +21,11 @@ pub fn init_logger() {
 
     // Simple size rotation (> 5 MB -> app.log.old)
     if let Ok(meta) = fs::metadata(&path)
-        && meta.len() > 5 * 1024 * 1024 {
-            let old = path.with_extension("log.old");
-            let _ = fs::rename(&path, old);
-        }
+        && meta.len() > 5 * 1024 * 1024
+    {
+        let old = path.with_extension("log.old");
+        let _ = fs::rename(&path, old);
+    }
 
     log_line("INFO", "========== GameAccel 启动 ==========");
 

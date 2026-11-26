@@ -2,14 +2,19 @@ use crate::logger;
 use crate::storage::{TrayStyle, config_dir, save_config};
 use crate::theme::{FONT_BODY, FONT_SM, ThemeMode, ThemePalette, apply_theme};
 use crate::widgets::{card_frame, hairline_divider, primary_btn, soft_btn, styled_input};
-use crate::{ConnState, GameAccelApp, NavTab, relaunch_as_admin};
+use crate::{ConnState, GameAccelApp, NavTab};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Layout, Pos2, RichText, ScrollArea, Sense, Stroke,
     Vec2,
 };
 
 impl GameAccelApp {
-    pub(super) fn render_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: ThemePalette) {
+    pub(super) fn render_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        p: ThemePalette,
+    ) {
         ScrollArea::vertical()
             .auto_shrink([false, true])
             .show(ui, |ui| {
@@ -60,7 +65,11 @@ impl GameAccelApp {
         ui.add_space(18.0);
 
         // Group 2: Appearance & Diagnostics
-        ui.label(RichText::new("外观与诊断").size(FONT_SM).color(p.text_muted));
+        ui.label(
+            RichText::new("外观与诊断")
+                .size(FONT_SM)
+                .color(p.text_muted),
+        );
         ui.add_space(6.0);
         card_frame(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -492,11 +501,7 @@ impl GameAccelApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if !self.is_admin && primary_btn(ui, "管理员重启", p).clicked() {
-                        if self.state != ConnState::Disconnected {
-                            self.stop_connect();
-                        }
-                        save_config(&self.cfg);
-                        relaunch_as_admin();
+                        self.restart_as_admin(false);
                     }
                     ui.add_enabled_ui(!self.cfg.nodes.is_empty(), |ui| {
                         if soft_btn(ui, "导出全部 gacl://", p).clicked() {
@@ -542,7 +547,9 @@ impl GameAccelApp {
                             .color(p.text_primary),
                     );
                     let (line, col) = match &status {
-                        UpdateStatus::Idle => ("从 GitHub Releases 获取新版本".to_string(), p.text_muted),
+                        UpdateStatus::Idle => {
+                            ("从 GitHub Releases 获取新版本".to_string(), p.text_muted)
+                        }
                         UpdateStatus::Checking => ("正在检查更新…".to_string(), p.text_muted),
                         UpdateStatus::UpToDate { checked_at } => {
                             (format!("已是最新版本（{checked_at} 检查）"), p.text_muted)
@@ -564,12 +571,19 @@ impl GameAccelApp {
                                     mb(*downloaded),
                                     mb(*t)
                                 ),
-                                _ => format!("正在下载 v{} … {:.1} MB", info.version, mb(*downloaded)),
+                                _ => format!(
+                                    "正在下载 v{} … {:.1} MB",
+                                    info.version,
+                                    mb(*downloaded)
+                                ),
                             };
                             (line, p.text_muted)
                         }
                         UpdateStatus::Ready { info, .. } => (
-                            format!("v{} 已下载并通过校验，安装时会自动关闭并重启程序", info.version),
+                            format!(
+                                "v{} 已下载并通过校验，安装时会自动关闭并重启程序",
+                                info.version
+                            ),
                             p.success_text,
                         ),
                         UpdateStatus::Failed(msg) => (msg.clone(), p.danger_text),
@@ -584,7 +598,8 @@ impl GameAccelApp {
                                 let rt = self.rt.clone();
                                 self.updater.download(&rt, ctx, info.clone());
                             }
-                            if !info.html_url.is_empty() && soft_btn(ui, "更新说明", p).clicked() {
+                            if !info.html_url.is_empty() && soft_btn(ui, "更新说明", p).clicked()
+                            {
                                 open_url(&info.html_url);
                             }
                         }
@@ -593,7 +608,8 @@ impl GameAccelApp {
                                 let installer = installer.clone();
                                 self.install_update(&installer);
                             }
-                            if !info.html_url.is_empty() && soft_btn(ui, "更新说明", p).clicked() {
+                            if !info.html_url.is_empty() && soft_btn(ui, "更新说明", p).clicked()
+                            {
                                 open_url(&info.html_url);
                             }
                         }

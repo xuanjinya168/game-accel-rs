@@ -1,11 +1,11 @@
 use crate::admin::{AdminApiErr, AdminEvent};
 use crate::logger;
-use crate::reconnect::is_retryable_connect_error;
 use crate::storage::{self, ProxyMode, SubscriptionEntry, save_config};
 use crate::sys_proxy;
 use crate::tray::TrayCmd;
 use crate::{AsyncEvent, ConnState, GameAccelApp, NavTab, ProbeState, relaunch_as_admin};
 use chrono::Local;
+use client::classify;
 use client::socks5::ClientStats;
 use client::{ClientOptions, probe_node_rtt, run_client_with_shutdown};
 use eframe::egui;
@@ -58,19 +58,18 @@ impl GameAccelApp {
         if self.cfg.proxy_mode == mode {
             return;
         }
+        // TUN needs admin rights: ask first, and only switch once the user agrees to restart
+        // elevated (the current mode stays untouched if they cancel).
+        if mode == ProxyMode::Tun && !self.is_admin {
+            self.tun_admin_prompt = Some(crate::TunAdminPrompt {
+                auto_connect: self.state != ConnState::Disconnected,
+                wake: true,
+            });
+            return;
+        }
         let prev = self.cfg.proxy_mode;
         self.cfg.proxy_mode = mode;
         save_config(&self.cfg);
-
-        // Switching to TUN without admin rights: clean up active session and elevate immediately
-        if mode == ProxyMode::Tun && !self.is_admin {
-            if self.state != ConnState::Disconnected {
-                self.stop_connect();
-            }
-            self.push_log("切换至 TUN 模式需要管理员权限，正在以管理员身份重启...");
-            relaunch_as_admin();
-            return;
-        }
 
         if self.state == ConnState::Disconnected {
             return;
@@ -131,9 +130,12 @@ impl GameAccelApp {
 
     /// (attempt, seconds until it fires) while a reconnect is pending or in flight.
     pub(crate) fn reconnect_status(&self) -> Option<(u32, u64)> {
-        self.reconnect
-            .in_progress()
-            .then(|| (self.reconnect.attempt(), self.reconnect.countdown(Instant::now())))
+        self.reconnect.in_progress().then(|| {
+            (
+                self.reconnect.attempt(),
+                self.reconnect.countdown(Instant::now()),
+            )
+        })
     }
 
     fn connect(&mut self, reconnect: bool) -> bool {
@@ -147,7 +149,10 @@ impl GameAccelApp {
 
         let server = node.server.trim().to_string();
         if let Err(e) = client::validate_server_addr(&server) {
-            let err = format!("节点地址格式无效：{}（{e}，支持 IP:端口 或 域名:端口）", node.server);
+            let err = format!(
+                "节点地址格式无效：{}（{e}，支持 IP:端口 或 域名:端口）",
+                node.server
+            );
             self.last_error = Some(err.clone());
             self.push_log(err);
             return false;
@@ -163,9 +168,17 @@ impl GameAccelApp {
         };
 
         if self.cfg.proxy_mode == ProxyMode::Tun && !self.is_admin {
-            let err = "TUN 模式需要管理员权限，请点击「以管理员身份重启」".to_string();
-            self.last_error = Some(err.clone());
-            self.push_log(err);
+            if reconnect {
+                let err = "TUN 模式需要管理员权限，请以管理员身份重启".to_string();
+                self.last_error = Some(err.clone());
+                self.push_log(err);
+            } else {
+                // User clicked connect: offer to restart elevated and connect automatically.
+                self.tun_admin_prompt = Some(crate::TunAdminPrompt {
+                    auto_connect: true,
+                    wake: true,
+                });
+            }
             return false;
         }
 
@@ -231,7 +244,7 @@ impl GameAccelApp {
             if let Err(e) =
                 run_client_with_shutdown(opts, stats, Some(raw_log_tx), shutdown_rx).await
             {
-                let _ = ev_tx.send(AsyncEvent::ConnError(session_id, format!("{e:#}")));
+                let _ = ev_tx.send(AsyncEvent::ConnError(session_id, classify(&e)));
             } else {
                 let _ = ev_tx.send(AsyncEvent::ConnEnded(session_id));
             }
@@ -244,9 +257,10 @@ impl GameAccelApp {
         self.pending_mode_reconnect = None;
         self.session_id = self.session_id.wrapping_add(1);
         if let Ok(mut guard) = self.shutdown_slot.lock()
-            && let Some(tx) = guard.take() {
-                let _ = tx.send(true);
-            }
+            && let Some(tx) = guard.take()
+        {
+            let _ = tx.send(true);
+        }
         self.state = ConnState::Disconnected;
         self.stats = Arc::new(ClientStats::default());
         self.rtt_history.clear();
@@ -353,9 +367,10 @@ impl GameAccelApp {
             }
         }
         if self.cfg.active_node().is_none()
-            && let Some(first) = self.cfg.nodes.first() {
-                self.cfg.active_node_id = first.id.clone();
-            }
+            && let Some(first) = self.cfg.nodes.first()
+        {
+            self.cfg.active_node_id = first.id.clone();
+        }
         save_config(&self.cfg);
         added
     }
@@ -381,7 +396,9 @@ impl GameAccelApp {
         } else {
             let attempts = self.reconnect.attempt();
             self.last_error = Some(format!("{reason}，自动重连 {attempts} 次仍未成功"));
-            self.push_log(format!("{reason}，已连续 {attempts} 次重连失败，停止自动重连"));
+            self.push_log(format!(
+                "{reason}，已连续 {attempts} 次重连失败，停止自动重连"
+            ));
             self.show_toast("自动重连失败，请检查节点后手动重连");
             self.stop_connect();
         }
@@ -395,23 +412,24 @@ impl GameAccelApp {
                     if sid != self.session_id {
                         continue;
                     }
-                    self.last_error = Some(err.clone());
-                    if is_retryable_connect_error(&err) {
+                    let msg = err.message();
+                    self.last_error = Some(msg.to_string());
+                    if err.is_retryable() {
                         match self.state {
                             ConnState::Connected => {
-                                self.on_tunnel_lost(&format!("连接中断: {err}"));
+                                self.on_tunnel_lost(&format!("连接中断: {msg}"));
                             }
                             ConnState::Connecting if self.reconnect.is_waiting() => {
                                 // Already scheduled by the stats watcher for this same failure
-                                self.push_log(format!("连接中断: {err}"));
+                                self.push_log(format!("连接中断: {msg}"));
                             }
                             ConnState::Connecting if self.reconnect.in_progress() => {
-                                self.on_tunnel_lost(&format!("重连失败: {err}"));
+                                self.on_tunnel_lost(&format!("重连失败: {msg}"));
                             }
-                            _ => self.fail_connect(&err),
+                            _ => self.fail_connect(msg),
                         }
                     } else {
-                        self.fail_connect(&err);
+                        self.fail_connect(msg);
                     }
                 }
                 AsyncEvent::ConnEnded(sid) => {
@@ -641,7 +659,9 @@ impl GameAccelApp {
 
         if self.active_tab == NavTab::Admin
             && !self.admin.busy
-            && self.admin.is_logged_in_for(&self.cfg.active_admin_server_id)
+            && self
+                .admin
+                .is_logged_in_for(&self.cfg.active_admin_server_id)
             && self
                 .admin
                 .last_refresh
@@ -650,7 +670,6 @@ impl GameAccelApp {
             self.admin_refresh();
         }
     }
-
 }
 
 impl GameAccelApp {
@@ -663,7 +682,10 @@ impl GameAccelApp {
             && self.update_notified.as_deref() != Some(info.version.as_str())
         {
             self.update_notified = Some(info.version.clone());
-            self.push_log(format!("发现新版本 v{}，可在「设置 → 软件更新」中一键升级", info.version));
+            self.push_log(format!(
+                "发现新版本 v{}，可在「设置 → 软件更新」中一键升级",
+                info.version
+            ));
             self.show_toast(format!("发现新版本 v{}，可在设置中一键更新", info.version));
         }
     }
@@ -674,7 +696,7 @@ impl GameAccelApp {
             self.stop_connect();
         }
         save_config(&self.cfg);
-        match crate::updater::launch_installer(installer) {
+        match crate::updater::launch_installer(installer, self.is_admin) {
             Ok(()) => {
                 logger::log_line("INFO", "已启动新版本安装程序，退出当前版本以完成升级");
                 self.really_quit = true;
@@ -688,6 +710,98 @@ impl GameAccelApp {
                 self.push_log(format!("{e:#}"));
                 self.show_toast(format!("{e:#}"));
             }
+        }
+    }
+}
+
+impl GameAccelApp {
+    /// Restart this app elevated (UAC). The current session is only torn down once the
+    /// elevated instance has actually been started, so cancelling UAC changes nothing.
+    pub(crate) fn restart_as_admin(&mut self, auto_connect: bool) {
+        save_config(&self.cfg);
+        match relaunch_as_admin(if auto_connect { "--connect" } else { "" }) {
+            Ok(()) => {
+                logger::log_line("INFO", "已以管理员身份启动新实例，当前实例退出");
+                if self.state != ConnState::Disconnected {
+                    self.stop_connect();
+                }
+                self.really_quit = true;
+                std::thread::spawn(|| {
+                    // Let async teardown (listener, routes, system proxy) finish first.
+                    std::thread::sleep(Duration::from_millis(400));
+                    crate::hard_exit(0);
+                });
+            }
+            Err(e) => {
+                self.push_log(format!("以管理员身份重启：{e}"));
+                self.show_toast(e);
+            }
+        }
+    }
+
+    /// "TUN needs admin — restart elevated?" confirmation dialog.
+    pub(crate) fn render_tun_admin_prompt(&mut self, ctx: &egui::Context, p: crate::ThemePalette) {
+        use crate::widgets::{modal_dialog, primary_btn, soft_btn};
+        use eframe::egui::{Align, Layout, RichText};
+
+        let Some(prompt) = self.tun_admin_prompt.as_mut() else {
+            return;
+        };
+        if prompt.wake {
+            prompt.wake = false;
+            self.window_hidden_to_tray = false;
+            self.tray_popover_open = false;
+            crate::tray::wake_window(ctx);
+        }
+        let auto_connect = prompt.auto_connect;
+
+        let mut confirm = false;
+        let mut cancel = false;
+        let dismissed = modal_dialog(
+            ctx,
+            "tun_admin_prompt",
+            "TUN 模式需要管理员权限",
+            420.0,
+            p,
+            |ui| {
+                ui.label(
+                    RichText::new(
+                        "TUN 模式会创建虚拟网卡接管全局 TCP / UDP 流量，需要以管理员身份运行。",
+                    )
+                    .size(crate::theme::FONT_SM)
+                    .color(p.text_secondary),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(if auto_connect {
+                        "是否以管理员身份重新启动 GameAccel？重启后将自动开启 TUN 加速。"
+                    } else {
+                        "是否以管理员身份重新启动 GameAccel？"
+                    })
+                    .size(crate::theme::FONT_SM)
+                    .color(p.text_secondary),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if primary_btn(ui, "以管理员身份重启", p).clicked() {
+                            confirm = true;
+                        }
+                        if soft_btn(ui, "取消", p).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if confirm {
+            self.tun_admin_prompt = None;
+            self.cfg.proxy_mode = ProxyMode::Tun;
+            self.restart_as_admin(auto_connect);
+        } else if cancel || dismissed {
+            self.tun_admin_prompt = None;
+            self.show_toast("已取消，继续使用当前模式");
         }
     }
 }

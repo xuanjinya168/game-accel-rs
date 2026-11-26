@@ -37,17 +37,23 @@ impl DirectDialer {
         } else {
             TcpSocket::new_v6()?
         };
-        if addr.is_ipv4() && !addr.ip().is_loopback()
-            && let Some(idx) = self.interface() {
-                pin_v4(&sock, idx)?;
-            }
+        if addr.is_ipv4()
+            && !addr.ip().is_loopback()
+            && let Some(idx) = self.interface()
+        {
+            pin_v4(&sock, idx)?;
+        }
         let stream = sock.connect(addr).await?;
         let _ = stream.set_nodelay(true);
         Ok(stream)
     }
 
     /// Resolve (OS resolver) and connect within `total`, trying each address in turn.
-    pub async fn connect_target(&self, target: &TargetAddr, total: Duration) -> io::Result<TcpStream> {
+    pub async fn connect_target(
+        &self,
+        target: &TargetAddr,
+        total: Duration,
+    ) -> io::Result<TcpStream> {
         let deadline = Instant::now() + total;
         let addrs: Vec<SocketAddr> = match target {
             TargetAddr::Ip(a) => vec![*a],
@@ -66,7 +72,9 @@ impl DirectDialer {
             }
             let left = (addrs.len() - i) as u32;
             let budget = if left > 1 {
-                (remaining / left).max(Duration::from_secs(2)).min(remaining)
+                (remaining / left)
+                    .max(Duration::from_secs(2))
+                    .min(remaining)
             } else {
                 remaining
             };
@@ -74,7 +82,10 @@ impl DirectDialer {
                 Ok(Ok(s)) => return Ok(s),
                 Ok(Err(e)) => last_err = Some(e),
                 Err(_) => {
-                    last_err = Some(io::Error::new(io::ErrorKind::TimedOut, format!("{addr} timed out")))
+                    last_err = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{addr} timed out"),
+                    ))
                 }
             }
         }

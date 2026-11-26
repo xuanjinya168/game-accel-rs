@@ -81,7 +81,11 @@ impl GameAccelApp {
                             && let Some(end) = line.find("] ")
                         {
                             let (ts, rest) = line.split_at(end + 2);
-                            job.append(ts, 0.0, egui::TextFormat::simple(font.clone(), p.text_muted));
+                            job.append(
+                                ts,
+                                0.0,
+                                egui::TextFormat::simple(font.clone(), p.text_muted),
+                            );
                             job.append(rest, 0.0, egui::TextFormat::simple(font, color));
                         } else {
                             job.append(line, 0.0, egui::TextFormat::simple(font, color));
@@ -91,5 +95,4 @@ impl GameAccelApp {
                 });
         });
     }
-
 }

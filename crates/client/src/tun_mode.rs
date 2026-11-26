@@ -65,7 +65,12 @@ fn run_hidden(program: &str, args: &[&str]) -> Result<String> {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("{program} {:?} failed: {} {}", args, stdout.trim(), stderr.trim());
+        bail!(
+            "{program} {:?} failed: {} {}",
+            args,
+            stdout.trim(),
+            stderr.trim()
+        );
     }
     Ok(stdout)
 }
@@ -77,11 +82,15 @@ fn detect_physical_gateway() -> Result<Ipv4Addr> {
     for line in out.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
         // Typical row: 0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.100  25
-        if cols.len() >= 4 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0"
+        if cols.len() >= 4
+            && cols[0] == "0.0.0.0"
+            && cols[1] == "0.0.0.0"
             && let Ok(gw) = cols[2].parse::<Ipv4Addr>()
-                && gw != TUN_GW && !gw.is_unspecified() {
-                    return Ok(gw);
-                }
+            && gw != TUN_GW
+            && !gw.is_unspecified()
+        {
+            return Ok(gw);
+        }
     }
     bail!("无法自动检测物理默认网关，请检查网络连接")
 }
@@ -106,7 +115,15 @@ impl RouteGuard {
                 let _ = run_hidden("route", &["delete", &ip_str]);
                 run_hidden(
                     "route",
-                    &["add", &ip_str, "mask", "255.255.255.255", &gw_str, "metric", "1"],
+                    &[
+                        "add",
+                        &ip_str,
+                        "mask",
+                        "255.255.255.255",
+                        &gw_str,
+                        "metric",
+                        "1",
+                    ],
                 )
                 .context("添加服务器直连防回环路由失败")?;
                 Some(v4)
@@ -300,12 +317,13 @@ pub async fn run_tun_mode(
     {
         builder = builder.mtu_v4(TUN_MTU);
         if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent() {
-                let candidate = dir.join("wintun.dll");
-                if candidate.is_file() {
-                    builder = builder.wintun_file(candidate.to_string_lossy().into_owned());
-                }
+            && let Some(dir) = exe.parent()
+        {
+            let candidate = dir.join("wintun.dll");
+            if candidate.is_file() {
+                builder = builder.wintun_file(candidate.to_string_lossy().into_owned());
             }
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -430,8 +448,7 @@ pub async fn run_tun_mode(
     let (udp_tx_task, udp_rx_task) = if let Some(udp_sock) = udp_socket {
         let (mut udp_read, mut udp_write) = udp_sock.split();
         // Unified return channel into TUN netstack: (payload, remote_src, local_dst, count_rx)
-        let (out_tx, mut out_rx) =
-            mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr, bool)>(1024);
+        let (out_tx, mut out_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr, bool)>(1024);
 
         let conn_out = udp_conn.clone();
         let pacer_tx = pacer.clone();
@@ -529,13 +546,9 @@ pub async fn run_tun_mode(
                     existing.clone()
                 } else {
                     let (f_tx, mut f_rx) = mpsc::channel::<UdpFrame>(256);
-                    let Some(fid) = reserve_flow_id(
-                        &next_flow,
-                        &dispatch,
-                        f_tx,
-                        TUN_FLOW_MIN,
-                        TUN_FLOW_MAX,
-                    ) else {
+                    let Some(fid) =
+                        reserve_flow_id(&next_flow, &dispatch, f_tx, TUN_FLOW_MIN, TUN_FLOW_MAX)
+                    else {
                         warn!("TUN UDP flow_id space exhausted, dropping packet from {local_src}");
                         continue;
                     };
@@ -547,7 +560,8 @@ pub async fn run_tun_mode(
                     let rx_handle = tokio::spawn(async move {
                         let mut dedup = DedupWindow::new();
                         while let Some(frame) = f_rx.recv().await {
-                            if protocol == NodeProtocol::Gacl && !dedup.check_and_insert(frame.seq) {
+                            if protocol == NodeProtocol::Gacl && !dedup.check_and_insert(frame.seq)
+                            {
                                 continue;
                             }
                             last_active_rx.store(now_secs(), Ordering::Relaxed);
@@ -584,8 +598,10 @@ pub async fn run_tun_mode(
                 let payload_bytes = Bytes::from(payload);
 
                 // Enable game dual-send only for small non-DNS, non-QUIC-443 UDP packets
-                let is_game_pkt =
-                    game_dup && payload_len < 200 && remote_dst.port() != 53 && remote_dst.port() != 443;
+                let is_game_pkt = game_dup
+                    && payload_len < 200
+                    && remote_dst.port() != 53
+                    && remote_dst.port() != 443;
 
                 if !send_proxy_udp_packet(
                     protocol,
@@ -676,10 +692,12 @@ async fn handle_tun_tcp(
         && !router.has_dns_hint(dst.ip())
     {
         let mut buf = vec![0u8; 4096];
-        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await
-            && n > 0 {
-                first_chunk.extend_from_slice(&buf[..n]);
-            }
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await
+            && n > 0
+        {
+            first_chunk.extend_from_slice(&buf[..n]);
+        }
         if let Some((_, host)) = protocol::sniff::sniff_first_packet(&first_chunk) {
             router.decide(&TargetAddr::Domain(host, dst.port())).await
         } else {
@@ -690,13 +708,11 @@ async fn handle_tun_tcp(
     };
 
     if route == Route::Direct {
-        let mut upstream = tokio::time::timeout(
-            Duration::from_secs(10),
-            router.dialer.connect_tcp(dst),
-        )
-        .await
-        .context("direct tun tcp timeout")?
-        .with_context(|| format!("direct tun tcp connect {dst}"))?;
+        let mut upstream =
+            tokio::time::timeout(Duration::from_secs(10), router.dialer.connect_tcp(dst))
+                .await
+                .context("direct tun tcp timeout")?
+                .with_context(|| format!("direct tun tcp connect {dst}"))?;
         if !first_chunk.is_empty() {
             upstream.write_all(&first_chunk).await?;
         }

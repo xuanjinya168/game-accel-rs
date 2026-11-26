@@ -164,7 +164,12 @@ impl GameAccelApp {
         });
     }
 
-    pub(crate) fn admin_post_link_action(&mut self, id: String, action: &'static str, ok_msg: &str) {
+    pub(crate) fn admin_post_link_action(
+        &mut self,
+        id: String,
+        action: &'static str,
+        ok_msg: &str,
+    ) {
         let Some(server) = self.cfg.active_admin_server().cloned() else {
             return;
         };
@@ -207,5 +212,4 @@ impl GameAccelApp {
             }));
         });
     }
-
 }

@@ -1,7 +1,5 @@
 use std::time::{Duration, Instant};
 
-use client::{ERR_AUTH_REJECTED, ERR_PORT_IN_USE};
-
 /// Backoff between consecutive reconnect attempts: 1, 2, 4, 8, 16, then 30s.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Give up after this many consecutive failed attempts (~4.5 minutes of trying).
@@ -83,12 +81,6 @@ impl ReconnectPolicy {
             _ => false,
         }
     }
-}
-
-/// Only failures that can resolve on their own (server restart, network switch, packet
-/// loss) are worth retrying; a rejected token or an occupied local port never will.
-pub(crate) fn is_retryable_connect_error(err: &str) -> bool {
-    !err.contains(ERR_AUTH_REJECTED) && !err.contains(ERR_PORT_IN_USE)
 }
 
 #[cfg(test)]
@@ -179,21 +171,11 @@ mod tests {
         assert_eq!(p.countdown(at(base, 1)), 0);
         assert!(p.take_due(at(base, 1)));
         assert!(!p.is_waiting());
-        assert!(p.in_progress(), "attempt in flight is still part of the streak");
+        assert!(
+            p.in_progress(),
+            "attempt in flight is still part of the streak"
+        );
         p.reset();
         assert!(!p.in_progress());
-    }
-
-    #[test]
-    fn only_transient_errors_are_retried() {
-        assert!(is_retryable_connect_error(
-            "QUIC 握手或鉴权超时（请检查网络、UDP 端口）"
-        ));
-        assert!(!is_retryable_connect_error(
-            "服务端拒绝鉴权 (code=1)"
-        ));
-        assert!(!is_retryable_connect_error(
-            "本地端口 127.0.0.1:7890 被占用，无法监听聚合代理"
-        ));
     }
 }

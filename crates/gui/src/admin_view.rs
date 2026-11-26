@@ -146,9 +146,7 @@ impl GameAccelApp {
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .checkbox(&mut ed.via_tunnel, "经加密隧道访问")
-                        .changed()
+                    if ui.checkbox(&mut ed.via_tunnel, "经加密隧道访问").changed()
                         && ed.via_tunnel
                         && (ed.base_url.trim().is_empty() || ed.base_url.trim() == "https://")
                     {
@@ -267,7 +265,14 @@ impl GameAccelApp {
                             .truncate(),
                     );
                     let w0 = cols[0].available_width();
-                    styled_input(&mut cols[0], &mut self.admin.login_user, "admin", w0, false, p);
+                    styled_input(
+                        &mut cols[0],
+                        &mut self.admin.login_user,
+                        "admin",
+                        w0,
+                        false,
+                        p,
+                    );
                     cols[1].add(
                         egui::Label::new(RichText::new("密码").size(FONT_XS).color(p.text_muted))
                             .truncate(),
@@ -351,8 +356,10 @@ impl GameAccelApp {
                         ui.set_width(ui.available_width());
                         ui.set_min_height(72.0);
                         ui.add(
-                            egui::Label::new(RichText::new(label).size(FONT_XS).color(p.text_muted))
-                                .truncate(),
+                            egui::Label::new(
+                                RichText::new(label).size(FONT_XS).color(p.text_muted),
+                            )
+                            .truncate(),
                         );
                         ui.add_space(4.0);
                         ui.add(
@@ -435,9 +442,7 @@ impl GameAccelApp {
 
                             cols[2].add(
                                 egui::Label::new(
-                                    RichText::new("到期日期")
-                                        .size(FONT_XS)
-                                        .color(p.text_muted),
+                                    RichText::new("到期日期").size(FONT_XS).color(p.text_muted),
                                 )
                                 .truncate(),
                             );
@@ -585,7 +590,8 @@ impl GameAccelApp {
                                 && gb > 0.0
                             {
                                 let pct = (used as f64 / (gb * 1024.0 * 1024.0 * 1024.0))
-                                    .clamp(0.0, 1.0) as f32;
+                                    .clamp(0.0, 1.0)
+                                    as f32;
                                 ui.add_space(4.0);
                                 let (bar_rect, _) = ui.allocate_exact_size(
                                     Vec2::new(220.0_f32.min(ui.available_width()), 5.0),
@@ -616,9 +622,13 @@ impl GameAccelApp {
                                     ctx.copy_text(l.share_uri.clone());
                                     self.show_toast("已复制 gacl:// 分享链接");
                                 }
-                                if !l.hy2_uri.is_empty() && chip_btn(ui, "复制 hy2://", p, false).clicked() {
+                                if !l.hy2_uri.is_empty()
+                                    && chip_btn(ui, "复制 hy2://", p, false).clicked()
+                                {
                                     ctx.copy_text(l.hy2_uri.clone());
-                                    self.show_toast("已复制 hysteria2:// 链接（小火箭/Clash 通用）");
+                                    self.show_toast(
+                                        "已复制 hysteria2:// 链接（小火箭/Clash 通用）",
+                                    );
                                 }
                                 if chip_btn(ui, "复制订阅", p, false).clicked() {
                                     ctx.copy_text(format!("{sub_base}/sub/{}", l.token));
@@ -636,7 +646,8 @@ impl GameAccelApp {
                                 let confirm_reset = self.admin.confirm_action.as_ref()
                                     == Some(&("reset-token".to_string(), l.id.clone()));
                                 if confirm_reset {
-                                    if accent_chip_btn(ui, "确认重置密钥", p, true).clicked() {
+                                    if accent_chip_btn(ui, "确认重置密钥", p, true).clicked()
+                                    {
                                         self.admin_post_link_action(
                                             l.id.clone(),
                                             "reset-token",

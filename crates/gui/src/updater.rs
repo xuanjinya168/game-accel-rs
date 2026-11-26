@@ -82,13 +82,21 @@ impl Updater {
     }
 
     /// Run the periodic background check if it's due. Returns quickly when not due.
-    pub fn tick_auto_check(&mut self, enabled: bool, rt: &tokio::runtime::Runtime, ctx: &egui::Context) {
+    pub fn tick_auto_check(
+        &mut self,
+        enabled: bool,
+        rt: &tokio::runtime::Runtime,
+        ctx: &egui::Context,
+    ) {
         if !enabled || Instant::now() < self.next_auto_check {
             return;
         }
         self.next_auto_check = Instant::now() + AUTO_CHECK_INTERVAL;
         // Don't clobber a pending download / ready installer / visible result.
-        if matches!(self.status(), UpdateStatus::Idle | UpdateStatus::UpToDate { .. }) {
+        if matches!(
+            self.status(),
+            UpdateStatus::Idle | UpdateStatus::UpToDate { .. }
+        ) {
             self.check(rt, ctx, true);
         }
     }
@@ -105,7 +113,10 @@ impl Updater {
         rt.spawn(async move {
             let new = match fetch_latest().await {
                 Ok(Some(info)) => {
-                    log_line("INFO", &format!("发现新版本 v{}（当前 v{CURRENT_VERSION}）", info.version));
+                    log_line(
+                        "INFO",
+                        &format!("发现新版本 v{}（当前 v{CURRENT_VERSION}）", info.version),
+                    );
                     UpdateStatus::Available(info)
                 }
                 Ok(None) => UpdateStatus::UpToDate {
@@ -143,7 +154,10 @@ impl Updater {
         rt.spawn(async move {
             let new = match download_and_verify(&info, &status, &ctx).await {
                 Ok(installer) => {
-                    log_line("INFO", &format!("新版本安装包已下载并校验: {}", installer.display()));
+                    log_line(
+                        "INFO",
+                        &format!("新版本安装包已下载并校验: {}", installer.display()),
+                    );
                     UpdateStatus::Ready { info, installer }
                 }
                 Err(e) => {
@@ -184,7 +198,9 @@ async fn fetch_latest() -> Result<Option<ReleaseInfo>> {
     let body = resp.bytes().await.context("读取 GitHub 响应失败")?;
     let v: serde_json::Value = serde_json::from_slice(&body).context("解析 GitHub 响应失败")?;
 
-    let tag = v["tag_name"].as_str().ok_or_else(|| anyhow!("Release 缺少 tag_name"))?;
+    let tag = v["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Release 缺少 tag_name"))?;
     let version = tag.trim_start_matches('v').to_string();
     if !is_newer(&version, CURRENT_VERSION) {
         return Ok(None);
@@ -233,7 +249,9 @@ async fn download_and_verify(
         .ok_or_else(|| anyhow!("SHA256SUMS.txt 中没有 {} 的校验值", info.installer_name))?;
 
     let dir = std::env::temp_dir().join("game-accel-update");
-    tokio::fs::create_dir_all(&dir).await.context("创建临时目录失败")?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .context("创建临时目录失败")?;
     let final_path = dir.join(&info.installer_name);
     let part_path = dir.join(format!("{}.part", info.installer_name));
 
@@ -296,8 +314,9 @@ async fn download_and_verify(
 }
 
 /// Run the downloaded installer silently. Inno Setup closes this app (Restart Manager),
-/// upgrades the install in place and relaunches the new version.
-pub fn launch_installer(installer: &std::path::Path) -> Result<()> {
+/// upgrades the install in place and relaunches the new version — elevated only if this
+/// instance was elevated (`relaunch_admin`), otherwise as the normal user.
+pub fn launch_installer(installer: &std::path::Path, relaunch_admin: bool) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -315,7 +334,11 @@ pub fn launch_installer(installer: &std::path::Path) -> Result<()> {
         let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
         let op = wide("open".as_ref());
         let file = wide(installer.as_os_str());
-        let params = wide("/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS".as_ref());
+        let mut args = "/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS".to_string();
+        if relaunch_admin {
+            args.push_str(" /relaunchadmin=1");
+        }
+        let params = wide(args.as_ref());
         const SW_SHOWNORMAL: i32 = 1;
         // ShellExecute (not CreateProcess) so a UAC prompt is shown when we're not elevated.
         let rc = unsafe {
@@ -335,7 +358,7 @@ pub fn launch_installer(installer: &std::path::Path) -> Result<()> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = installer;
+        let _ = (installer, relaunch_admin);
         bail!("仅支持 Windows 自动更新")
     }
 }

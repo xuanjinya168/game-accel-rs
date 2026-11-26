@@ -88,9 +88,39 @@ pub fn enable_system_proxy(proxy_addr: &str) -> Result<()> {
         {
             *guard = Some(snapshot_current_proxy());
         }
-        run_reg(&["add", REG_KEY, "/v", "ProxyServer", "/t", "REG_SZ", "/d", proxy_addr, "/f"])?;
-        run_reg(&["add", REG_KEY, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", BYPASS_LIST, "/f"])?;
-        run_reg(&["add", REG_KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"])?;
+        run_reg(&[
+            "add",
+            REG_KEY,
+            "/v",
+            "ProxyServer",
+            "/t",
+            "REG_SZ",
+            "/d",
+            proxy_addr,
+            "/f",
+        ])?;
+        run_reg(&[
+            "add",
+            REG_KEY,
+            "/v",
+            "ProxyOverride",
+            "/t",
+            "REG_SZ",
+            "/d",
+            BYPASS_LIST,
+            "/f",
+        ])?;
+        run_reg(&[
+            "add",
+            REG_KEY,
+            "/v",
+            "ProxyEnable",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            "1",
+            "/f",
+        ])?;
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -106,19 +136,59 @@ pub fn disable_system_proxy() -> Result<()> {
         let prev = SAVED_PROXY.lock().ok().and_then(|mut g| g.take());
         if let Some(p) = prev {
             if let Some(srv) = &p.server {
-                let _ = run_reg(&["add", REG_KEY, "/v", "ProxyServer", "/t", "REG_SZ", "/d", srv, "/f"]);
+                let _ = run_reg(&[
+                    "add",
+                    REG_KEY,
+                    "/v",
+                    "ProxyServer",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    srv,
+                    "/f",
+                ]);
             } else {
                 let _ = run_reg(&["delete", REG_KEY, "/v", "ProxyServer", "/f"]);
             }
             if let Some(ov) = &p.override_list {
-                let _ = run_reg(&["add", REG_KEY, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", ov, "/f"]);
+                let _ = run_reg(&[
+                    "add",
+                    REG_KEY,
+                    "/v",
+                    "ProxyOverride",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    ov,
+                    "/f",
+                ]);
             } else {
                 let _ = run_reg(&["delete", REG_KEY, "/v", "ProxyOverride", "/f"]);
             }
             let en = if p.enabled { "1" } else { "0" };
-            run_reg(&["add", REG_KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", en, "/f"])?;
+            run_reg(&[
+                "add",
+                REG_KEY,
+                "/v",
+                "ProxyEnable",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                en,
+                "/f",
+            ])?;
         } else {
-            run_reg(&["add", REG_KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"])?;
+            run_reg(&[
+                "add",
+                REG_KEY,
+                "/v",
+                "ProxyEnable",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "0",
+                "/f",
+            ])?;
         }
     }
     Ok(())

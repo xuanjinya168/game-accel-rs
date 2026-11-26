@@ -32,7 +32,7 @@ jobs:
         shell: pwsh
         run: |
           cargo test -p protocol -p client -p server
-          cargo test -p game-accel-gui --no-run
+          cargo test -p game-accel-gui
 
       - name: Package Windows portable zip and Inno Setup installer
         shell: pwsh

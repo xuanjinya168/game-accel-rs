@@ -20,6 +20,28 @@ const MENU_RADIUS: f32 = 8.0;
 /// Repaint interval for the floating card's breathing LED animation (~20fps).
 pub(crate) const PILL_ANIM_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Map combined throughput to LED activity `0..=1` on a log scale:
+/// ≤ 1 KB/s → 0 (calm), 10 MB/s and up → 1 (fast).
+fn led_activity(bytes_per_sec: f64) -> f32 {
+    let kb = bytes_per_sec.max(0.0) / 1024.0;
+    if kb <= 1.0 {
+        0.0
+    } else {
+        (kb.log10() / 4.0).clamp(0.0, 1.0) as f32
+    }
+}
+
+impl GameAccelApp {
+    /// LED repaint interval: bump to ~30fps when it's breathing fast so it stays smooth.
+    pub(crate) fn pill_anim_interval(&self) -> Duration {
+        if self.floating_pill_led_k > 0.5 {
+            Duration::from_millis(33)
+        } else {
+            PILL_ANIM_INTERVAL
+        }
+    }
+}
+
 enum CardMenuAction {
     ToggleTopmost,
     ToggleFullscreenHide,
@@ -70,6 +92,25 @@ impl GameAccelApp {
         });
 
         let now_secs = ctx.input(|i| i.time);
+
+        // Speed-reactive breathing LED. Advance phases by `dt * rate` instead of computing
+        // `sin(t * rate)`, so a changing rate speeds the LED up/down smoothly with no jump.
+        let dt = (now_secs - self.floating_pill_led_last).clamp(0.0, 0.25);
+        self.floating_pill_led_last = now_secs;
+        let target_k = led_activity(self.tx_speed_bps + self.rx_speed_bps);
+        // Ease activity over ~0.6s so the 1s speed samples don't make the rate step.
+        let ease = 1.0 - (-dt / 0.6).exp();
+        self.floating_pill_led_k += (target_k - self.floating_pill_led_k) * ease as f32;
+        let led_k = self.floating_pill_led_k as f64;
+        // Breathing: ~3.1s period when idle -> ~0.7s at >= 10 MB/s.
+        self.floating_pill_led_phase =
+            (self.floating_pill_led_phase + dt * (2.0 + 7.0 * led_k)) % std::f64::consts::TAU;
+        // Ripple ring: ~2.2s -> ~0.7s.
+        self.floating_pill_ring_phase =
+            (self.floating_pill_ring_phase + dt * (0.45 + 0.95 * led_k)).fract();
+        let led_phase = self.floating_pill_led_phase;
+        let ring_phase = self.floating_pill_ring_phase;
+        let anim_interval = self.pill_anim_interval();
         let force_raise = if self.floating_pill_raise_frames > 0 {
             self.floating_pill_raise_frames -= 1;
             ctx.request_repaint_after(Duration::from_millis(33));
@@ -107,10 +148,10 @@ impl GameAccelApp {
                     latest_outer_pos = Some([outer.min.x, outer.min.y]);
                 }
 
-                // Drive the breathing LED animation when visible & active. 20fps is visually
-                // indistinguishable for this slow sine and costs ~1/3 less than 30fps.
+                // Drive the breathing LED animation when visible & active (20fps, 30fps when
+                // the LED is breathing fast under heavy traffic).
                 if !fs_hidden && self.state != ConnState::Disconnected {
-                    vctx.request_repaint_after(PILL_ANIM_INTERVAL);
+                    vctx.request_repaint_after(anim_interval);
                 }
 
                 egui::CentralPanel::default()
@@ -178,8 +219,8 @@ impl GameAccelApp {
                         let led_center = Pos2::new(rect.left() + 13.0, cy);
                         match self.state {
                             ConnState::Connected => {
-                                let wave = ((now_secs * 2.8).sin() * 0.5 + 0.5) as f32;
-                                let ring_t = ((now_secs * 0.55).fract()) as f32;
+                                let wave = (led_phase.sin() * 0.5 + 0.5) as f32;
+                                let ring_t = ring_phase as f32;
 
                                 let ripple_r = 3.2 + ring_t * 6.0;
                                 let ripple_alpha = ((1.0 - ring_t).powi(2) * 165.0) as u8;
@@ -642,7 +683,8 @@ static MENU_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsiz
 
 /// Whether the taskbar guard should keep the card above the taskbar.
 #[cfg(target_os = "windows")]
-static KEEP_ABOVE_TASKBAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KEEP_ABOVE_TASKBAR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn set_taskbar_guard(enabled: bool) {
     #[cfg(target_os = "windows")]
@@ -1335,5 +1377,21 @@ fn move_floating_card_physical(ppp: f32, x: i32, y: i32) {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (ppp, x, y);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::led_activity;
+
+    #[test]
+    fn led_activity_scale() {
+        assert_eq!(led_activity(0.0), 0.0);
+        assert_eq!(led_activity(1024.0), 0.0);
+        let k_100k = led_activity(100.0 * 1024.0); // ~0.5
+        assert!((0.45..0.55).contains(&k_100k), "{k_100k}");
+        assert_eq!(led_activity(10.0 * 1024.0 * 1024.0), 1.0);
+        assert_eq!(led_activity(1e12), 1.0);
+        assert!(led_activity(10.0 * 1024.0) < led_activity(1024.0 * 1024.0));
     }
 }

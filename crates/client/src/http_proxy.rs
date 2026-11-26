@@ -34,7 +34,8 @@ pub(crate) async fn handle_http_proxy_client(
         }
     };
 
-    let header_str = std::str::from_utf8(&buf[..header_end]).context("invalid http header utf-8")?;
+    let header_str =
+        std::str::from_utf8(&buf[..header_end]).context("invalid http header utf-8")?;
     let mut lines = header_str.split("\r\n");
     let request_line = lines.next().context("empty http request")?;
     let mut parts = request_line.split_whitespace();
@@ -89,7 +90,11 @@ pub(crate) async fn handle_http_proxy_client(
         };
 
     if router.decide(&target).await == Route::Direct {
-        let fail = if ok_reply.is_some() { Some(BAD_GATEWAY) } else { fail_reply };
+        let fail = if ok_reply.is_some() {
+            Some(BAD_GATEWAY)
+        } else {
+            fail_reply
+        };
         return relay_direct(&router, client, &target, ok_reply, &upstream_preamble, fail).await;
     }
 

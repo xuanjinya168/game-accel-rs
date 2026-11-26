@@ -107,18 +107,36 @@ pub fn draw_nav_icon(painter: &Painter, center: Pos2, kind: u8, color: Color32) 
         }
         // 4: Server Admin (dual stacked server rack units with status LEDs)
         4 => {
-            let top = Rect::from_center_size(Pos2::new(center.x, center.y - 3.2), Vec2::new(12.4, 4.6));
-            let bot = Rect::from_center_size(Pos2::new(center.x, center.y + 3.2), Vec2::new(12.4, 4.6));
-            painter.rect_stroke(top, CornerRadius::same(2), stroke, eframe::egui::StrokeKind::Middle);
-            painter.rect_stroke(bot, CornerRadius::same(2), stroke, eframe::egui::StrokeKind::Middle);
+            let top =
+                Rect::from_center_size(Pos2::new(center.x, center.y - 3.2), Vec2::new(12.4, 4.6));
+            let bot =
+                Rect::from_center_size(Pos2::new(center.x, center.y + 3.2), Vec2::new(12.4, 4.6));
+            painter.rect_stroke(
+                top,
+                CornerRadius::same(2),
+                stroke,
+                eframe::egui::StrokeKind::Middle,
+            );
+            painter.rect_stroke(
+                bot,
+                CornerRadius::same(2),
+                stroke,
+                eframe::egui::StrokeKind::Middle,
+            );
             painter.circle_filled(Pos2::new(top.left() + 3.0, top.center().y), 1.1, color);
             painter.circle_filled(Pos2::new(bot.left() + 3.0, bot.center().y), 1.1, color);
             painter.line_segment(
-                [Pos2::new(top.right() - 4.8, top.center().y), Pos2::new(top.right() - 2.2, top.center().y)],
+                [
+                    Pos2::new(top.right() - 4.8, top.center().y),
+                    Pos2::new(top.right() - 2.2, top.center().y),
+                ],
                 Stroke::new(1.3_f32, color),
             );
             painter.line_segment(
-                [Pos2::new(bot.right() - 4.8, bot.center().y), Pos2::new(bot.right() - 2.2, bot.center().y)],
+                [
+                    Pos2::new(bot.right() - 4.8, bot.center().y),
+                    Pos2::new(bot.right() - 2.2, bot.center().y),
+                ],
                 Stroke::new(1.3_f32, color),
             );
         }
@@ -155,7 +173,10 @@ pub fn draw_theme_icon(painter: &Painter, center: Pos2, is_dark: bool, color: Co
         let mut pts = Vec::with_capacity(28);
         for i in 0..=14 {
             let a = 0.08 * TAU + (i as f32 / 14.0) * 0.62 * TAU;
-            pts.push(Pos2::new(center.x + a.cos() * 5.4, center.y + a.sin() * 5.4));
+            pts.push(Pos2::new(
+                center.x + a.cos() * 5.4,
+                center.y + a.sin() * 5.4,
+            ));
         }
         for i in (0..=10).rev() {
             let a = 0.14 * TAU + (i as f32 / 10.0) * 0.50 * TAU;
@@ -321,7 +342,11 @@ pub fn draw_search_icon(painter: &Painter, center: Pos2, color: Color32) {
 }
 
 /// Animated pill toggle switch (`34 x 19`).
-pub fn pill_toggle(ui: &mut eframe::egui::Ui, on: &mut bool, p: ThemePalette) -> eframe::egui::Response {
+pub fn pill_toggle(
+    ui: &mut eframe::egui::Ui,
+    on: &mut bool,
+    p: ThemePalette,
+) -> eframe::egui::Response {
     let desired = Vec2::new(34.0, 19.0);
     let (rect, mut resp) = ui.allocate_exact_size(desired, eframe::egui::Sense::click());
     if resp.clicked() {
@@ -336,7 +361,11 @@ pub fn pill_toggle(ui: &mut eframe::egui::Ui, on: &mut bool, p: ThemePalette) ->
     let r = 7.2;
     let cx = eframe::egui::lerp((rect.left() + 9.5)..=(rect.right() - 9.5), how_on);
     let knob = Pos2::new(cx, rect.center().y);
-    painter.circle_filled(Pos2::new(knob.x, knob.y + 0.8), r, Color32::from_black_alpha(28));
+    painter.circle_filled(
+        Pos2::new(knob.x, knob.y + 0.8),
+        r,
+        Color32::from_black_alpha(28),
+    );
     painter.circle_filled(knob, r, Color32::WHITE);
     resp
 }

@@ -44,14 +44,12 @@ pub async fn resolve_server_addr(raw: &str) -> Result<SocketAddr> {
         return Ok(addr);
     }
     validate_server_addr(s)?;
-    let resolved: Vec<SocketAddr> = tokio::time::timeout(
-        Duration::from_secs(4),
-        tokio::net::lookup_host(s),
-    )
-    .await
-    .with_context(|| format!("解析节点域名超时: {s}"))?
-    .with_context(|| format!("解析节点域名失败: {s}"))?
-    .collect();
+    let resolved: Vec<SocketAddr> =
+        tokio::time::timeout(Duration::from_secs(4), tokio::net::lookup_host(s))
+            .await
+            .with_context(|| format!("解析节点域名超时: {s}"))?
+            .with_context(|| format!("解析节点域名失败: {s}"))?
+            .collect();
     resolved
         .iter()
         .copied()
@@ -130,9 +128,9 @@ pub(crate) fn build_client_config(
     transport.max_idle_timeout(Some(MAX_IDLE_TIMEOUT.try_into()?));
     // Brutal is strictly restricted to the bulk TCP lane; the game UDP lane always uses BBR.
     if !is_udp_lane && brutal_mbps > 0 {
-        transport.congestion_controller_factory(Arc::new(
-            protocol::brutal::BrutalConfig::new(brutal_mbps),
-        ));
+        transport.congestion_controller_factory(Arc::new(protocol::brutal::BrutalConfig::new(
+            brutal_mbps,
+        )));
     } else {
         transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     }

@@ -49,7 +49,9 @@ pub fn question_name(msg: &[u8]) -> Option<String> {
     if msg.len() < HEADER_LEN || u16::from_be_bytes([msg[4], msg[5]]) == 0 {
         return None;
     }
-    read_name(msg, HEADER_LEN).map(|(n, _)| n).filter(|n| !n.is_empty())
+    read_name(msg, HEADER_LEN)
+        .map(|(n, _)| n)
+        .filter(|n| !n.is_empty())
 }
 
 /// For a DNS response: the question name and every A/AAAA address in the answer section.
@@ -76,7 +78,9 @@ pub fn answer_addresses(msg: &[u8]) -> Option<(String, Vec<IpAddr>)> {
         let rdlen = u16::from_be_bytes([rr[8], rr[9]]) as usize;
         let rdata = msg.get(p + 10..p + 10 + rdlen)?;
         match (rtype, rdlen) {
-            (1, 4) => ips.push(IpAddr::V4(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]))),
+            (1, 4) => ips.push(IpAddr::V4(Ipv4Addr::new(
+                rdata[0], rdata[1], rdata[2], rdata[3],
+            ))),
             (28, 16) => {
                 let mut o = [0u8; 16];
                 o.copy_from_slice(rdata);
@@ -120,12 +124,34 @@ pub(crate) mod tests {
         r[7] = 2; // ancount = 2
         // CNAME www.baidu.com -> www.a.shifen.com
         r.extend_from_slice(&[0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 0, 60]);
-        let cname: Vec<u8> = [&[3u8][..], b"www", &[1], b"a", &[6], b"shifen", &[0xC0, 0x16]].concat();
+        let cname: Vec<u8> = [
+            &[3u8][..],
+            b"www",
+            &[1],
+            b"a",
+            &[6],
+            b"shifen",
+            &[0xC0, 0x16],
+        ]
+        .concat();
         r.extend_from_slice(&(cname.len() as u16).to_be_bytes());
         let cname_off = r.len();
         r.extend_from_slice(&cname);
         // A record for the CNAME target (pointer to it)
-        r.extend_from_slice(&[0xC0 | ((cname_off >> 8) as u8), cname_off as u8, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        r.extend_from_slice(&[
+            0xC0 | ((cname_off >> 8) as u8),
+            cname_off as u8,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            60,
+            0,
+            4,
+        ]);
         r.extend_from_slice(&[183, 2, 172, 177]);
 
         let (name, ips) = answer_addresses(&r).unwrap();

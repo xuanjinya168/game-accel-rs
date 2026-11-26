@@ -5,7 +5,7 @@ use crate::widgets::{
     card_frame, draw_hero_power_button, draw_rtt_sparkline, draw_traffic_sparkline,
     hairline_divider, primary_btn,
 };
-use crate::{ChartMode, ConnState, GameAccelApp, NavTab, ProbeState, relaunch_as_admin};
+use crate::{ChartMode, ConnState, GameAccelApp, NavTab, ProbeState};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, Pos2, RichText, ScrollArea,
     Sense, Stroke, Vec2,
@@ -35,14 +35,8 @@ impl GameAccelApp {
             ui.add_space(8.0);
 
             ui.vertical_centered(|ui| {
-                if draw_hero_power_button(
-                    ui,
-                    self.state,
-                    self.reconnect_status(),
-                    has_nodes,
-                    p,
-                )
-                .clicked()
+                if draw_hero_power_button(ui, self.state, self.reconnect_status(), has_nodes, p)
+                    .clicked()
                 {
                     if !has_nodes {
                         self.active_tab = NavTab::Nodes;
@@ -87,7 +81,9 @@ impl GameAccelApp {
                                         .cfg
                                         .active_node()
                                         .map(|n| n.name.clone())
-                                        .unwrap_or_else(|| "尚未添加节点 · 点击前往配置".to_string());
+                                        .unwrap_or_else(|| {
+                                            "尚未添加节点 · 点击前往配置".to_string()
+                                        });
 
                                     let can_switch = self.state == ConnState::Disconnected;
                                     let has_active = self.cfg.active_node().is_some();
@@ -196,9 +192,7 @@ impl GameAccelApp {
                                                 p.text_secondary
                                             },
                                         );
-                                        if s_resp
-                                            .on_hover_text("复制 gacl:// 分享链接")
-                                            .clicked()
+                                        if s_resp.on_hover_text("复制 gacl:// 分享链接").clicked()
                                         {
                                             ui.ctx().copy_text(node.to_share_uri());
                                             self.show_toast(format!(
@@ -241,85 +235,87 @@ impl GameAccelApp {
                                     offset: [0, 8],
                                     blur: 20,
                                     spread: 0,
-                                    color: Color32::from_black_alpha(if p.is_dark { 85 } else { 24 }),
+                                    color: Color32::from_black_alpha(if p.is_dark {
+                                        85
+                                    } else {
+                                        24
+                                    }),
                                 })
                                 .show(ui, |ui| {
                                     ui.set_width(popup_w - 12.0);
                                     ui.spacing_mut().item_spacing = Vec2::new(0.0, 3.0);
 
-                                    ScrollArea::vertical()
-                                        .max_height(210.0)
-                                        .show(ui, |ui| {
-                                            for node in &nodes_snapshot {
-                                                let selected = self.cfg.active_node_id == node.id;
-                                                let (r, resp) = ui.allocate_exact_size(
-                                                    Vec2::new(ui.available_width(), 42.0),
-                                                    Sense::click(),
-                                                );
-                                                let bg = if selected {
-                                                    p.accent_soft
-                                                } else if resp.hovered() {
-                                                    p.bg_nav_hover
-                                                } else {
-                                                    Color32::TRANSPARENT
-                                                };
-                                                let painter = ui.painter();
-                                                painter.rect_filled(r, CornerRadius::same(8), bg);
+                                    ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
+                                        for node in &nodes_snapshot {
+                                            let selected = self.cfg.active_node_id == node.id;
+                                            let (r, resp) = ui.allocate_exact_size(
+                                                Vec2::new(ui.available_width(), 42.0),
+                                                Sense::click(),
+                                            );
+                                            let bg = if selected {
+                                                p.accent_soft
+                                            } else if resp.hovered() {
+                                                p.bg_nav_hover
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            };
+                                            let painter = ui.painter();
+                                            painter.rect_filled(r, CornerRadius::same(8), bg);
 
-                                                painter.text(
-                                                    Pos2::new(r.left() + 10.0, r.top() + 14.0),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    &node.name,
-                                                    FontId::proportional(FONT_BODY),
-                                                    if selected {
-                                                        p.accent_text
-                                                    } else {
-                                                        p.text_primary
-                                                    },
-                                                );
-
-                                                let sub = format!("{} · {}", node.server, node.sni);
-                                                painter.text(
-                                                    Pos2::new(r.left() + 10.0, r.bottom() - 11.0),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    sub,
-                                                    FontId::monospace(FONT_XS),
-                                                    p.text_muted,
-                                                );
-
-                                                let mut right_x = r.right() - 14.0;
+                                            painter.text(
+                                                Pos2::new(r.left() + 10.0, r.top() + 14.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                &node.name,
+                                                FontId::proportional(FONT_BODY),
                                                 if selected {
-                                                    icons::draw_check_icon(
-                                                        painter,
-                                                        Pos2::new(right_x, r.center().y),
-                                                        p.accent,
-                                                    );
-                                                    right_x -= 18.0;
-                                                }
-                                                if let Some(ProbeState::Ok(ms)) =
-                                                    self.probes.get(&node.id)
-                                                {
-                                                    let c = if *ms < 100 {
-                                                        p.success_text
-                                                    } else if *ms < 200 {
-                                                        p.warn_text
-                                                    } else {
-                                                        p.danger_text
-                                                    };
-                                                    painter.text(
-                                                        Pos2::new(right_x, r.center().y),
-                                                        egui::Align2::RIGHT_CENTER,
-                                                        format!("{ms} ms"),
-                                                        FontId::monospace(FONT_XS),
-                                                        c,
-                                                    );
-                                                }
+                                                    p.accent_text
+                                                } else {
+                                                    p.text_primary
+                                                },
+                                            );
 
-                                                if resp.clicked() {
-                                                    picked_id = Some(node.id.clone());
-                                                }
+                                            let sub = format!("{} · {}", node.server, node.sni);
+                                            painter.text(
+                                                Pos2::new(r.left() + 10.0, r.bottom() - 11.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                sub,
+                                                FontId::monospace(FONT_XS),
+                                                p.text_muted,
+                                            );
+
+                                            let mut right_x = r.right() - 14.0;
+                                            if selected {
+                                                icons::draw_check_icon(
+                                                    painter,
+                                                    Pos2::new(right_x, r.center().y),
+                                                    p.accent,
+                                                );
+                                                right_x -= 18.0;
                                             }
-                                        });
+                                            if let Some(ProbeState::Ok(ms)) =
+                                                self.probes.get(&node.id)
+                                            {
+                                                let c = if *ms < 100 {
+                                                    p.success_text
+                                                } else if *ms < 200 {
+                                                    p.warn_text
+                                                } else {
+                                                    p.danger_text
+                                                };
+                                                painter.text(
+                                                    Pos2::new(right_x, r.center().y),
+                                                    egui::Align2::RIGHT_CENTER,
+                                                    format!("{ms} ms"),
+                                                    FontId::monospace(FONT_XS),
+                                                    c,
+                                                );
+                                            }
+
+                                            if resp.clicked() {
+                                                picked_id = Some(node.id.clone());
+                                            }
+                                        }
+                                    });
                                 });
                         })
                         .response;
@@ -333,9 +329,11 @@ impl GameAccelApp {
                     } else if !trigger_clicked
                         && ui.ctx().input(|i| i.pointer.any_pressed())
                         && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-                            && !area_resp.rect.contains(pos) && !pill_rect.contains(pos) {
-                                self.node_picker_open = false;
-                            }
+                        && !area_resp.rect.contains(pos)
+                        && !pill_rect.contains(pos)
+                    {
+                        self.node_picker_open = false;
+                    }
                 }
             });
 
@@ -345,7 +343,11 @@ impl GameAccelApp {
 
             // 4-column telemetry strip with 1px hairline vertical dividers
             let is_live = self.state == ConnState::Connected;
-            let metric_col = if is_live { p.text_primary } else { p.text_muted };
+            let metric_col = if is_live {
+                p.text_primary
+            } else {
+                p.text_muted
+            };
             let strip_rect = ui
                 .scope(|ui| {
                     ui.columns(4, |cols| {
@@ -564,9 +566,19 @@ impl GameAccelApp {
                         } else {
                             Stroke::NONE
                         };
-                        let col = if selected { p.text_primary } else { p.text_muted };
+                        let col = if selected {
+                            p.text_primary
+                        } else {
+                            p.text_muted
+                        };
                         let painter = cols[idx].painter();
-                        painter.rect(rect, CornerRadius::same(6), fill, stroke, egui::StrokeKind::Inside);
+                        painter.rect(
+                            rect,
+                            CornerRadius::same(6),
+                            fill,
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
                         painter.text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -602,11 +614,7 @@ impl GameAccelApp {
                         .color(p.accent_text),
                 );
                 if primary_btn(ui, "以管理员身份重启", p).clicked() {
-                    if self.state != ConnState::Disconnected {
-                        self.stop_connect();
-                    }
-                    save_config(&self.cfg);
-                    relaunch_as_admin();
+                    self.restart_as_admin(false);
                 }
             });
         }
@@ -621,9 +629,11 @@ impl GameAccelApp {
                 (ChartMode::Rtt, "延迟波动"),
             ] {
                 let active = self.chart_mode == mode;
-                let text = RichText::new(label)
-                    .size(FONT_SM)
-                    .color(if active { p.text_primary } else { p.text_muted });
+                let text = RichText::new(label).size(FONT_SM).color(if active {
+                    p.text_primary
+                } else {
+                    p.text_muted
+                });
                 let resp = ui.add(
                     egui::Label::new(if active { text.strong() } else { text })
                         .sense(Sense::click()),
@@ -645,7 +655,11 @@ impl GameAccelApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let info = format!(
                         "UDP BBR · MTU 1200 · {}",
-                        if node.game_dup { "丢包自适应双发" } else { "普通模式" }
+                        if node.game_dup {
+                            "丢包自适应双发"
+                        } else {
+                            "普通模式"
+                        }
                     );
                     ui.label(RichText::new(info).size(FONT_XS).color(p.text_muted));
                 });
@@ -653,13 +667,15 @@ impl GameAccelApp {
         });
         ui.add_space(6.0);
         match self.chart_mode {
-            ChartMode::Traffic => {
-                draw_traffic_sparkline(ui, &self.speed_history, self.state == ConnState::Connected, p)
-            }
+            ChartMode::Traffic => draw_traffic_sparkline(
+                ui,
+                &self.speed_history,
+                self.state == ConnState::Connected,
+                p,
+            ),
             ChartMode::Rtt => {
                 draw_rtt_sparkline(ui, &self.rtt_history, self.state == ConnState::Connected, p)
             }
         }
     }
-
 }

@@ -50,5 +50,13 @@ Name: "{autodesktop}\GameAccel"; Filename: "{app}\game-accel.exe"; Tasks: deskto
 
 [Run]
 Filename: "{app}\game-accel.exe"; Description: "{cm:LaunchProgram,GameAccel}"; Flags: nowait postinstall skipifsilent shellexec
-; In-app auto-update runs this installer with /SILENT: relaunch the new version afterwards.
-Filename: "{app}\game-accel.exe"; Flags: nowait shellexec; Check: WizardSilent
+; In-app auto-update runs this installer with /SILENT: relaunch the new version afterwards,
+; as the normal user unless the updating instance was elevated (/relaunchadmin=1).
+Filename: "{app}\game-accel.exe"; Flags: nowait runasoriginaluser; Check: WizardSilent and not RelaunchAsAdmin
+Filename: "{app}\game-accel.exe"; Flags: nowait; Check: WizardSilent and RelaunchAsAdmin
+
+[Code]
+function RelaunchAsAdmin: Boolean;
+begin
+  Result := ExpandConstant('{param:relaunchadmin|0}') = '1';
+end;

@@ -189,7 +189,11 @@ fn mask32(len: u32) -> u32 {
 }
 
 fn mask128(len: u32) -> u128 {
-    if len == 0 { 0 } else { u128::MAX << (128 - len) }
+    if len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - len)
+    }
 }
 
 fn merge<T: Ord + Copy + num_succ::Succ>(mut v: Vec<(T, T)>) -> Vec<(T, T)> {
@@ -197,12 +201,13 @@ fn merge<T: Ord + Copy + num_succ::Succ>(mut v: Vec<(T, T)>) -> Vec<(T, T)> {
     let mut out: Vec<(T, T)> = Vec::with_capacity(v.len());
     for (s, e) in v {
         if let Some(last) = out.last_mut()
-            && s <= last.1.succ_saturating() {
-                if e > last.1 {
-                    last.1 = e;
-                }
-                continue;
+            && s <= last.1.succ_saturating()
+        {
+            if e > last.1 {
+                last.1 = e;
             }
+            continue;
+        }
         out.push((s, e));
     }
     out
@@ -287,7 +292,8 @@ impl RuleData {
     /// edited override files take effect after restarting the app.
     pub fn shared(rules_dir: Option<&Path>) -> Arc<RuleData> {
         static DATA: OnceLock<Arc<RuleData>> = OnceLock::new();
-        DATA.get_or_init(|| Arc::new(RuleData::load(rules_dir))).clone()
+        DATA.get_or_init(|| Arc::new(RuleData::load(rules_dir)))
+            .clone()
     }
 
     pub fn summary(&self) -> String {
@@ -434,9 +440,10 @@ impl Router {
         // A domain learned from DNS beats GEOIP (e.g. a domestic site on a foreign CDN IP,
         // or a foreign site served from an in-China IP).
         if let Some(name) = self.dns_hints.get(&ip).map(|h| h.clone())
-            && let Some(route) = self.decide_domain_static(&name) {
-                return route;
-            }
+            && let Some(route) = self.decide_domain_static(&name)
+        {
+            return route;
+        }
         if self.data.cn_ip.contains(ip) {
             Route::Direct
         } else {
@@ -448,7 +455,11 @@ impl Router {
     fn decide_domain_static(&self, host: &str) -> Option<Route> {
         // Tunnel-only aliases (server panel) and mDNS names must never be resolved locally.
         if host.ends_with(".local") || host == "localhost" {
-            return Some(if host == "localhost" { Route::Direct } else { Route::Proxy });
+            return Some(if host == "localhost" {
+                Route::Direct
+            } else {
+                Route::Proxy
+            });
         }
         if self.data.proxy.matches(host) {
             return Some(Route::Proxy);
@@ -463,9 +474,10 @@ impl Router {
     /// for addressing direct UDP to domain targets.
     pub async fn resolve_cached(&self, host: &str) -> Option<IpAddr> {
         if let Some(hit) = self.dns_cache.get(host)
-            && hit.1.elapsed() < DNS_CACHE_TTL {
-                return hit.0;
-            }
+            && hit.1.elapsed() < DNS_CACHE_TTL
+        {
+            return hit.0;
+        }
         let ip = tokio::time::timeout(GEOIP_RESOLVE_TIMEOUT, tokio::net::lookup_host((host, 0)))
             .await
             .ok()
@@ -475,7 +487,8 @@ impl Router {
         if self.dns_cache.len() >= DNS_CACHE_MAX {
             self.dns_cache.clear();
         }
-        self.dns_cache.insert(host.to_string(), (ip, Instant::now()));
+        self.dns_cache
+            .insert(host.to_string(), (ip, Instant::now()));
         ip
     }
 }
@@ -507,7 +520,14 @@ mod tests {
     #[tokio::test]
     async fn chinese_sites_go_direct_foreign_sites_go_proxy() {
         let r = router(RouteMode::Rule);
-        for d in ["www.baidu.com", "baidu.com", "WWW.QQ.COM.", "api.bilibili.com", "gov.cn", "a.b.edu.cn"] {
+        for d in [
+            "www.baidu.com",
+            "baidu.com",
+            "WWW.QQ.COM.",
+            "api.bilibili.com",
+            "gov.cn",
+            "a.b.edu.cn",
+        ] {
             assert_eq!(r.decide(&dom(d)).await, Route::Direct, "{d}");
         }
         for d in ["www.google.com", "youtube.com", "i.ytimg.com", "github.com"] {
@@ -527,7 +547,10 @@ mod tests {
         assert_eq!(r.decide(&ip("192.168.1.1:80")).await, Route::Direct);
         assert_eq!(r.decide(&ip("127.0.0.1:80")).await, Route::Direct);
         assert_eq!(r.decide(&ip("[::1]:80")).await, Route::Direct);
-        assert_eq!(r.decide(&ip("[2001:4860:4860::8888]:53")).await, Route::Proxy);
+        assert_eq!(
+            r.decide(&ip("[2001:4860:4860::8888]:53")).await,
+            Route::Proxy
+        );
         // Tunnel-only panel TUN alias (198.18.0.1) is not local -> must be tunnelled
         assert_eq!(r.decide(&ip("198.18.0.1:80")).await, Route::Proxy);
     }
@@ -547,9 +570,18 @@ mod tests {
     fn dns_split_and_hints() {
         use crate::dns_msg::tests::build_query;
         let r = router(RouteMode::Rule);
-        assert_eq!(r.decide_dns_query(&build_query(1, "www.baidu.com")), DnsRoute::Domestic);
-        assert_eq!(r.decide_dns_query(&build_query(2, "www.google.com")), DnsRoute::Proxy);
-        assert_eq!(r.decide_dns_query(&build_query(3, "unknown-zzz.example")), DnsRoute::Proxy);
+        assert_eq!(
+            r.decide_dns_query(&build_query(1, "www.baidu.com")),
+            DnsRoute::Domestic
+        );
+        assert_eq!(
+            r.decide_dns_query(&build_query(2, "www.google.com")),
+            DnsRoute::Proxy
+        );
+        assert_eq!(
+            r.decide_dns_query(&build_query(3, "unknown-zzz.example")),
+            DnsRoute::Proxy
+        );
 
         // A foreign IP learned as belonging to a domestic domain goes direct (and vice versa).
         let foreign_ip: IpAddr = "8.8.4.4".parse().unwrap();

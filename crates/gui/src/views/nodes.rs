@@ -1,11 +1,9 @@
 use crate::icons;
 use crate::storage::save_config;
-use crate::theme::{
-    FONT_BODY, FONT_SM, FONT_SUB, FONT_XS, ThemePalette,
-};
+use crate::theme::{FONT_BODY, FONT_SM, FONT_SUB, FONT_XS, ThemePalette};
 use crate::widgets::{
-    accent_chip_btn, card_frame, chip_btn, modal_dialog, pill, primary_btn, soft_btn,
-    styled_input, styled_multiline,
+    accent_chip_btn, card_frame, chip_btn, modal_dialog, pill, primary_btn, soft_btn, styled_input,
+    styled_multiline,
 };
 use crate::{ConnState, GameAccelApp, NodeEditorState, ProbeState};
 use chrono::Local;
@@ -90,9 +88,7 @@ impl GameAccelApp {
                         let added = self.merge_imported_nodes(nodes, None);
                         self.import_text.clear();
                         self.import_panel_open = false;
-                        self.show_toast(format!(
-                            "导入成功：解析 {total} 个节点（新增 {added}）"
-                        ));
+                        self.show_toast(format!("导入成功：解析 {total} 个节点（新增 {added}）"));
                     }
                     Err(e) => {
                         self.show_toast(format!("导入失败: {e:#}"));
@@ -110,13 +106,8 @@ impl GameAccelApp {
             let mut close_sub = false;
             let subs = self.cfg.subscriptions.clone();
             let sub_loading = self.sub_loading;
-            let dismissed = modal_dialog(
-                &ctx,
-                "sub_url_modal",
-                "订阅 URL 同步",
-                520.0,
-                p,
-                |ui| {
+            let dismissed =
+                modal_dialog(&ctx, "sub_url_modal", "订阅 URL 同步", 520.0, p, |ui| {
                     ui.label(
                         RichText::new("支持管理面板 JSON、gacl:// 或 hysteria2:// 列表")
                             .size(FONT_SM)
@@ -126,7 +117,11 @@ impl GameAccelApp {
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_enabled_ui(!sub_loading, |ui| {
-                                let lbl = if sub_loading { "拉取中..." } else { "拉取订阅" };
+                                let lbl = if sub_loading {
+                                    "拉取中..."
+                                } else {
+                                    "拉取订阅"
+                                };
                                 if primary_btn(ui, lbl, p).clicked() {
                                     fetch_url = Some(self.sub_url_input.clone());
                                 }
@@ -183,8 +178,7 @@ impl GameAccelApp {
                             }
                         });
                     });
-                },
-            );
+                });
             if let Some(url) = fetch_url {
                 self.fetch_subscription(url);
             }
@@ -208,7 +202,11 @@ impl GameAccelApp {
                     .num_columns(2)
                     .spacing([14.0, 10.0])
                     .show(ui, |ui| {
-                        ui.label(RichText::new("协议类型").size(FONT_BODY).color(p.text_secondary));
+                        ui.label(
+                            RichText::new("协议类型")
+                                .size(FONT_BODY)
+                                .color(p.text_secondary),
+                        );
                         ui.horizontal(|ui| {
                             if accent_chip_btn(ui, "GACL", p, ed.protocol == NodeProtocol::Gacl)
                                 .clicked()
@@ -229,7 +227,11 @@ impl GameAccelApp {
                         });
                         ui.end_row();
 
-                        ui.label(RichText::new("节点名称").size(FONT_BODY).color(p.text_secondary));
+                        ui.label(
+                            RichText::new("节点名称")
+                                .size(FONT_BODY)
+                                .color(p.text_secondary),
+                        );
                         styled_input(ui, &mut ed.name, "例如：美西游戏专线", 300.0, false, p);
                         ui.end_row();
 
@@ -323,12 +325,8 @@ impl GameAccelApp {
                             } else {
                                 ed.name.trim().to_string()
                             };
-                            let brutal_mbps = ed
-                                .brutal_mbps
-                                .trim()
-                                .parse::<u32>()
-                                .unwrap_or(0)
-                                .min(1000);
+                            let brutal_mbps =
+                                ed.brutal_mbps.trim().parse::<u32>().unwrap_or(0).min(1000);
                             editor_save = Some(NodeProfile {
                                 id,
                                 name,
@@ -411,7 +409,10 @@ impl GameAccelApp {
 
                 Frame::new()
                     .fill(p.bg_card)
-                    .stroke(Stroke::new(if is_active { 1.5_f32 } else { 1.0_f32 }, border))
+                    .stroke(Stroke::new(
+                        if is_active { 1.5_f32 } else { 1.0_f32 },
+                        border,
+                    ))
                     .corner_radius(CornerRadius::same(12))
                     .inner_margin(Margin::symmetric(18, 15))
                     .shadow(p.card_shadow)
@@ -427,11 +428,7 @@ impl GameAccelApp {
                             ui.painter().circle_filled(
                                 dr.center(),
                                 3.6,
-                                if is_active {
-                                    p.accent
-                                } else {
-                                    p.border_strong
-                                },
+                                if is_active { p.accent } else { p.border_strong },
                             );
                             ui.label(
                                 RichText::new(&node.name)
@@ -564,5 +561,4 @@ impl GameAccelApp {
             self.show_toast(format!("已复制「{}」的 gacl:// 分享链接到剪贴板", n.name));
         }
     }
-
 }

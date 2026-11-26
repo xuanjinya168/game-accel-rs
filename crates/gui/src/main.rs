@@ -16,6 +16,7 @@ mod views;
 mod widgets;
 
 use admin::{AdminEvent, AdminState};
+use client::ConnectError;
 use client::socks5::ClientStats;
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Stroke, Vec2};
 use protocol::share::{NodeProfile, NodeProtocol};
@@ -69,7 +70,7 @@ pub(crate) enum ProbeState {
 
 enum AsyncEvent {
     Log(String),
-    ConnError(u64, String),
+    ConnError(u64, ConnectError),
     /// The client session ended without an error (tunnel dropped or user stop).
     ConnEnded(u64),
     Tray(TrayCmd),
@@ -196,10 +197,17 @@ pub(crate) struct GameAccelApp {
     /// lifetime of the window: egui turns any change into an `OuterPosition` command,
     /// which would fight with OS drags / edge-tuck moves and make the card flicker.
     pub(crate) floating_pill_spawn_pos: Option<Pos2>,
+    /// Speed-reactive LED state: smoothed activity (0..=1), breathing / ripple phases and
+    /// the timestamp of the last advance.
+    pub(crate) floating_pill_led_k: f32,
+    pub(crate) floating_pill_led_phase: f64,
+    pub(crate) floating_pill_ring_phase: f64,
+    pub(crate) floating_pill_led_last: f64,
     /// GitHub Releases based auto-updater.
     pub(crate) updater: updater::Updater,
     /// Version we've already toasted about, so the "new version" toast shows once.
     pub(crate) update_notified: Option<String>,
+    pub(crate) tun_admin_prompt: Option<TunAdminPrompt>,
     pub(crate) really_quit: bool,
 }
 
@@ -230,9 +238,10 @@ impl GameAccelApp {
             },
             move || {
                 if let Ok(mut guard) = quit_shutdown.lock()
-                    && let Some(tx) = guard.take() {
-                        let _ = tx.send(true);
-                    }
+                    && let Some(tx) = guard.take()
+                {
+                    let _ = tx.send(true);
+                }
                 if quit_proxy_flag.swap(false, Ordering::SeqCst) {
                     let _ = sys_proxy::disable_system_proxy();
                     logger::log_line("INFO", "退出清理：已关闭 Windows 系统代理");
@@ -304,8 +313,13 @@ impl GameAccelApp {
             floating_pill_edge_tucked: false,
             floating_pill_last_hover: Instant::now(),
             floating_pill_spawn_pos: None,
+            floating_pill_led_k: 0.0,
+            floating_pill_led_phase: 0.0,
+            floating_pill_ring_phase: 0.0,
+            floating_pill_led_last: 0.0,
             updater: updater::Updater::default(),
             update_notified: None,
+            tun_admin_prompt: None,
             really_quit: false,
         };
         app.push_log(if is_admin {
@@ -313,6 +327,16 @@ impl GameAccelApp {
         } else {
             "客户端已就绪，点击「一键开启加速」启动 QUIC/UDP 通道"
         });
+        // Started by `restart_as_admin(auto_connect = true)`: bring TUN up once the previous
+        // instance has finished releasing the listener / system proxy.
+        if is_admin
+            && app.cfg.proxy_mode == storage::ProxyMode::Tun
+            && std::env::args().any(|a| a == "--connect")
+        {
+            app.state = ConnState::Connecting;
+            app.pending_mode_reconnect = Some(Instant::now() + Duration::from_millis(1200));
+            app.push_log("已以管理员身份重启，正在自动开启 TUN 加速...");
+        }
         app
     }
 
@@ -463,7 +487,7 @@ impl eframe::App for GameAccelApp {
             .values()
             .any(|v| matches!(v, ProbeState::Probing));
         if pill_animating {
-            ctx.request_repaint_after(views::floating_pill::PILL_ANIM_INTERVAL);
+            ctx.request_repaint_after(self.pill_anim_interval());
         } else if self.state != ConnState::Disconnected
             || any_probing
             || self.sub_loading
@@ -490,109 +514,113 @@ impl eframe::App for GameAccelApp {
                 .is_some_and(|r| r.min.x < -8000.0 || r.min.y < -8000.0)
         });
         if !(is_minimized || main_offscreen) {
-        // Frameless rounded window container with single crisp 1px outer border (zero double-stroke)
-        egui::CentralPanel::default()
-            .frame(Frame::NONE)
-            .show(ctx, |ui| {
-                let total_rect = ui.max_rect();
-                let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                let radius = if is_maximized { 0u8 } else { 14u8 };
+            // Frameless rounded window container with single crisp 1px outer border (zero double-stroke)
+            egui::CentralPanel::default()
+                .frame(Frame::NONE)
+                .show(ctx, |ui| {
+                    let total_rect = ui.max_rect();
+                    let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    let radius = if is_maximized { 0u8 } else { 14u8 };
 
-                // Enable native 8-direction edge & corner drag resizing on frameless window
-                if !is_maximized {
-                    handle_frameless_resize(ctx, total_rect);
-                }
+                    // Enable native 8-direction edge & corner drag resizing on frameless window
+                    if !is_maximized {
+                        handle_frameless_resize(ctx, total_rect);
+                    }
 
-                let sidebar_w = 192.0;
-                let split_x = total_rect.min.x + sidebar_w;
+                    let sidebar_w = 192.0;
+                    let split_x = total_rect.min.x + sidebar_w;
 
-                // Paint left sidebar & right workspace as two non-overlapping rounded halves
-                // so the 4 outer corners have zero background bleed or double-ring artifacts.
-                let sidebar_rect = egui::Rect::from_min_max(
-                    total_rect.min,
-                    Pos2::new(split_x, total_rect.max.y),
-                );
-                let right_rect = egui::Rect::from_min_max(
-                    Pos2::new(split_x, total_rect.min.y),
-                    total_rect.max,
-                );
-                toast_workspace_rect = right_rect;
-                ui.painter().rect_filled(
-                    sidebar_rect,
-                    CornerRadius {
-                        nw: radius,
-                        sw: radius,
-                        ne: 0,
-                        se: 0,
-                    },
-                    p.bg_sidebar,
-                );
-                ui.painter().rect_filled(
-                    right_rect,
-                    CornerRadius {
-                        nw: 0,
-                        sw: 0,
-                        ne: radius,
-                        se: radius,
-                    },
-                    p.bg_root,
-                );
-                ui.painter().line_segment(
-                    [
-                        Pos2::new(split_x, total_rect.min.y + 1.0),
-                        Pos2::new(split_x, total_rect.max.y - 1.0),
-                    ],
-                    Stroke::new(1.0_f32, p.border_subtle),
-                );
-
-                // Split into left sidebar + right main workspace
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(sidebar_w, total_rect.height()),
-                        Layout::top_down(Align::LEFT),
-                        |ui| {
-                            Frame::new()
-                                .inner_margin(Margin::symmetric(16, 20))
-                                .show(ui, |ui| {
-                                    ui.set_min_height((total_rect.height() - 40.0).max(200.0));
-                                    self.render_sidebar_contents(ui, ctx, p);
-                                });
+                    // Paint left sidebar & right workspace as two non-overlapping rounded halves
+                    // so the 4 outer corners have zero background bleed or double-ring artifacts.
+                    let sidebar_rect = egui::Rect::from_min_max(
+                        total_rect.min,
+                        Pos2::new(split_x, total_rect.max.y),
+                    );
+                    let right_rect = egui::Rect::from_min_max(
+                        Pos2::new(split_x, total_rect.min.y),
+                        total_rect.max,
+                    );
+                    toast_workspace_rect = right_rect;
+                    ui.painter().rect_filled(
+                        sidebar_rect,
+                        CornerRadius {
+                            nw: radius,
+                            sw: radius,
+                            ne: 0,
+                            se: 0,
                         },
+                        p.bg_sidebar,
+                    );
+                    ui.painter().rect_filled(
+                        right_rect,
+                        CornerRadius {
+                            nw: 0,
+                            sw: 0,
+                            ne: radius,
+                            se: radius,
+                        },
+                        p.bg_root,
+                    );
+                    ui.painter().line_segment(
+                        [
+                            Pos2::new(split_x, total_rect.min.y + 1.0),
+                            Pos2::new(split_x, total_rect.max.y - 1.0),
+                        ],
+                        Stroke::new(1.0_f32, p.border_subtle),
                     );
 
-                    let right_w = (total_rect.width() - sidebar_w).max(460.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(right_w, total_rect.height()),
-                        Layout::top_down(Align::LEFT),
-                        |ui| {
-                            Frame::new()
-                                .inner_margin(Margin::symmetric(28, 22))
-                                .show(ui, |ui| {
-                                    ui.set_width((right_w - 56.0).max(360.0));
-                                    ui.set_min_height((total_rect.height() - 44.0).max(200.0));
-                                    self.render_right_workspace(ui, ctx, p);
-                                });
-                        },
-                    );
+                    // Split into left sidebar + right main workspace
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(sidebar_w, total_rect.height()),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                Frame::new().inner_margin(Margin::symmetric(16, 20)).show(
+                                    ui,
+                                    |ui| {
+                                        ui.set_min_height((total_rect.height() - 40.0).max(200.0));
+                                        self.render_sidebar_contents(ui, ctx, p);
+                                    },
+                                );
+                            },
+                        );
+
+                        let right_w = (total_rect.width() - sidebar_w).max(460.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(right_w, total_rect.height()),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                Frame::new().inner_margin(Margin::symmetric(28, 22)).show(
+                                    ui,
+                                    |ui| {
+                                        ui.set_width((right_w - 56.0).max(360.0));
+                                        ui.set_min_height((total_rect.height() - 44.0).max(200.0));
+                                        self.render_right_workspace(ui, ctx, p);
+                                    },
+                                );
+                            },
+                        );
+                    });
+
+                    // Single crisp 1px outer border on top (skipped when maximized flush to screen)
+                    if !is_maximized {
+                        ui.painter().rect_stroke(
+                            total_rect,
+                            CornerRadius::same(radius),
+                            Stroke::new(1.0_f32, p.border_strong),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
                 });
-
-                // Single crisp 1px outer border on top (skipped when maximized flush to screen)
-                if !is_maximized {
-                    ui.painter().rect_stroke(
-                        total_rect,
-                        CornerRadius::same(radius),
-                        Stroke::new(1.0_f32, p.border_strong),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-            });
         }
 
         if toast_workspace_rect.is_positive() {
             self.render_toast_overlay(ctx, toast_workspace_rect, p);
         }
+
+        self.render_tun_admin_prompt(ctx, p);
 
         self.render_tray_popover(ctx, p);
         self.render_floating_pill(ctx, p);
@@ -661,23 +689,62 @@ fn handle_frameless_resize(ctx: &egui::Context, rect: egui::Rect) {
     }
 }
 
-pub(crate) fn relaunch_as_admin() {
+/// Relaunch this exe elevated through the UAC prompt.
+///
+/// Returns `Ok` once the elevated process has been created; the caller is responsible for
+/// cleaning up and exiting. Returns `Err` (and keeps this instance running) if the user
+/// declines the UAC prompt or the launch fails.
+pub(crate) fn relaunch_as_admin(args: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        if let Ok(exe) = std::env::current_exe() {
-            let exe_str = exe.to_string_lossy().replace('\'', "''");
-            let ps_cmd = format!("Start-Process -FilePath '{exe_str}' -Verb RunAs");
-            if std::process::Command::new("powershell")
-                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
-                .creation_flags(0x0800_0000)
-                .spawn()
-                .is_ok()
-            {
-                std::process::exit(0);
-            }
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: isize,
+                op: *const u16,
+                file: *const u16,
+                params: *const u16,
+                dir: *const u16,
+                show: i32,
+            ) -> isize;
+        }
+        let exe = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {e}"))?;
+        let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+        let op = wide("runas".as_ref());
+        let file = wide(exe.as_os_str());
+        let params = wide(args.as_ref());
+        const SW_SHOWNORMAL: i32 = 1;
+        // Blocks until the UAC prompt is answered.
+        let rc = unsafe {
+            ShellExecuteW(
+                0,
+                op.as_ptr(),
+                file.as_ptr(),
+                params.as_ptr(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        match rc {
+            r if r > 32 => Ok(()),
+            5 => Err("已取消管理员授权".to_string()),
+            r => Err(format!("以管理员身份启动失败（错误码 {r}）")),
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = args;
+        Err("仅支持 Windows".to_string())
+    }
+}
+
+/// Pending "TUN needs admin, restart elevated?" confirmation dialog.
+pub(crate) struct TunAdminPrompt {
+    /// Start the TUN connection automatically after the elevated restart.
+    pub(crate) auto_connect: bool,
+    /// Bring the main window up first (the request may come from the tray popover).
+    pub(crate) wake: bool,
 }
 
 fn main() -> eframe::Result<()> {

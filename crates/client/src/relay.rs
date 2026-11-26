@@ -174,7 +174,8 @@ where
 
     let stats_u = stats.clone();
     let u = tokio::spawn(async move {
-        let _ = protocol::io::copy_with_counter(&mut s_read, &mut quic_send, &stats_u.tx_bytes).await;
+        let _ =
+            protocol::io::copy_with_counter(&mut s_read, &mut quic_send, &stats_u.tx_bytes).await;
         let _ = quic_send.finish();
     });
 
@@ -182,15 +183,14 @@ where
     let d = tokio::spawn(async move {
         let ok = match protocol {
             NodeProtocol::Gacl => matches!(quic_recv.read_u8().await, Ok(AUTH_OK)),
-            NodeProtocol::Hysteria2 => {
-                protocol::hy2::read_hy2_tcp_response(&mut quic_recv)
-                    .await
-                    .is_ok()
-            }
+            NodeProtocol::Hysteria2 => protocol::hy2::read_hy2_tcp_response(&mut quic_recv)
+                .await
+                .is_ok(),
         };
         if ok {
             let _ =
-                protocol::io::copy_with_counter(&mut quic_recv, &mut s_write, &stats_d.rx_bytes).await;
+                protocol::io::copy_with_counter(&mut quic_recv, &mut s_write, &stats_d.rx_bytes)
+                    .await;
         } else if let Some(reply) = fail_reply {
             let _ = s_write.write_all(reply).await;
         }
@@ -223,7 +223,11 @@ pub(crate) async fn relay_direct(
     upstream_preamble: &[u8],
     fail_reply: Option<&[u8]>,
 ) -> Result<()> {
-    let mut upstream = match router.dialer.connect_target(target, DIRECT_CONNECT_TIMEOUT).await {
+    let mut upstream = match router
+        .dialer
+        .connect_target(target, DIRECT_CONNECT_TIMEOUT)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             if let Some(reply) = fail_reply {
@@ -255,25 +259,76 @@ mod tests {
         let (tx0, _rx0) = mpsc::channel(1);
         dispatch.insert(SOCKS_FLOW_MIN, tx0);
 
-        let id1 = reserve_flow_id(&socks_cur, &dispatch, mpsc::channel(1).0, SOCKS_FLOW_MIN, SOCKS_FLOW_MAX).unwrap();
-        let id2 = reserve_flow_id(&socks_cur, &dispatch, mpsc::channel(1).0, SOCKS_FLOW_MIN, SOCKS_FLOW_MAX).unwrap();
-        let id3 = reserve_flow_id(&socks_cur, &dispatch, mpsc::channel(1).0, SOCKS_FLOW_MIN, SOCKS_FLOW_MAX).unwrap();
+        let id1 = reserve_flow_id(
+            &socks_cur,
+            &dispatch,
+            mpsc::channel(1).0,
+            SOCKS_FLOW_MIN,
+            SOCKS_FLOW_MAX,
+        )
+        .unwrap();
+        let id2 = reserve_flow_id(
+            &socks_cur,
+            &dispatch,
+            mpsc::channel(1).0,
+            SOCKS_FLOW_MIN,
+            SOCKS_FLOW_MAX,
+        )
+        .unwrap();
+        let id3 = reserve_flow_id(
+            &socks_cur,
+            &dispatch,
+            mpsc::channel(1).0,
+            SOCKS_FLOW_MIN,
+            SOCKS_FLOW_MAX,
+        )
+        .unwrap();
         assert_eq!(id1, SOCKS_FLOW_MAX - 1);
         assert_eq!(id2, SOCKS_FLOW_MAX);
         assert_eq!(id3, SOCKS_FLOW_MIN + 1);
         assert!(id3 <= SOCKS_FLOW_MAX);
 
-        let t1 = reserve_flow_id(&tun_cur, &dispatch, mpsc::channel(1).0, TUN_FLOW_MIN, TUN_FLOW_MAX).unwrap();
-        let t2 = reserve_flow_id(&tun_cur, &dispatch, mpsc::channel(1).0, TUN_FLOW_MIN, TUN_FLOW_MAX).unwrap();
-        let t3 = reserve_flow_id(&tun_cur, &dispatch, mpsc::channel(1).0, TUN_FLOW_MIN, TUN_FLOW_MAX).unwrap();
+        let t1 = reserve_flow_id(
+            &tun_cur,
+            &dispatch,
+            mpsc::channel(1).0,
+            TUN_FLOW_MIN,
+            TUN_FLOW_MAX,
+        )
+        .unwrap();
+        let t2 = reserve_flow_id(
+            &tun_cur,
+            &dispatch,
+            mpsc::channel(1).0,
+            TUN_FLOW_MIN,
+            TUN_FLOW_MAX,
+        )
+        .unwrap();
+        let t3 = reserve_flow_id(
+            &tun_cur,
+            &dispatch,
+            mpsc::channel(1).0,
+            TUN_FLOW_MIN,
+            TUN_FLOW_MAX,
+        )
+        .unwrap();
         assert_eq!(t1, TUN_FLOW_MAX - 1);
         assert_eq!(t2, TUN_FLOW_MAX);
         assert_eq!(t3, TUN_FLOW_MIN);
 
         let tiny_cur = AtomicU16::new(10);
         let tiny_map: UdpDispatchMap = Arc::new(DashMap::new());
-        assert_eq!(reserve_flow_id(&tiny_cur, &tiny_map, mpsc::channel(1).0, 10, 11), Some(10));
-        assert_eq!(reserve_flow_id(&tiny_cur, &tiny_map, mpsc::channel(1).0, 10, 11), Some(11));
-        assert_eq!(reserve_flow_id(&tiny_cur, &tiny_map, mpsc::channel(1).0, 10, 11), None);
+        assert_eq!(
+            reserve_flow_id(&tiny_cur, &tiny_map, mpsc::channel(1).0, 10, 11),
+            Some(10)
+        );
+        assert_eq!(
+            reserve_flow_id(&tiny_cur, &tiny_map, mpsc::channel(1).0, 10, 11),
+            Some(11)
+        );
+        assert_eq!(
+            reserve_flow_id(&tiny_cur, &tiny_map, mpsc::channel(1).0, 10, 11),
+            None
+        );
     }
 }
