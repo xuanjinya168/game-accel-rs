@@ -465,11 +465,13 @@ impl GameAccelApp {
                             self.tray_popover_ever_focused = false;
                         } else {
                             let ppp = ctx.pixels_per_point().max(1.0);
+                            let pop_h =
+                                crate::views::tray_popover::desired_popover_height(&self.cfg);
                             self.tray_popover_pos = crate::tray::clamp_popover_position(
                                 px,
                                 py,
                                 crate::views::tray_popover::TRAY_POPOVER_W,
-                                crate::views::tray_popover::TRAY_POPOVER_H,
+                                pop_h,
                                 ppp,
                             );
                             self.tray_popover_just_opened = true;
@@ -741,7 +743,7 @@ impl GameAccelApp {
 
     /// "TUN needs admin — restart elevated?" confirmation dialog.
     pub(crate) fn render_tun_admin_prompt(&mut self, ctx: &egui::Context, p: crate::ThemePalette) {
-        use crate::widgets::{modal_dialog, primary_btn, soft_btn};
+        use crate::widgets::{aligned_row, modal_dialog, primary_btn, soft_btn};
         use eframe::egui::{Align, Layout, RichText};
 
         let Some(prompt) = self.tun_admin_prompt.as_mut() else {
@@ -760,31 +762,23 @@ impl GameAccelApp {
         let dismissed = modal_dialog(
             ctx,
             "tun_admin_prompt",
-            "TUN 模式需要管理员权限",
-            420.0,
+            "需要管理员权限",
+            380.0,
             p,
             |ui| {
                 ui.label(
-                    RichText::new(
-                        "TUN 模式会创建虚拟网卡接管全局 TCP / UDP 流量，需要以管理员身份运行。",
-                    )
-                    .size(crate::theme::FONT_SM)
-                    .color(p.text_secondary),
-                );
-                ui.add_space(4.0);
-                ui.label(
                     RichText::new(if auto_connect {
-                        "是否以管理员身份重新启动 GameAccel？重启后将自动开启 TUN 加速。"
+                        "启用 TUN 全局虚拟网卡需要管理员权限，授权重启后将自动开启加速。"
                     } else {
-                        "是否以管理员身份重新启动 GameAccel？"
+                        "启用 TUN 全局虚拟网卡需要管理员权限，是否现在重启程序？"
                     })
                     .size(crate::theme::FONT_SM)
                     .color(p.text_secondary),
                 );
                 ui.add_space(14.0);
-                ui.horizontal(|ui| {
+                aligned_row(ui, 30.0, |ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if primary_btn(ui, "以管理员身份重启", p).clicked() {
+                        if primary_btn(ui, "管理员重启", p).clicked() {
                             confirm = true;
                         }
                         if soft_btn(ui, "取消", p).clicked() {

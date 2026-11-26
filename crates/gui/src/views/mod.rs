@@ -10,7 +10,7 @@ use crate::storage::save_config;
 use crate::theme::{
     FONT_BODY, FONT_SM, FONT_SUB, FONT_TITLE, FONT_XS, ThemeMode, ThemePalette, apply_theme,
 };
-use crate::widgets::{draw_status_pill, hairline_divider};
+use crate::widgets::{aligned_row, draw_status_pill, hairline_divider};
 use crate::{APP_VERSION, ConnState, GameAccelApp, NavTab};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Layout, PointerButton, Pos2, RichText, Sense,
@@ -26,7 +26,7 @@ impl GameAccelApp {
     ) {
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
-        // Optically aligned brand header (also acts as frameless window drag handle)
+        // Optically aligned brand header (acts as frameless window drag handle; Beta badge removed)
         let (brand_rect, brand_resp) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), 36.0),
             Sense::click_and_drag(),
@@ -37,14 +37,14 @@ impl GameAccelApp {
 
         let painter = ui.painter();
         let logo_rect = egui::Rect::from_min_size(
-            Pos2::new(brand_rect.left(), brand_rect.center().y - 16.0),
+            Pos2::new(brand_rect.left() + 2.0, brand_rect.center().y - 16.0),
             Vec2::new(32.0, 32.0),
         );
         icons::draw_brand_logo(painter, logo_rect, p);
 
         let text_x = logo_rect.right() + 10.0;
         let title_y = logo_rect.top() + 9.0;
-        let sub_y = logo_rect.bottom() - 6.0;
+        let sub_y = logo_rect.bottom() - 6.5;
 
         painter.text(
             Pos2::new(text_x, title_y),
@@ -53,56 +53,25 @@ impl GameAccelApp {
             FontId::proportional(FONT_SUB),
             p.text_primary,
         );
-
-        let ver_galley = ui.fonts(|f| {
-            f.layout_no_wrap(
-                APP_VERSION.to_string(),
-                FontId::proportional(FONT_XS),
-                p.text_muted,
-            )
-        });
-        let ver_w = ver_galley.size().x;
-        painter.galley(
-            Pos2::new(text_x, sub_y - ver_galley.size().y * 0.5),
-            ver_galley,
+        painter.text(
+            Pos2::new(text_x, sub_y),
+            egui::Align2::LEFT_CENTER,
+            APP_VERSION,
+            FontId::monospace(FONT_XS),
             p.text_muted,
         );
 
-        let beta_galley = ui.fonts(|f| {
-            f.layout_no_wrap(
-                "Beta".to_string(),
-                FontId::proportional(FONT_XS),
-                p.accent_text,
-            )
-        });
-        let pill_rect = egui::Rect::from_min_size(
-            Pos2::new(
-                text_x + ver_w + 5.0,
-                sub_y - (beta_galley.size().y + 2.0) * 0.5,
-            ),
-            Vec2::new(beta_galley.size().x + 8.0, beta_galley.size().y + 2.0),
-        );
-        painter.rect_filled(pill_rect, CornerRadius::same(4), p.accent_soft);
-        painter.galley(
-            Pos2::new(
-                pill_rect.left() + 4.0,
-                pill_rect.center().y - beta_galley.size().y * 0.5,
-            ),
-            beta_galley,
-            p.accent_text,
-        );
-
-        ui.add_space(24.0);
+        ui.add_space(20.0);
 
         let mut items = vec![
-            (NavTab::Dashboard, 0u8, "加速首页"),
-            (NavTab::Nodes, 1u8, "节点与订阅"),
-            (NavTab::Logs, 2u8, "连接与日志"),
+            (NavTab::Dashboard, 0u8, "加速面板"),
+            (NavTab::Nodes, 1u8, "节点管理"),
+            (NavTab::Logs, 2u8, "运行日志"),
         ];
         if self.cfg.show_admin_menu {
-            items.push((NavTab::Admin, 4u8, "服务端管理"));
+            items.push((NavTab::Admin, 4u8, "服务端"));
         }
-        items.push((NavTab::Settings, 3u8, "系统设置"));
+        items.push((NavTab::Settings, 3u8, "偏好设置"));
 
         for (tab, icon_kind, label) in items {
             let active = self.active_tab == tab;
@@ -126,45 +95,63 @@ impl GameAccelApp {
                 );
             }
             let icon_color = if active { p.accent } else { p.text_muted };
-            let icon_center = Pos2::new(rect.left() + 18.0, rect.center().y);
+            let icon_center = Pos2::new(rect.left() + 16.0, rect.center().y);
             icons::draw_nav_icon(painter, icon_center, icon_kind, icon_color);
 
-            painter.text(
-                Pos2::new(rect.left() + 36.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                label,
-                FontId::proportional(FONT_BODY),
-                if active {
-                    p.text_primary
-                } else {
-                    p.text_secondary
-                },
+            let fg = if active {
+                p.text_primary
+            } else {
+                p.text_secondary
+            };
+            let galley =
+                ui.fonts(|f| f.layout_no_wrap(label.to_string(), FontId::proportional(FONT_BODY), fg));
+            painter.galley(
+                Pos2::new(rect.left() + 34.0, rect.center().y - galley.size().y * 0.5),
+                galley,
+                fg,
             );
             if resp.clicked() {
                 self.active_tab = tab;
             }
-            ui.add_space(4.0);
+            ui.add_space(3.0);
         }
 
-        // Minimalist footer pinned at bottom
+        // Minimalist single-row footer pinned at bottom
         let remaining = ui.available_height();
-        if remaining > 48.0 {
-            ui.add_space(remaining - 46.0);
+        if remaining > 34.0 {
+            ui.add_space(remaining - 32.0);
         }
         hairline_divider(ui, p);
         ui.add_space(6.0);
-        ui.label(
-            RichText::new(&self.cfg.listen_addr)
-                .size(FONT_SM)
-                .monospace()
-                .color(p.text_secondary),
-        );
-        let (perm_txt, perm_col) = if self.is_admin {
-            ("● 管理员 · TUN 就绪", p.success_text)
-        } else {
-            ("○ 普通权限", p.text_muted)
-        };
-        ui.label(RichText::new(perm_txt).size(FONT_XS).color(perm_col));
+        aligned_row(ui, 20.0, |ui| {
+            ui.label(
+                RichText::new(&self.cfg.listen_addr)
+                    .size(FONT_SM)
+                    .monospace()
+                    .color(p.text_secondary),
+            );
+            if self.is_admin {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let font = FontId::proportional(FONT_XS);
+                    let galley =
+                        ui.fonts(|f| f.layout_no_wrap("TUN".to_string(), font, p.success_text));
+                    let (r, _) = ui.allocate_exact_size(
+                        Vec2::new(galley.size().x + 10.0, 18.0),
+                        Sense::hover(),
+                    );
+                    ui.painter()
+                        .rect_filled(r, CornerRadius::same(4), p.success_soft);
+                    ui.painter().galley(
+                        Pos2::new(
+                            r.center().x - galley.size().x * 0.5,
+                            r.center().y - galley.size().y * 0.5,
+                        ),
+                        galley,
+                        p.success_text,
+                    );
+                });
+            }
+        });
     }
 
     pub(crate) fn render_right_workspace(
@@ -175,14 +162,14 @@ impl GameAccelApp {
     ) {
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
-        // Integrated frameless title bar with exact dynamic non-overlapping drag handle
-        ui.horizontal(|ui| {
+        // Integrated frameless title bar locked to 28px height for exact horizontal centering
+        aligned_row(ui, 28.0, |ui| {
             let page_title = match self.active_tab {
-                NavTab::Dashboard => "加速首页",
-                NavTab::Nodes => "节点与订阅",
-                NavTab::Logs => "连接与日志",
-                NavTab::Admin => "服务端管理",
-                NavTab::Settings => "系统设置",
+                NavTab::Dashboard => "加速面板",
+                NavTab::Nodes => "节点管理",
+                NavTab::Logs => "运行日志",
+                NavTab::Admin => "服务端",
+                NavTab::Settings => "偏好设置",
             };
             let title_resp = ui.add(
                 egui::Label::new(
@@ -294,14 +281,12 @@ impl GameAccelApp {
                 // Compact status pill
                 let reconnect = self.reconnect_status();
                 let pill = match (self.state, reconnect) {
-                    (ConnState::Connected, _) => "已连接".to_string(),
-                    (ConnState::Connecting, Some((attempt, 0))) => {
-                        format!("重连中 · 第 {attempt} 次")
-                    }
+                    (ConnState::Connected, _) => "已加速".to_string(),
+                    (ConnState::Connecting, Some((attempt, 0))) => format!("重连 #{attempt}"),
                     (ConnState::Connecting, Some((attempt, secs))) => {
-                        format!("重连中 · {secs} 秒后重试（第 {attempt} 次）")
+                        format!("重连 #{attempt} ({secs}s)")
                     }
-                    (ConnState::Connecting, None) => "连接中...".to_string(),
+                    (ConnState::Connecting, None) => "连接中…".to_string(),
                     (ConnState::Disconnected, _) => "未连接".to_string(),
                 };
                 let (dot_col, bg, fg, stroke_col) = match self.state {
@@ -318,7 +303,7 @@ impl GameAccelApp {
                 };
                 draw_status_pill(ui, &pill, dot_col, bg, fg, stroke_col);
 
-                // Exact remaining empty space between status pill and title -> drag handle
+                // Remaining empty space between status pill and title -> drag handle
                 let gap_w = ui.available_width();
                 if gap_w > 6.0 {
                     let (_, gap_resp) =
@@ -333,9 +318,9 @@ impl GameAccelApp {
             });
         });
 
-        ui.add_space(16.0);
+        ui.add_space(14.0);
 
-        // Responsive max-width centering on very wide/maximized monitors so layouts stay balanced
+        // Responsive max-width centering on wide/maximized monitors
         let max_content_w = match self.active_tab {
             NavTab::Logs | NavTab::Admin => 1180.0,
             _ => 960.0,

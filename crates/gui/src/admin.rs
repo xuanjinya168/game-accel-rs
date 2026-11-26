@@ -145,6 +145,8 @@ pub(crate) struct AdminState {
     pub last_refresh: Option<Instant>,
     pub link_editor: Option<AdminLinkEditor>,
     pub server_editor: Option<AdminServerEditor>,
+    /// Link ID whose `更多 ▾` action popover is currently open.
+    pub open_more_link_id: Option<String>,
     /// Inline confirmation guard for destructive actions (delete / reset token).
     pub confirm_action: Option<(String, String)>, // (action_kind, link_id)
 }
@@ -163,6 +165,7 @@ impl Default for AdminState {
             last_refresh: None,
             link_editor: None,
             server_editor: None,
+            open_more_link_id: None,
             confirm_action: None,
         }
     }
@@ -176,6 +179,7 @@ impl AdminState {
         self.links.clear();
         self.last_refresh = None;
         self.link_editor = None;
+        self.open_more_link_id = None;
         self.confirm_action = None;
         self.busy = false;
     }

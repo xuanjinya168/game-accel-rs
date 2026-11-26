@@ -132,7 +132,22 @@
   .link-name { font-size: 14.5px; font-weight: 600; }
   .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; color: var(--muted); }
   .link-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  .progress { height: 5px; background: var(--border); border-radius: 99px; overflow: hidden; margin-top: 6px; max-width: 260px; }
+  .more-wrap { position: relative; display: inline-block; }
+  .more-menu {
+    position: absolute; right: 0; top: calc(100% + 5px); min-width: 124px;
+    background: var(--card); border: 1px solid var(--border-strong); border-radius: 10px;
+    padding: 5px; box-shadow: 0 10px 26px rgba(0,0,0,0.16); z-index: 40;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .more-item {
+    width: 100%; text-align: left; padding: 6px 10px; border-radius: 6px; border: none;
+    background: transparent; color: var(--text); font-size: 12.5px; cursor: pointer;
+  }
+  .more-item:hover { background: var(--card-alt); }
+  .more-item-danger { color: var(--danger-text); }
+  .more-item-danger:hover { background: var(--danger-soft); }
+  .more-sep { height: 1px; background: var(--border); margin: 3px 0; }
+  .progress { height: 5px; background: var(--border); border-radius: 99px; overflow: hidden; width: 96px; display: inline-block; vertical-align: middle; margin-left: 8px; }
   .progress-bar { height: 100%; background: var(--accent); border-radius: 99px; }
 
   .tabs { display: inline-flex; gap: 4px; background: var(--card-alt); padding: 4px; border-radius: 10px; border: 1px solid var(--border); margin-bottom: 16px; }
@@ -182,7 +197,6 @@
       <div class="brand-icon">⚡</div>
       <div>
         <div style="font-size:17px;font-weight:700">GameAccel 管理后台</div>
-        <div style="font-size:12px;color:var(--muted)">QUIC / UDP 极简加速服务端</div>
       </div>
     </div>
     <div class="field">
@@ -238,25 +252,22 @@
     <div class="card">
       <div class="kpi-label">分享链接数</div>
       <div class="kpi-val" id="kpiLinks">0 / 0</div>
-      <div class="kpi-sub">启用 / 总数（热生效）</div>
+      <div class="kpi-sub">启用 / 总数</div>
     </div>
   </div>
 
   <!-- Tabs -->
   <div class="tabs">
-    <button class="tab active" id="tabLinks" onclick="switchTab('links')">分享链接与用户</button>
+    <button class="tab active" id="tabLinks" onclick="switchTab('links')">分享链接</button>
     <button class="tab" id="tabLogs" onclick="switchTab('logs')">访问日志</button>
-    <button class="tab" id="tabSettings" onclick="switchTab('settings')">节点与安全设置</button>
+    <button class="tab" id="tabSettings" onclick="switchTab('settings')">节点与安全</button>
   </div>
 
   <!-- Tab 1: Links -->
   <div id="panelLinks" class="card">
     <div class="section-head">
-      <div>
-        <div class="section-title">多用户分享链接管理</div>
-        <div style="font-size:12px;color:var(--muted)">新建、禁用、重置 Token 均毫秒级热生效，无需重启服务</div>
-      </div>
-      <button class="btn btn-primary" onclick="openCreateModal()">+ 新建分享链接</button>
+      <div class="section-title">分享链接</div>
+      <button class="btn btn-primary" onclick="openCreateModal()">+ 新建链接</button>
     </div>
     <div id="linkList" class="link-list"></div>
   </div>
@@ -264,13 +275,10 @@
   <!-- Tab 2: Access Logs -->
   <div id="panelLogs" class="card hidden">
     <div class="section-head">
-      <div>
-        <div class="section-title">主域名访问日志</div>
-        <div style="font-size:12px;color:var(--muted)">自动嗅探 HTTPS SNI 与 HTTP Host 还原主域名（含 TUN 模式），落盘 10MB 自动轮转防爆盘</div>
-      </div>
+      <div class="section-title">访问日志</div>
       <div style="display:flex;align-items:center;gap:8px">
-        <button class="btn btn-sm" id="logToggleBtn" onclick="toggleAccessLogs()">记录中 ●</button>
-        <button class="btn btn-sm btn-danger" onclick="clearAccessLogs()">清空日志</button>
+        <button class="btn btn-sm" id="logToggleBtn" title="点击暂停或恢复记录" onclick="toggleAccessLogs()">● 记录中</button>
+        <button class="btn btn-sm btn-danger" onclick="clearAccessLogs()">清空</button>
       </div>
     </div>
     <div class="filter-bar">
@@ -286,7 +294,7 @@
         <option value="PANEL">后台审计</option>
         <option value="AUTH">鉴权拦截</option>
       </select>
-      <input id="logSearch" placeholder="搜索主域名 / 目标 / IP..." oninput="refreshLogs()" style="flex:1;min-width:180px" />
+      <input id="logSearch" placeholder="搜索域名 / 目标 / IP…" oninput="refreshLogs()" style="flex:1;min-width:180px" />
       <span id="logCountHint" class="mono"></span>
     </div>
     <div class="table-wrap">
@@ -311,7 +319,7 @@
   <!-- Tab 3: Settings -->
   <div id="panelSettings" class="grid-2 hidden">
     <div class="card">
-      <div class="section-title" style="margin-bottom:12px">对外节点信息（用于生成 gacl:// 与订阅）</div>
+      <div class="section-title" style="margin-bottom:12px">节点对外信息</div>
       <div class="field">
         <label>公网 IP 或域名</label>
         <input id="setHost" placeholder="203.0.113.10" />
@@ -325,13 +333,13 @@
         <input id="setSni" placeholder="node.example.com" />
       </div>
       <label class="checkbox-row">
-        <input type="checkbox" id="setInsecure" /> 允许客户端跳过证书校验（仅自签测试时勾选）
+        <input type="checkbox" id="setInsecure" /> 允许跳过证书校验（自签证书）
       </label>
-      <button class="btn btn-primary" onclick="saveNodeSettings()">保存节点设置</button>
+      <button class="btn btn-primary" onclick="saveNodeSettings()">保存设置</button>
     </div>
 
     <div class="card">
-      <div class="section-title" style="margin-bottom:12px">修改管理后台密码</div>
+      <div class="section-title" style="margin-bottom:12px">修改管理密码</div>
       <div class="field">
         <label>原密码</label>
         <input id="oldPass" type="password" />
@@ -350,19 +358,19 @@
   <div class="modal">
     <div class="modal-title" id="modalTitle">新建分享链接</div>
     <div class="field">
-      <label>备注名称（例如：朋友A / 办公室电脑）</label>
-      <input id="mName" placeholder="请输入名称" />
+      <label>备注名称</label>
+      <input id="mName" placeholder="例如：主力电脑 / 朋友联机" />
     </div>
     <div class="field">
-      <label>流量上限 GB（留空或填 0 表示不限流量）</label>
-      <input id="mLimit" type="number" step="0.5" min="0" placeholder="例如：100" />
+      <label>流量上限 (GB)</label>
+      <input id="mLimit" type="number" step="0.5" min="0" placeholder="留空或填 0 表示不限" />
     </div>
     <div class="field">
-      <label>到期日期 YYYY-MM-DD（留空表示永不过期）</label>
+      <label>到期日期</label>
       <input id="mExpire" type="date" />
     </div>
     <label class="checkbox-row">
-      <input type="checkbox" id="mGameDup" checked /> 默认开启游戏模式小包双发抗丢包
+      <input type="checkbox" id="mGameDup" checked /> 开启游戏小包双发
     </label>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal()">取消</button>
@@ -377,6 +385,7 @@ let linksCache = [];
 let pollTimer = null;
 let currentTab = 'links';
 let accessLogEnabled = true;
+let openMoreLinkId = null;
 
 function toast(msg) {
   const el = document.getElementById('toast');
@@ -517,9 +526,9 @@ async function refreshLogs() {
     const data = await api(`/api/logs?link_id=${lid}&proto=${pr}&q=${q}`);
     accessLogEnabled = !!data.enabled;
     const btn = document.getElementById('logToggleBtn');
-    btn.textContent = accessLogEnabled ? '记录中 ●（点击暂停）' : '已暂停 ○（点击开启）';
+    btn.textContent = accessLogEnabled ? '● 记录中' : '○ 已暂停';
     btn.className = 'btn btn-sm ' + (accessLogEnabled ? 'btn-primary' : '');
-    document.getElementById('logCountHint').textContent = `显示 ${data.logs.length} / 缓存 ${data.total_buffered} 条`;
+    document.getElementById('logCountHint').textContent = `${data.logs.length} / ${data.total_buffered} 条`;
     renderLogs(data.logs);
   } catch (e) {}
 }
@@ -610,43 +619,55 @@ function esc(s) {
 function renderLinks(links) {
   const el = document.getElementById('linkList');
   if (!links.length) {
-    el.innerHTML = '<div style="text-align:center;color:var(--muted);padding:26px">暂无分享链接，点击右上角「+ 新建分享链接」创建</div>';
+    el.innerHTML = '<div style="text-align:center;color:var(--muted);padding:26px">暂无分享链接，点击右上角「+ 新建链接」创建</div>';
     return;
   }
   el.innerHTML = links.map(l => {
     const used = l.tx_bytes + l.rx_bytes;
     const limitBytes = l.traffic_limit_gb ? l.traffic_limit_gb * 1024 * 1024 * 1024 : 0;
     const pct = limitBytes > 0 ? Math.min(100, Math.round(used * 100 / limitBytes)) : 0;
+    const isOpen = openMoreLinkId === l.id;
     return `
       <div class="link-item">
         <div class="link-meta">
           <div class="link-title-row">
             <span class="link-name">${esc(l.name)}</span>
             ${statusBadge(l.status)}
-            ${l.game_dup ? '<span class="badge badge-accent">游戏双发</span>' : ''}
             ${l.online_conns > 0 ? `<span class="badge badge-ok">在线 ${l.online_conns}</span>` : ''}
           </div>
-          <div class="mono">
-            流量: ${fmtBytes(used)}${l.traffic_limit_gb ? ` / ${l.traffic_limit_gb} GB` : ' / 不限'}
-            (↑ ${fmtBytes(l.tx_bytes)} · ↓ ${fmtBytes(l.rx_bytes)})
-            · 到期: ${l.expire_at ? esc(l.expire_at) : '永不过期'}
+          <div class="mono" title="上传 ${fmtBytes(l.tx_bytes)} · 下载 ${fmtBytes(l.rx_bytes)}">
+            ${fmtBytes(used)}${l.traffic_limit_gb ? ` / ${l.traffic_limit_gb} GB` : ' / 不限'}
+            · ${l.expire_at ? esc(l.expire_at) : '长期有效'}
+            ${limitBytes > 0 ? `<span class="progress"><span class="progress-bar" style="display:block;width:${pct}%"></span></span>` : ''}
           </div>
-          ${limitBytes > 0 ? `<div class="progress"><div class="progress-bar" style="width:${pct}%"></div></div>` : ''}
         </div>
         <div class="link-actions" data-id="${esc(l.id)}">
           <button class="btn btn-sm btn-primary" data-act="copy-share">复制 gacl://</button>
-          <button class="btn btn-sm" data-act="copy-hy2">复制 hy2://</button>
-          <button class="btn btn-sm" data-act="copy-sub">复制订阅</button>
-          <button class="btn btn-sm" data-act="toggle">${l.enabled ? '禁用' : '启用'}</button>
-          <button class="btn btn-sm" data-act="edit">编辑</button>
-          <button class="btn btn-sm" data-act="reset-token">重置密钥</button>
-          <button class="btn btn-sm" data-act="reset-traffic">清零流量</button>
-          <button class="btn btn-sm btn-danger" data-act="delete">删除</button>
+          <button class="btn btn-sm" data-act="copy-hy2">hy2://</button>
+          <button class="btn btn-sm" data-act="copy-sub">订阅</button>
+          <div class="more-wrap">
+            <button class="btn btn-sm" data-act="more-toggle">更多 ▾</button>
+            <div class="more-menu ${isOpen ? '' : 'hidden'}">
+              <button class="more-item" data-act="edit">编辑配额</button>
+              <button class="more-item" data-act="toggle">${l.enabled ? '禁用链接' : '启用链接'}</button>
+              <button class="more-item" data-act="reset-traffic">清零流量</button>
+              <div class="more-sep"></div>
+              <button class="more-item" data-act="reset-token">重置密钥</button>
+              <button class="more-item more-item-danger" data-act="delete">删除链接</button>
+            </div>
+          </div>
         </div>
       </div>
     `;
   }).join('');
 }
+
+document.addEventListener('click', e => {
+  if (openMoreLinkId && !e.target.closest('.more-wrap')) {
+    openMoreLinkId = null;
+    renderLinks(linksCache);
+  }
+});
 
 // Delegated handler: never interpolate user-controlled strings into inline JS handlers,
 // and resolve share/token data from linksCache instead of embedding it in HTML attributes.
@@ -657,6 +678,13 @@ document.getElementById('linkList').addEventListener('click', e => {
   if (!box) return;
   const id = box.dataset.id;
   const l = linksCache.find(x => x.id === id);
+  if (btn.dataset.act === 'more-toggle') {
+    e.stopPropagation();
+    openMoreLinkId = openMoreLinkId === id ? null : id;
+    renderLinks(linksCache);
+    return;
+  }
+  openMoreLinkId = null;
   switch (btn.dataset.act) {
     case 'copy-share':
       if (l) copyText(l.share_uri, 'gacl:// 分享链接');

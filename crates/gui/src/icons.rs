@@ -341,6 +341,23 @@ pub fn draw_search_icon(painter: &Painter, center: Pos2, color: Color32) {
     );
 }
 
+/// Crisp geometric up/down flow arrow centered at `c` (avoids baseline drift of Unicode `↑`/`↓`).
+pub fn draw_flow_arrow(painter: &Painter, c: Pos2, up: bool, col: Color32) {
+    let s = Stroke::new(1.4_f32, col);
+    let half_h = 3.8_f32;
+    let wing = 2.6_f32;
+    let top = Pos2::new(c.x, c.y - half_h);
+    let bot = Pos2::new(c.x, c.y + half_h);
+    painter.line_segment([top, bot], s);
+    if up {
+        painter.line_segment([top, Pos2::new(c.x - wing, top.y + wing)], s);
+        painter.line_segment([top, Pos2::new(c.x + wing, top.y + wing)], s);
+    } else {
+        painter.line_segment([bot, Pos2::new(c.x - wing, bot.y - wing)], s);
+        painter.line_segment([bot, Pos2::new(c.x + wing, bot.y - wing)], s);
+    }
+}
+
 /// Animated pill toggle switch (`34 x 19`).
 pub fn pill_toggle(
     ui: &mut eframe::egui::Ui,

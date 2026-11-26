@@ -321,9 +321,9 @@ impl GameAccelApp {
             really_quit: false,
         };
         app.push_log(if is_admin {
-            "客户端已就绪（管理员权限，已支持 TUN 全局虚拟网卡模式）"
+            "客户端已就绪（管理员权限，TUN 虚拟网卡可用）"
         } else {
-            "客户端已就绪，点击「一键开启加速」启动 QUIC/UDP 通道"
+            "客户端已就绪，点击「开启加速」启动 QUIC/UDP 通道"
         });
         // Started by `restart_as_admin(auto_connect = true)`: bring TUN up once the previous
         // instance has finished releasing the listener / system proxy.
@@ -530,7 +530,7 @@ impl eframe::App for GameAccelApp {
                         handle_frameless_resize(ctx, total_rect);
                     }
 
-                    let sidebar_w = 192.0;
+                    let sidebar_w = 176.0;
                     let split_x = total_rect.min.x + sidebar_w;
 
                     // Paint left sidebar & right workspace as two non-overlapping rounded halves
@@ -580,10 +580,10 @@ impl eframe::App for GameAccelApp {
                             Vec2::new(sidebar_w, total_rect.height()),
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                Frame::new().inner_margin(Margin::symmetric(16, 20)).show(
+                                Frame::new().inner_margin(Margin::symmetric(14, 18)).show(
                                     ui,
                                     |ui| {
-                                        ui.set_min_height((total_rect.height() - 40.0).max(200.0));
+                                        ui.set_min_height((total_rect.height() - 36.0).max(200.0));
                                         self.render_sidebar_contents(ui, ctx, p);
                                     },
                                 );
@@ -595,11 +595,11 @@ impl eframe::App for GameAccelApp {
                             Vec2::new(right_w, total_rect.height()),
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                Frame::new().inner_margin(Margin::symmetric(28, 22)).show(
+                                Frame::new().inner_margin(Margin::symmetric(26, 20)).show(
                                     ui,
                                     |ui| {
-                                        ui.set_width((right_w - 56.0).max(360.0));
-                                        ui.set_min_height((total_rect.height() - 44.0).max(200.0));
+                                        ui.set_width((right_w - 52.0).max(360.0));
+                                        ui.set_min_height((total_rect.height() - 40.0).max(200.0));
                                         self.render_right_workspace(ui, ctx, p);
                                     },
                                 );
@@ -765,8 +765,8 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
-            .with_inner_size([1040.0, 800.0])
-            .with_min_inner_size([860.0, 660.0])
+            .with_inner_size([940.0, 660.0])
+            .with_min_inner_size([800.0, 560.0])
             .with_icon(Arc::new(build_app_icon())),
         centered: true,
         persist_window: false,

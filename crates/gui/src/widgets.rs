@@ -29,6 +29,138 @@ pub fn hairline_divider(ui: &mut egui::Ui, p: ThemePalette) {
     );
 }
 
+/// Deterministic fixed-height horizontal row (`Align::Center`) that locks `max_rect.height()`
+/// upfront so left-side text labels and taller right-side controls share the exact same centerline.
+pub fn aligned_row<R>(
+    ui: &mut egui::Ui,
+    height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let w = ui.available_width().max(1.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(w, height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_height(height);
+            add_contents(ui)
+        },
+    )
+}
+
+/// Truncates `text` to fit within `max_width` pixels using binary search over glyph metrics,
+/// appending `…` only when needed.
+pub fn elide_text(ui: &egui::Ui, text: &str, font: FontId, max_width: f32) -> String {
+    if max_width <= 8.0 || text.is_empty() {
+        return String::new();
+    }
+    let full_w = ui.fonts(|f| {
+        f.layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+    });
+    if full_w <= max_width {
+        return text.to_string();
+    }
+    let ellipsis = "…";
+    let ell_w = ui.fonts(|f| {
+        f.layout_no_wrap(ellipsis.to_string(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+    });
+    let target_w = (max_width - ell_w).max(0.0);
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars[..mid].iter().collect();
+        let w = ui.fonts(|f| {
+            f.layout_no_wrap(candidate, font.clone(), Color32::WHITE)
+                .size()
+                .x
+        });
+        if w <= target_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let prefix: String = chars[..lo].iter().collect();
+    format!("{prefix}{ellipsis}")
+}
+
+/// Unified painter-drawn segmented control with optical galley centering and optional hover tips.
+pub fn segmented_control<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    selected: T,
+    options: &[(T, &str, Option<&str>)],
+    size: Vec2,
+    font_size: f32,
+    p: ThemePalette,
+) -> Option<T> {
+    let (pill_rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect(
+        pill_rect,
+        CornerRadius::same(8),
+        p.bg_card_alt,
+        Stroke::new(1.0_f32, p.border_subtle),
+        StrokeKind::Inside,
+    );
+    let n = options.len().max(1) as f32;
+    let pad = 2.5_f32;
+    let gap = 2.0_f32;
+    let seg_w = ((size.x - pad * 2.0 - gap * (n - 1.0)) / n).max(16.0);
+    let seg_h = (size.y - pad * 2.0).max(14.0);
+    let font = FontId::proportional(font_size);
+
+    let mut picked = None;
+    for (idx, &(val, lbl, tip)) in options.iter().enumerate() {
+        let x = pill_rect.left() + pad + idx as f32 * (seg_w + gap);
+        let seg_rect =
+            egui::Rect::from_min_size(Pos2::new(x, pill_rect.top() + pad), Vec2::new(seg_w, seg_h));
+        let mut resp = ui.interact(seg_rect, ui.id().with((id_salt, idx)), Sense::click());
+        if let Some(tip_text) = tip {
+            resp = resp.on_hover_text(tip_text);
+        }
+        let active = selected == val;
+        let fill = if active {
+            p.bg_card
+        } else if resp.hovered() {
+            p.bg_nav_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        let stroke = if active {
+            Stroke::new(1.0_f32, p.border_subtle)
+        } else {
+            Stroke::NONE
+        };
+        let fg = if active { p.text_primary } else { p.text_muted };
+        let galley = ui.fonts(|f| f.layout_no_wrap(lbl.to_string(), font.clone(), fg));
+        let painter = ui.painter();
+        painter.rect(
+            seg_rect,
+            CornerRadius::same(6),
+            fill,
+            stroke,
+            StrokeKind::Inside,
+        );
+        painter.galley(
+            Pos2::new(
+                seg_rect.center().x - galley.size().x * 0.5,
+                seg_rect.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            fg,
+        );
+        if resp.clicked() && !active {
+            picked = Some(val);
+        }
+    }
+    picked
+}
+
 /// Unified primary Terracotta button (consistent hover & press feedback everywhere).
 pub fn primary_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette) -> egui::Response {
     let font = FontId::proportional(FONT_SM);
@@ -250,11 +382,7 @@ pub fn draw_status_pill(
     );
 }
 
-/// Primary Hero connection CTA capsule (`236 x 50`).
-/// - Disconnected / Connecting: bold Terracotta CTA with soft halo.
-/// - Connected: calm sage-tinted outlined capsule matching the top-right status pill so
-///   the status color complements rather than overwhelms the Warm Linen & Terracotta palette;
-///   hovering gently previews the disconnect action.
+/// Primary Hero connection CTA capsule (`228 x 46`).
 pub fn draw_hero_power_button(
     ui: &mut egui::Ui,
     state: ConnState,
@@ -262,7 +390,7 @@ pub fn draw_hero_power_button(
     has_nodes: bool,
     p: ThemePalette,
 ) -> egui::Response {
-    let desired = Vec2::new(236.0, 50.0);
+    let desired = Vec2::new(228.0, 46.0);
     let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
     let painter = ui.painter();
 
@@ -277,9 +405,9 @@ pub fn draw_hero_power_button(
                 base
             };
             let lbl = if has_nodes {
-                "一键开启加速"
+                "开启加速"
             } else {
-                "添加节点以开始"
+                "添加节点"
             }
             .to_string();
             (
@@ -292,8 +420,8 @@ pub fn draw_hero_power_button(
         }
         ConnState::Connecting => {
             let lbl = match reconnect {
-                Some((attempt, _)) => format!("正在自动重连（第 {attempt} 次）..."),
-                None => "正在建立加密通道...".to_string(),
+                Some((attempt, _)) => format!("重连中 (#{attempt})…"),
+                None => "连接中…".to_string(),
             };
             (
                 p.accent,
@@ -310,7 +438,7 @@ pub fn draw_hero_power_button(
                     Stroke::new(1.5_f32, p.danger_text),
                     Color32::from_rgba_unmultiplied(198, 63, 59, 26),
                     p.danger_text,
-                    "点击断开加速".to_string(),
+                    "断开连接".to_string(),
                 )
             } else {
                 (
@@ -318,16 +446,16 @@ pub fn draw_hero_power_button(
                     Stroke::new(1.5_f32, p.success_text),
                     Color32::from_rgba_unmultiplied(29, 107, 74, if p.is_dark { 34 } else { 20 }),
                     p.success_text,
-                    "加速保护中".to_string(),
+                    "加速中".to_string(),
                 )
             }
         }
     };
 
-    painter.rect_filled(rect.expand(4.0), CornerRadius::same(29), halo_col);
+    painter.rect_filled(rect.expand(4.0), CornerRadius::same(27), halo_col);
     painter.rect(
         rect,
-        CornerRadius::same(25),
+        CornerRadius::same(23),
         fill,
         border_stroke,
         StrokeKind::Inside,
@@ -464,24 +592,16 @@ pub fn draw_rtt_sparkline(
     is_connected: bool,
     p: ThemePalette,
 ) {
-    let height = ui.available_height().clamp(96.0, 260.0);
+    let height = ui.available_height().clamp(88.0, 260.0);
     let desired = Vec2::new(ui.available_width(), height);
     let (rect, _resp) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
-
-    painter.rect(
-        rect,
-        CornerRadius::same(10),
-        p.bg_card,
-        Stroke::new(1.0_f32, p.border_subtle),
-        StrokeKind::Inside,
-    );
 
     if !is_connected || history.len() < 2 {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "连接后显示实时延迟波动曲线",
+            "连接后展示实时曲线",
             FontId::proportional(FONT_SM),
             p.text_muted,
         );
@@ -490,17 +610,16 @@ pub fn draw_rtt_sparkline(
 
     let peak = history.iter().copied().max().unwrap_or(100).max(50);
     let max_val = ((peak as f32 * 1.35) / 10.0).ceil() * 10.0;
-    let left_pad = 50.0;
-    let right_pad = 14.0;
-    let top_pad = 28.0;
-    let bot_pad = 14.0;
+    let left_pad = 48.0;
+    let right_pad = 8.0;
+    let top_pad = 8.0;
+    let bot_pad = 8.0;
     let inner = egui::Rect::from_min_max(
         Pos2::new(rect.left() + left_pad, rect.top() + top_pad),
         Pos2::new(rect.right() - right_pad, rect.bottom() - bot_pad),
     );
     let step_x = inner.width() / (history.len().saturating_sub(1).max(1) as f32);
 
-    // Subtle 3-tier horizontal gridlines + left Y-axis ticks
     let grid_col = if p.is_dark {
         Color32::from_white_alpha(14)
     } else {
@@ -563,57 +682,25 @@ pub fn draw_rtt_sparkline(
         );
         painter.circle_filled(last_pt, 3.0, p.accent);
     }
-
-    // Header legend (left) & live stats (right)
-    painter.circle_filled(
-        Pos2::new(rect.left() + 14.0, rect.top() + 14.0),
-        3.2,
-        p.accent,
-    );
-    painter.text(
-        Pos2::new(rect.left() + 22.0, rect.top() + 14.0),
-        egui::Align2::LEFT_CENTER,
-        "QUIC 延迟",
-        FontId::proportional(FONT_XS),
-        p.text_muted,
-    );
-    if let Some(&last) = history.back() {
-        let avg: u64 = history.iter().sum::<u64>() / history.len() as u64;
-        painter.text(
-            Pos2::new(rect.right() - 12.0, rect.top() + 14.0),
-            egui::Align2::RIGHT_CENTER,
-            format!("当前 {last} ms · 均值 {avg} ms"),
-            FontId::monospace(FONT_XS),
-            p.text_muted,
-        );
-    }
 }
 
-/// Real-time traffic throughput sparkline (Download in Terracotta area fill, Upload in Emerald line).
+/// Real-time traffic throughput sparkline embedded seamlessly inside the monitor card.
 pub fn draw_traffic_sparkline(
     ui: &mut egui::Ui,
     history: &VecDeque<(f64, f64)>,
     is_connected: bool,
     p: ThemePalette,
 ) {
-    let height = ui.available_height().clamp(96.0, 260.0);
+    let height = ui.available_height().clamp(88.0, 260.0);
     let desired = Vec2::new(ui.available_width(), height);
     let (rect, _resp) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
-
-    painter.rect(
-        rect,
-        CornerRadius::same(10),
-        p.bg_card,
-        Stroke::new(1.0_f32, p.border_subtle),
-        StrokeKind::Inside,
-    );
 
     if !is_connected || history.len() < 2 {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "连接后显示实时下载 / 上传速率曲线",
+            "连接后展示实时曲线",
             FontId::proportional(FONT_SM),
             p.text_muted,
         );
@@ -626,17 +713,16 @@ pub fn draw_traffic_sparkline(
         .fold(0.0_f64, f64::max);
     let scale_max = (peak_bps * 1.30).max(16.0 * 1024.0);
 
-    let left_pad = 68.0;
-    let right_pad = 14.0;
-    let top_pad = 28.0;
-    let bot_pad = 14.0;
+    let left_pad = 64.0;
+    let right_pad = 8.0;
+    let top_pad = 8.0;
+    let bot_pad = 8.0;
     let inner = egui::Rect::from_min_max(
         Pos2::new(rect.left() + left_pad, rect.top() + top_pad),
         Pos2::new(rect.right() - right_pad, rect.bottom() - bot_pad),
     );
     let step_x = inner.width() / (history.len().saturating_sub(1).max(1) as f32);
 
-    // 3-tier horizontal gridlines + Y-axis scale labels
     let grid_col = if p.is_dark {
         Color32::from_white_alpha(14)
     } else {
@@ -683,7 +769,6 @@ pub fn draw_traffic_sparkline(
         })
         .collect();
 
-    // Terracotta translucent area fill under Download curve
     let mut mesh = egui::Mesh::default();
     let top_col = Color32::from_rgba_unmultiplied(217, 119, 87, if p.is_dark { 58 } else { 42 });
     let bot_col = Color32::from_rgba_unmultiplied(217, 119, 87, 0);
@@ -699,7 +784,6 @@ pub fn draw_traffic_sparkline(
     }
     painter.add(egui::Shape::mesh(mesh));
 
-    // Upload curve (secondary emerald line) + Download curve (primary terracotta)
     painter.add(egui::Shape::line(
         tx_points,
         Stroke::new(1.5_f32, p.success_text),
@@ -716,43 +800,9 @@ pub fn draw_traffic_sparkline(
         );
         painter.circle_filled(last_pt, 2.8, p.accent);
     }
-
-    // Inline legend (top-left) + live speed summary (top-right)
-    let legend_y = rect.top() + 14.0;
-    painter.circle_filled(Pos2::new(rect.left() + 14.0, legend_y), 3.2, p.accent);
-    painter.text(
-        Pos2::new(rect.left() + 22.0, legend_y),
-        egui::Align2::LEFT_CENTER,
-        "下载",
-        FontId::proportional(FONT_XS),
-        p.text_muted,
-    );
-    painter.circle_filled(Pos2::new(rect.left() + 58.0, legend_y), 3.2, p.success_text);
-    painter.text(
-        Pos2::new(rect.left() + 66.0, legend_y),
-        egui::Align2::LEFT_CENTER,
-        "上传",
-        FontId::proportional(FONT_XS),
-        p.text_muted,
-    );
-
-    if let Some(&(last_rx, last_tx)) = history.back() {
-        painter.text(
-            Pos2::new(rect.right() - 12.0, legend_y),
-            egui::Align2::RIGHT_CENTER,
-            format!(
-                "↓ {}  ↑ {}  峰值 {}",
-                format_speed(last_rx),
-                format_speed(last_tx),
-                format_speed(peak_bps)
-            ),
-            FontId::monospace(FONT_XS),
-            p.text_muted,
-        );
-    }
 }
 
-/// Renders a centered floating modal dialog with a dimmed backdrop, Esc/backdrop/`×` close handling,
+/// Renders a centered floating modal dialog with a dimmed backdrop, Esc/backdrop/close handling,
 /// and consistent card styling. Returns `true` if the user requested to close the modal.
 pub fn modal_dialog(
     ctx: &egui::Context,
@@ -797,7 +847,7 @@ pub fn modal_dialog(
         .frame(modal_frame)
         .show(ctx, |ui| {
             ui.set_width(width);
-            ui.horizontal(|ui| {
+            aligned_row(ui, 28.0, |ui| {
                 ui.label(
                     egui::RichText::new(title)
                         .size(FONT_SUB)
@@ -805,7 +855,22 @@ pub fn modal_dialog(
                         .color(p.text_primary),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if chip_btn(ui, "×", p, false).clicked() {
+                    let (x_rect, x_resp) =
+                        ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+                    if x_resp.hovered() {
+                        ui.painter()
+                            .rect_filled(x_rect, CornerRadius::same(7), p.bg_nav_hover);
+                    }
+                    icons::draw_win_close_icon(
+                        ui.painter(),
+                        x_rect.center(),
+                        if x_resp.hovered() {
+                            p.text_primary
+                        } else {
+                            p.text_secondary
+                        },
+                    );
+                    if x_resp.clicked() {
                         close_requested = true;
                     }
                 });
