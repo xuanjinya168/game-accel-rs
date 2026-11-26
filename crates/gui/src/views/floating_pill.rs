@@ -14,7 +14,7 @@ const CARD_H: f32 = 44.0;
 const CARD_RADIUS: f32 = 6.0;
 
 const MENU_W: f32 = 166.0;
-const MENU_H: f32 = 228.0;
+const MENU_H: f32 = 236.0;
 const MENU_RADIUS: f32 = 8.0;
 
 /// Repaint interval for the floating card's breathing LED animation (~20fps).
@@ -441,9 +441,7 @@ impl GameAccelApp {
                     .frame(
                         Frame::new()
                             .fill(p.bg_card)
-                            .stroke(Stroke::new(1.0_f32, p.border_strong))
-                            .corner_radius(CornerRadius::same(MENU_RADIUS as u8))
-                            .inner_margin(Margin::symmetric(6, 6)),
+                            .inner_margin(Margin::symmetric(6, 7)),
                     )
                     .show(vctx, |ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
@@ -482,6 +480,19 @@ impl GameAccelApp {
                             picked = Some(CardMenuAction::CloseCard);
                             close_menu = true;
                         }
+
+                        // Paint crisp 1px rounded border flush inside the viewport bounds so
+                        // content height can never push the bottom stroke off-screen.
+                        vctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("floating_menu_border"),
+                        ))
+                        .rect_stroke(
+                            vctx.screen_rect(),
+                            CornerRadius::same(MENU_RADIUS as u8),
+                            Stroke::new(1.0_f32, p.border_strong),
+                            StrokeKind::Inside,
+                        );
                     });
             },
         );

@@ -25,7 +25,7 @@ pub struct ReleaseInfo {
     pub html_url: String,
     pub installer_url: String,
     pub installer_name: String,
-    pub sums_url: String,
+    pub expected_sha256: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -178,53 +178,68 @@ fn http_client() -> Result<reqwest::Client> {
         .context("创建 HTTP 客户端失败")
 }
 
+/// Query the latest release without calling `api.github.com`, avoiding its 60 req/hr
+/// per-IP unauthenticated rate limit (easily hit by users sharing a proxy exit IP).
 async fn fetch_latest() -> Result<Option<ReleaseInfo>> {
-    let client = http_client()?;
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let resp = tokio::time::timeout(
-        Duration::from_secs(20),
-        client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .send(),
-    )
-    .await
-    .context("连接 GitHub 超时")??;
+    let no_redirect = reqwest::Client::builder()
+        .user_agent(format!("game-accel/{CURRENT_VERSION}"))
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("创建 HTTP 客户端失败")?;
+
+    let latest_url = format!("https://github.com/{REPO}/releases/latest");
+    let resp = tokio::time::timeout(Duration::from_secs(20), no_redirect.head(&latest_url).send())
+        .await
+        .context("连接 GitHub 超时")??;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        // Repository has no published release yet.
         return Ok(None);
     }
-    let resp = resp.error_for_status().context("GitHub 返回错误")?;
-    let body = resp.bytes().await.context("读取 GitHub 响应失败")?;
-    let v: serde_json::Value = serde_json::from_slice(&body).context("解析 GitHub 响应失败")?;
+    if !resp.status().is_redirection() {
+        bail!("GitHub 返回异常状态码 {}", resp.status());
+    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| anyhow!("GitHub 重定向缺少 Location 头"))?;
+    let Some(tag) = parse_tag_from_location(location) else {
+        // E.g. redirected to `/releases` when no release has been published yet.
+        return Ok(None);
+    };
 
-    let tag = v["tag_name"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Release 缺少 tag_name"))?;
     let version = tag.trim_start_matches('v').to_string();
     if !is_newer(&version, CURRENT_VERSION) {
         return Ok(None);
     }
 
-    let assets = v["assets"].as_array().cloned().unwrap_or_default();
-    let find = |pred: &dyn Fn(&str) -> bool| {
-        assets.iter().find_map(|a| {
-            let name = a["name"].as_str()?;
-            let url = a["browser_download_url"].as_str()?;
-            pred(name).then(|| (name.to_string(), url.to_string()))
-        })
-    };
-    let (installer_name, installer_url) = find(&|n| n.ends_with("-windows-x64-setup.exe"))
-        .ok_or_else(|| anyhow!("新版本 v{version} 没有提供 Windows 安装包"))?;
-    let (_, sums_url) = find(&|n| n.eq_ignore_ascii_case("SHA256SUMS.txt"))
-        .ok_or_else(|| anyhow!("新版本 v{version} 缺少 SHA256SUMS.txt 校验文件"))?;
+    let client = http_client()?;
+    let sums_url = format!("https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS.txt");
+    let sums_resp = tokio::time::timeout(Duration::from_secs(20), client.get(&sums_url).send())
+        .await
+        .context("获取 SHA256SUMS.txt 超时")??;
+    if sums_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("新版本 v{version} 缺少 SHA256SUMS.txt 校验文件");
+    }
+    let sums = sums_resp
+        .error_for_status()
+        .context("下载 SHA256SUMS.txt 失败")?
+        .text()
+        .await
+        .context("读取 SHA256SUMS.txt 失败")?;
+
+    let (installer_name, expected_sha256) =
+        find_asset_in_sha256sums(&sums, "-windows-x64-setup.exe")
+            .ok_or_else(|| anyhow!("新版本 v{version} 没有提供 Windows 安装包"))?;
 
     Ok(Some(ReleaseInfo {
         version,
-        html_url: v["html_url"].as_str().unwrap_or_default().to_string(),
-        installer_url,
+        html_url: format!("https://github.com/{REPO}/releases/tag/{tag}"),
+        installer_url: format!(
+            "https://github.com/{REPO}/releases/download/{tag}/{installer_name}"
+        ),
         installer_name,
-        sums_url,
+        expected_sha256,
     }))
 }
 
@@ -234,19 +249,6 @@ async fn download_and_verify(
     ctx: &egui::Context,
 ) -> Result<PathBuf> {
     let client = http_client()?;
-
-    // Expected hash first, so we fail fast if the checksum file is unusable.
-    let sums = client
-        .get(&info.sums_url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .context("下载 SHA256SUMS.txt 失败")?
-        .text()
-        .await
-        .context("读取 SHA256SUMS.txt 失败")?;
-    let expected = parse_sha256sums(&sums, &info.installer_name)
-        .ok_or_else(|| anyhow!("SHA256SUMS.txt 中没有 {} 的校验值", info.installer_name))?;
 
     let dir = std::env::temp_dir().join("game-accel-update");
     tokio::fs::create_dir_all(&dir)
@@ -301,7 +303,7 @@ async fn download_and_verify(
         bail!("下载不完整（{downloaded}/{t} 字节）");
     }
     let actual = hex(hasher.finish().as_ref());
-    if !actual.eq_ignore_ascii_case(&expected) {
+    if !actual.eq_ignore_ascii_case(&info.expected_sha256) {
         let _ = tokio::fs::remove_file(&part_path).await;
         bail!("安装包校验失败（SHA256 不匹配），已丢弃");
     }
@@ -390,12 +392,26 @@ pub fn open_url(url: &str) {
     }
 }
 
-fn parse_sha256sums(text: &str, file_name: &str) -> Option<String> {
+/// Extract the release tag from a `releases/latest` redirect `Location` URL, e.g.
+/// `https://github.com/owner/repo/releases/tag/v0.2.4` -> `Some("v0.2.4")`.
+fn parse_tag_from_location(location: &str) -> Option<String> {
+    let rest = location.split_once("/releases/tag/")?.1;
+    let tag = rest
+        .split(['?', '#', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    (!tag.is_empty()).then(|| tag.to_string())
+}
+
+/// Find the first `(filename, sha256)` entry in `SHA256SUMS.txt` whose filename ends with `suffix`.
+fn find_asset_in_sha256sums(text: &str, suffix: &str) -> Option<(String, String)> {
     text.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
         let hash = parts.next()?;
         let name = parts.next()?.trim_start_matches('*');
-        (name == file_name && hash.len() == 64).then(|| hash.to_string())
+        let valid_hash = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        (valid_hash && name.ends_with(suffix)).then(|| (name.to_string(), hash.to_string()))
     })
 }
 
@@ -439,10 +455,29 @@ mod tests {
         let h = "a".repeat(64);
         let text = format!("{h}  game-accel-v0.2.3-windows-x64-setup.exe\n{h} *other.zip\n");
         assert_eq!(
-            parse_sha256sums(&text, "game-accel-v0.2.3-windows-x64-setup.exe"),
-            Some(h.clone())
+            find_asset_in_sha256sums(&text, "-windows-x64-setup.exe"),
+            Some(("game-accel-v0.2.3-windows-x64-setup.exe".into(), h.clone()))
         );
-        assert_eq!(parse_sha256sums(&text, "other.zip"), Some(h));
-        assert_eq!(parse_sha256sums(&text, "missing.exe"), None);
+        assert_eq!(
+            find_asset_in_sha256sums(&text, ".zip"),
+            Some(("other.zip".into(), h))
+        );
+        assert_eq!(find_asset_in_sha256sums(&text, ".msi"), None);
+    }
+
+    #[test]
+    fn redirect_tag_parsing() {
+        assert_eq!(
+            parse_tag_from_location("https://github.com/xuanjinya168/game-accel-rs/releases/tag/v0.2.4"),
+            Some("v0.2.4".into())
+        );
+        assert_eq!(
+            parse_tag_from_location("/xuanjinya168/game-accel-rs/releases/tag/v1.0.0?foo=1"),
+            Some("v1.0.0".into())
+        );
+        assert_eq!(
+            parse_tag_from_location("https://github.com/xuanjinya168/game-accel-rs/releases"),
+            None
+        );
     }
 }
