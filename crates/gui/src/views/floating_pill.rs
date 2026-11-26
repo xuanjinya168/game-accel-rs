@@ -938,6 +938,8 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
 
         #[link(name = "user32")]
         unsafe extern "system" {
+            fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> isize;
+            fn GetAsyncKeyState(key: i32) -> i16;
             fn IsWindowVisible(hwnd: Hwnd) -> i32;
             fn GetForegroundWindow() -> Hwnd;
             fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
@@ -960,7 +962,7 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
             fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
         }
 
-        let Some((hwnd, _x, _y, w, h)) = find_own_window_by_size(
+        let Some((hwnd, x, y, w, h)) = find_own_window_by_size(
             &CARD_HWND,
             (CARD_W * ppp).round() as i32,
             (CARD_H * ppp).round() as i32,
@@ -989,12 +991,30 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
             const SWP_NOACTIVATE: u32 = 0x0010;
             const SWP_SHOWWINDOW: u32 = 0x0040;
 
+            const SWP_NOZORDER: u32 = 0x0004;
             let visible = IsWindowVisible(hwnd as Hwnd) != 0;
             if fs_hidden {
                 if visible {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
                 return;
+            }
+
+            // A saved position can be entirely off-screen after a monitor is unplugged.
+            // Keep the intentional edge-hide strip and allow dragging between monitors.
+            if MonitorFromWindow(hwnd as Hwnd, 0) == 0
+                && GetAsyncKeyState(1) >= 0
+                && let Some((left, top, right, bottom)) = monitor_work_rect_for_hwnd(hwnd)
+            {
+                let _ = SetWindowPos(
+                    hwnd,
+                    0,
+                    x.clamp(left, (right - w).max(left)),
+                    y.clamp(top, (bottom - h).max(top)),
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                );
             }
 
             let cur_topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
@@ -1152,14 +1172,6 @@ fn is_another_app_fullscreen() -> bool {
         }
 
         unsafe {
-            // Exclusive (D3D) fullscreen games may not expose a monitor-sized foreground rect.
-            const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
-            let mut quns: i32 = 0;
-            if SHQueryUserNotificationState(&mut quns) == 0 && quns == QUNS_RUNNING_D3D_FULL_SCREEN
-            {
-                return true;
-            }
-
             let fg = GetForegroundWindow();
             if fg.is_null() {
                 return false;
@@ -1205,6 +1217,18 @@ fn is_another_app_fullscreen() -> bool {
             if hmon == 0 {
                 return false;
             }
+            let card = CARD_HWND.load(std::sync::atomic::Ordering::Relaxed) as Hwnd;
+            if card.is_null() || MonitorFromWindow(card, MONITOR_DEFAULTTONEAREST) != hmon {
+                return false;
+            }
+            // Exclusive (D3D) fullscreen games may not expose a monitor-sized foreground rect.
+            const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
+            let mut quns: i32 = 0;
+            if SHQueryUserNotificationState(&mut quns) == 0 && quns == QUNS_RUNNING_D3D_FULL_SCREEN
+            {
+                return true;
+            }
+
             let mut mi = MonitorInfo {
                 cb_size: std::mem::size_of::<MonitorInfo>() as u32,
                 rc_monitor: WinRect {

@@ -336,6 +336,11 @@ impl GameAccelApp {
             app.state = ConnState::Connecting;
             app.pending_mode_reconnect = Some(Instant::now() + Duration::from_millis(1200));
             app.push_log("已以管理员身份重启，正在自动开启 TUN 加速...");
+        } else if !is_admin && app.cfg.proxy_mode == storage::ProxyMode::Tun {
+            app.tun_admin_prompt = Some(TunAdminPrompt {
+                auto_connect: false,
+                wake: false,
+            });
         }
         app
     }

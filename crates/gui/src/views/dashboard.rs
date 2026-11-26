@@ -3,7 +3,7 @@ use crate::storage::{ProxyMode, RouteMode, format_bytes, format_speed, save_conf
 use crate::theme::{FONT_BODY, FONT_SM, FONT_TITLE, FONT_XS, ThemePalette};
 use crate::widgets::{
     card_frame, draw_hero_power_button, draw_rtt_sparkline, draw_traffic_sparkline,
-    hairline_divider, primary_btn,
+    hairline_divider,
 };
 use crate::{ChartMode, ConnState, GameAccelApp, NavTab, ProbeState};
 use eframe::egui::{
@@ -604,20 +604,6 @@ impl GameAccelApp {
         ui.vertical_centered(|ui| {
             ui.label(RichText::new(route_desc).size(FONT_SM).color(p.text_muted));
         });
-
-        if self.cfg.proxy_mode == ProxyMode::Tun && !self.is_admin {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("TUN 模式需要管理员权限：")
-                        .size(FONT_SM)
-                        .color(p.accent_text),
-                );
-                if primary_btn(ui, "以管理员身份重启", p).clicked() {
-                    self.restart_as_admin(false);
-                }
-            });
-        }
 
         ui.add_space(16.0);
 

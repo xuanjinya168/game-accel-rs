@@ -801,7 +801,13 @@ impl GameAccelApp {
             self.restart_as_admin(auto_connect);
         } else if cancel || dismissed {
             self.tun_admin_prompt = None;
-            self.show_toast("已取消，继续使用当前模式");
+            if self.cfg.proxy_mode == ProxyMode::Tun {
+                self.cfg.proxy_mode = ProxyMode::SystemProxy;
+                save_config(&self.cfg);
+                self.show_toast("已取消，已改回系统代理");
+            } else {
+                self.show_toast("已取消，继续使用当前模式");
+            }
         }
     }
 }
