@@ -539,7 +539,7 @@ checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 
 [[package]]
 name = "client"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "game-accel-gui"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3013,7 +3013,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "protocol"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3601,7 +3601,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "axum",

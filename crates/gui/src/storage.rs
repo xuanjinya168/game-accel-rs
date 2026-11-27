@@ -80,9 +80,12 @@ pub struct AppConfig {
     pub admin_servers: Vec<AdminServerProfile>,
     #[serde(default)]
     pub active_admin_server_id: String,
-    /// Split routing: Rule (CN direct, rest proxied) / Global / Direct.
+    /// Split routing: Rule (CN direct) / Dual (CN via domestic node) / Global / Direct.
     #[serde(default)]
     pub route_mode: RouteMode,
+    /// Chosen domestic exit node ID used when `route_mode == RouteMode::Dual`.
+    #[serde(default)]
+    pub domestic_node_id: Option<String>,
     /// Tray right-click behavior: floating popover panel vs native context menu.
     #[serde(default)]
     pub tray_style: TrayStyle,
@@ -127,6 +130,7 @@ impl Default for AppConfig {
             admin_servers: vec![default_srv],
             active_admin_server_id,
             route_mode: RouteMode::default(),
+            domestic_node_id: None,
             tray_style: TrayStyle::default(),
             show_floating_pill: false,
             floating_pill_light: PillLightStyle::default(),
@@ -146,6 +150,12 @@ impl AppConfig {
             .iter()
             .find(|n| n.id == self.active_node_id)
             .or_else(|| self.nodes.first())
+    }
+
+    /// Chosen domestic exit node for `RouteMode::Dual` (any node from the pool).
+    pub fn domestic_node(&self) -> Option<&NodeProfile> {
+        let id = self.domestic_node_id.as_deref()?;
+        self.nodes.iter().find(|n| n.id == id)
     }
 
     pub fn ensure_default_admin_server(&mut self) {
@@ -244,6 +254,7 @@ pub fn load_config() -> AppConfig {
             admin_servers: vec![default_srv],
             active_admin_server_id,
             route_mode: RouteMode::default(),
+            domestic_node_id: None,
             tray_style: TrayStyle::default(),
             show_floating_pill: false,
             floating_pill_light: PillLightStyle::default(),

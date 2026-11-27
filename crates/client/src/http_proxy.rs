@@ -1,6 +1,6 @@
 use crate::relay::{ClientStats, relay_direct};
-use crate::rules::{Route, Router};
-use crate::tunnel::TunnelSession;
+use crate::rules::Router;
+use crate::tunnel::Tunnels;
 use anyhow::{Context, Result, bail};
 use protocol::frame::TargetAddr;
 use std::net::{IpAddr, SocketAddr};
@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 /// Handle HTTP / HTTPS (CONNECT) proxy requests on the mixed port.
 pub(crate) async fn handle_http_proxy_client(
     mut client: TcpStream,
-    tunnel: Arc<TunnelSession>,
+    tunnels: Arc<Tunnels>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
@@ -82,14 +82,15 @@ pub(crate) async fn handle_http_proxy_client(
             (target, None, preamble, Some(BAD_GATEWAY))
         };
 
-    if router.decide(&target).await == Route::Direct {
+    let route = router.decide(&target).await;
+    let Some(tunnel) = tunnels.for_route(route) else {
         let fail = if ok_reply.is_some() {
             Some(BAD_GATEWAY)
         } else {
             fail_reply
         };
         return relay_direct(&router, client, &target, ok_reply, &upstream_preamble, fail).await;
-    }
+    };
 
     let (mut quic_send, quic_recv) = tunnel.open_tcp(&target).await?;
     if let Some(reply) = ok_reply {

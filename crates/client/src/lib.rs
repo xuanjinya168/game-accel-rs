@@ -16,10 +16,10 @@ pub use quic::{resolve_server_addr, validate_server_addr};
 
 use crate::quic::{bind_tuned_udp_socket, build_client_config, unspecified_bind_for};
 use crate::relay::{ClientStats, UdpDispatchMap};
-use crate::rules::{RouteModeCell, Router, RuleData};
+use crate::rules::{DomesticEgress, DomesticEgressCell, RouteModeCell, Router, RuleData};
 use crate::socks5::run_mixed_proxy_server;
 use crate::telemetry::JitterEstimator;
-use crate::tunnel::TunnelSession;
+use crate::tunnel::{TunnelSession, Tunnels};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use protocol::auth::{AUTH_OK, write_auth_request};
@@ -40,23 +40,56 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
-pub struct ClientOptions {
+pub struct UpstreamOptions {
     /// Server `IP:port`, `[IPv6]:port`, or `domain:port`.
     pub server: String,
     pub server_name: String,
-    pub listen: SocketAddr,
     pub token: String,
     pub protocol: NodeProtocol,
     pub game_dup: bool,
-    pub enable_tun: bool,
     pub insecure: bool,
     /// Optional Brutal congestion-control rate cap in Mbps for the TCP lane only (0 = BBR).
     pub brutal_mbps: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientOptions {
+    pub primary: UpstreamOptions,
+    /// Optional domestic node. Only dialled when `domestic` is `Secondary`.
+    pub secondary: Option<UpstreamOptions>,
+    /// Where the domestic (CN) bucket goes: DIRECT or through the secondary tunnel.
+    pub domestic: DomesticEgress,
+    pub listen: SocketAddr,
+    pub enable_tun: bool,
     /// Split-routing mode, shared live with the UI (applies to new connections).
     pub route_mode: Arc<RouteModeCell>,
     /// Optional directory whose `direct-list.txt` / `proxy-list.txt` / `geoip-cn.txt`
     /// override the embedded rule data.
     pub rules_dir: Option<std::path::PathBuf>,
+}
+
+/// One established node: dual QUIC lanes, its tunnel session, and the endpoint/socket
+/// state that must outlive the session.
+struct Upstream {
+    tunnel: Arc<TunnelSession>,
+    tcp_conn: quinn::Connection,
+    udp_conn: quinn::Connection,
+    tcp_ep: Endpoint,
+    udp_ep: Endpoint,
+    server_addr: SocketAddr,
+    // Keep HTTP/3 control streams & uni-stream drainers alive for the session lifetime.
+    _tcp_authed: AuthedConn,
+    _udp_authed: AuthedConn,
+    _dgram_task: AbortOnDrop,
+}
+
+impl Drop for Upstream {
+    fn drop(&mut self) {
+        self.tcp_conn.close(0u32.into(), b"client_shutdown");
+        self.udp_conn.close(0u32.into(), b"client_shutdown");
+        self.tcp_ep.close(0u32.into(), b"client_shutdown");
+        self.udp_ep.close(0u32.into(), b"client_shutdown");
+    }
 }
 
 pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
@@ -82,7 +115,7 @@ pub async fn run_client_with_shutdown(
 
     // Internal shutdown flag raised by the caller's signal or by the QUIC connection dying,
     // so every data-plane task observes one consistent stop condition.
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let _ext_shutdown_guard = {
         let tx = shutdown_tx.clone();
         AbortOnDrop(tokio::spawn(async move {
@@ -99,8 +132,270 @@ pub async fn run_client_with_shutdown(
     };
 
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Primary and domestic-node handshakes run concurrently (only when in Dual mode).
+    // Primary is mandatory; domestic is best-effort and degrades to DIRECT on failure.
+    let want_secondary = opts.route_mode.get() == crate::rules::RouteMode::Dual
+        && opts.secondary.is_some()
+        && opts.domestic == DomesticEgress::Secondary;
+    let secondary_opts = if want_secondary {
+        opts.secondary.clone()
+    } else {
+        None
+    };
+    let mut primary_rx = shutdown_rx.clone();
+    let mut secondary_rx = shutdown_rx.clone();
+    let primary_log = log_tx.clone();
+    let secondary_log = log_tx.clone();
+
+    let (primary_res, secondary_res) = tokio::join!(
+        connect_upstream(&opts.primary, &mut primary_rx, &primary_log, "主节点"),
+        async move {
+            match secondary_opts {
+                Some(o) => {
+                    connect_upstream(&o, &mut secondary_rx, &secondary_log, "国内节点").await
+                }
+                None => Ok(None),
+            }
+        },
+    );
+
+    let Some(primary) = primary_res? else {
+        return Ok(());
+    };
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+
+    // A failed or dead domestic lane only downgrades the CN bucket to DIRECT.
+    let mut domestic = if opts.route_mode.get() == crate::rules::RouteMode::Dual {
+        opts.domestic
+    } else {
+        DomesticEgress::Direct
+    };
+    let secondary = match secondary_res {
+        Ok(Some(up)) => Some(up),
+        Ok(None) => {
+            if domestic == DomesticEgress::Secondary {
+                domestic = DomesticEgress::Direct;
+            }
+            None
+        }
+        Err(e) => {
+            emit(format!("国内节点连接失败（{e:#}），国内流量回退直连"));
+            domestic = DomesticEgress::Direct;
+            None
+        }
+    };
+    let domestic_cell = DomesticEgressCell::new(domestic);
+
+    let initial_rtt = primary.udp_conn.rtt().as_millis() as u64;
+    stats
+        .connected_at_unix
+        .store(protocol::unix_now_secs(), Ordering::Relaxed);
+    stats.rtt_ms.store(initial_rtt, Ordering::Relaxed);
+    stats.jitter_tenths_ms.store(0, Ordering::Relaxed);
+    stats.loss_bps.store(0, Ordering::Relaxed);
+    stats.dup_active.store(false, Ordering::Relaxed);
+    stats.connected.store(true, Ordering::Relaxed);
+    if let Some(sec) = &secondary {
+        let sec_rtt = sec.udp_conn.rtt().as_millis() as u64;
+        stats.secondary_rtt_ms.store(sec_rtt, Ordering::Relaxed);
+        stats.secondary_connected.store(true, Ordering::Relaxed);
+    } else {
+        stats.secondary_rtt_ms.store(0, Ordering::Relaxed);
+        stats.secondary_connected.store(false, Ordering::Relaxed);
+    }
+    emit(format!(
+        "主节点双通道已连接并认证成功 [{}] ({}，游戏 UDP 通道初始 RTT {} ms)",
+        opts.primary.protocol.label(),
+        primary.server_addr,
+        initial_rtt
+    ));
+    if let Some(sec) = &secondary {
+        emit(format!(
+            "国内节点已连接 ({}，RTT {} ms)，国内流量将走该隧道",
+            sec.server_addr,
+            sec.udp_conn.rtt().as_millis()
+        ));
+    }
+
+    // Primary watchdog: any lane death (idle timeout / server restart / network change)
+    // tears the whole session down so both lanes reconnect cleanly together.
+    let watchdog_tx = shutdown_tx.clone();
+    let wd_tcp = primary.tcp_conn.clone();
+    let wd_udp = primary.udp_conn.clone();
+    let _watchdog_guard = AbortOnDrop(tokio::spawn(async move {
+        tokio::select! {
+            _ = wd_tcp.closed() => {}
+            _ = wd_udp.closed() => {}
+        }
+        let _ = watchdog_tx.send(true);
+    }));
+
+    // Domestic lane death only downgrades NEW connections to DIRECT; the session survives.
+    let _secondary_watchdog = secondary.as_ref().map(|sec| {
+        let cell = domestic_cell.clone();
+        let sec_stats = stats.clone();
+        let wd_tcp = sec.tcp_conn.clone();
+        let wd_udp = sec.udp_conn.clone();
+        let log = log_tx.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            tokio::select! {
+                _ = wd_tcp.closed() => {}
+                _ = wd_udp.closed() => {}
+            }
+            cell.set(DomesticEgress::Direct);
+            sec_stats.secondary_connected.store(false, Ordering::Relaxed);
+            sec_stats.secondary_rtt_ms.store(0, Ordering::Relaxed);
+            let msg = "国内节点连接已断开，国内流量回退直连（仅影响新连接）".to_string();
+            info!("{}", msg);
+            if let Some(tx) = &log {
+                let _ = tx.send(msg);
+            }
+        }))
+    });
+
+    // Periodic 1s Game Link Health sampler (primary + optional secondary RTT)
+    let rtt_conn = primary.udp_conn.clone();
+    let sec_rtt_conn = secondary.as_ref().map(|s| s.udp_conn.clone());
+    let rtt_stats = stats.clone();
+    let rtt_pacer = primary.tunnel.pacer().clone();
+    let rtt_task = tokio::spawn(async move {
+        let mut jitter_est = JitterEstimator::default();
+        let _ = jitter_est.observe_rtt_ms(initial_rtt);
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            if rtt_conn.close_reason().is_some() {
+                break;
+            }
+            let rtt = rtt_conn.rtt().as_millis() as u64;
+            let jitter_tenths = jitter_est.observe_rtt_ms(rtt);
+            rtt_stats.rtt_ms.store(rtt, Ordering::Relaxed);
+            rtt_stats
+                .jitter_tenths_ms
+                .store(jitter_tenths, Ordering::Relaxed);
+            rtt_stats
+                .loss_bps
+                .store(rtt_pacer.loss_bps(), Ordering::Relaxed);
+            rtt_stats
+                .dup_active
+                .store(rtt_pacer.is_dup_active(), Ordering::Relaxed);
+            if let Some(sec_conn) = &sec_rtt_conn
+                && sec_conn.close_reason().is_none()
+            {
+                rtt_stats
+                    .secondary_rtt_ms
+                    .store(sec_conn.rtt().as_millis() as u64, Ordering::Relaxed);
+            }
+        }
+    });
+
+    let tunnels = Tunnels::new(
+        primary.tunnel.clone(),
+        secondary.as_ref().map(|sec| sec.tunnel.clone()),
+    );
+
+    // Split-routing tables (~140k entries) are parsed once per process, off the runtime.
+    // Built before TUN starts: the mixed proxy and the TUN share one router + dialer.
+    let rules_dir = opts.rules_dir.clone();
+    let rule_data = tokio::task::spawn_blocking(move || RuleData::shared(rules_dir.as_deref()))
+        .await
+        .context("加载分流规则失败")?;
+    emit(format!(
+        "分流模式：{}（国内流量：{}；{}）",
+        opts.route_mode.get().label(),
+        domestic_cell.get().label(),
+        rule_data.summary(),
+    ));
+    let router = Arc::new(Router::new(
+        opts.route_mode.clone(),
+        domestic_cell.clone(),
+        rule_data,
+    ));
+
+    // Optional TUN virtual NIC mode (runs alongside the local mixed proxy).
+    // Both node server IPs are pinned to the physical gateway so node traffic
+    // never re-enters the TUN.
+    let tun_handle = if opts.enable_tun {
+        let mut server_ips = vec![primary.server_addr.ip()];
+        if let Some(sec) = &secondary {
+            server_ips.push(sec.server_addr.ip());
+        }
+        let tun_tunnels = tunnels.clone();
+        let tun_stats = stats.clone();
+        let tun_log_tx = log_tx.clone();
+        let tun_shutdown = shutdown_rx.clone();
+        let tun_router = router.clone();
+        let tun_err_tx = log_tx.clone();
+        Some(tokio::spawn(async move {
+            let res = tun_mode::run_tun_mode(
+                server_ips,
+                tun_tunnels,
+                tun_stats,
+                tun_router,
+                tun_log_tx,
+                tun_shutdown,
+            )
+            .await;
+            if let Err(e) = &res {
+                info!("TUN 模式异常: {e:#}");
+                if let Some(tx) = &tun_err_tx {
+                    let _ = tx.send(format!("TUN 模式异常: {e:#}"));
+                }
+            }
+            res
+        }))
+    } else {
+        None
+    };
+
+    let res = run_mixed_proxy_server(
+        opts.listen,
+        tunnels.clone(),
+        stats.clone(),
+        router,
+        log_tx.clone(),
+        shutdown_rx.clone(),
+    )
+    .await;
+
+    // Listener bind failure or shutdown: also stop TUN before awaiting its handle,
+    // otherwise a failed mixed-proxy bind would block here forever.
+    let _ = shutdown_tx.send(true);
+
+    // Errors were already reported by the TUN task itself; this only awaits cleanup.
+    if let Some(handle) = tun_handle {
+        let _ = handle.await;
+    }
+
+    rtt_task.abort();
+    // Dropping the upstreams aborts their datagram tasks and closes conns + endpoints.
+    drop(primary);
+    drop(secondary);
+    stats.reset();
+    emit("连接已断开".to_string());
+    res
+}
+
+/// Establishes both QUIC lanes for one node. Returns `Ok(None)` when shutdown was requested
+/// while handshaking (the caller should stop silently).
+async fn connect_upstream(
+    opts: &UpstreamOptions,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    log_tx: &Option<mpsc::UnboundedSender<String>>,
+    label: &str,
+) -> Result<Option<Upstream>> {
+    let note = |msg: String| {
+        info!("{}", msg);
+        if let Some(tx) = log_tx {
+            let _ = tx.send(msg);
+        }
+    };
+
     let server_addr = tokio::select! {
-        _ = shutdown_rx.changed() => return Ok(()),
+        _ = shutdown_rx.changed() => return Ok(None),
         res = resolve_server_addr(&opts.server) => res?,
     };
 
@@ -138,8 +433,8 @@ pub async fn run_client_with_shutdown(
     } else {
         "TCP/UDP 拥塞隔离".to_string()
     };
-    emit(format!(
-        "正在建立双通道连接 [{}] quic://{} -> {} (SNI={}，{})...",
+    note(format!(
+        "正在建立{label}双通道连接 [{}] quic://{} -> {} (SNI={}，{})...",
         opts.protocol.label(),
         opts.server,
         server_addr,
@@ -158,11 +453,11 @@ pub async fn run_client_with_shutdown(
     for attempt in 1..=MAX_ATTEMPTS {
         if *shutdown_rx.borrow() {
             close_endpoints(&tcp_endpoint, &udp_endpoint, b"cancelled");
-            return Ok(());
+            return Ok(None);
         }
         if attempt > 1 {
-            emit(format!(
-                "首次握手/鉴权超时，正在自动重试 ({attempt}/{MAX_ATTEMPTS})..."
+            note(format!(
+                "{label}首次握手/鉴权超时，正在自动重试 ({attempt}/{MAX_ATTEMPTS})..."
             ));
         }
 
@@ -189,7 +484,7 @@ pub async fn run_client_with_shutdown(
         let outcome = tokio::select! {
             _ = shutdown_rx.changed() => {
                 close_endpoints(&tcp_endpoint, &udp_endpoint, b"cancelled");
-                return Ok(());
+                return Ok(None);
             }
             res = tokio::time::timeout(HANDSHAKE_TIMEOUT, attempt_fut) => res,
         };
@@ -220,118 +515,61 @@ pub async fn run_client_with_shutdown(
     };
     let tcp_conn = tcp_authed.conn.clone();
     let udp_conn = udp_authed.conn.clone();
-    // Keep HTTP/3 control streams & uni-stream drainers alive for the session lifetime.
-    let _authed_guards = (tcp_authed, udp_authed);
 
     if *shutdown_rx.borrow() {
         tcp_conn.close(0u32.into(), b"cancelled");
         udp_conn.close(0u32.into(), b"cancelled");
         close_endpoints(&tcp_endpoint, &udp_endpoint, b"cancelled");
-        return Ok(());
+        return Ok(None);
     }
-
-    let initial_rtt = udp_conn.rtt().as_millis() as u64;
-    stats
-        .connected_at_unix
-        .store(protocol::unix_now_secs(), Ordering::Relaxed);
-    stats.rtt_ms.store(initial_rtt, Ordering::Relaxed);
-    stats.jitter_tenths_ms.store(0, Ordering::Relaxed);
-    stats.loss_bps.store(0, Ordering::Relaxed);
-    stats.dup_active.store(false, Ordering::Relaxed);
-    stats.connected.store(true, Ordering::Relaxed);
-    emit(format!(
-        "双通道已连接并认证成功 [{}] ({}，游戏 UDP 通道初始 RTT {} ms)",
-        opts.protocol.label(),
-        server_addr,
-        initial_rtt
-    ));
-
-    // Watchdog: if EITHER lane dies (idle timeout / server restart / network change),
-    // tear the session down so both lanes reconnect cleanly together.
-    let watchdog_tx = shutdown_tx.clone();
-    let wd_tcp = tcp_conn.clone();
-    let wd_udp = udp_conn.clone();
-    let _watchdog_guard = AbortOnDrop(tokio::spawn(async move {
-        tokio::select! {
-            _ = wd_tcp.closed() => {}
-            _ = wd_udp.closed() => {}
-        }
-        let _ = watchdog_tx.send(true);
-    }));
 
     // Dedicated UDP duplicate pacer: samples loss ONLY on `udp_conn`, immune to TCP BBR loss
     let pacer = UdpDupPacer::spawn(udp_conn.clone());
 
-    // Periodic 1s Game Link Health sampler: tracks RTT, RFC 3550 jitter, loss %, and dual-send state
-    let rtt_conn = udp_conn.clone();
-    let rtt_stats = stats.clone();
-    let rtt_pacer = pacer.clone();
-    let rtt_task = tokio::spawn(async move {
-        let mut jitter_est = JitterEstimator::default();
-        let _ = jitter_est.observe_rtt_ms(initial_rtt);
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            tick.tick().await;
-            if rtt_conn.close_reason().is_some() {
-                break;
-            }
-            let rtt = rtt_conn.rtt().as_millis() as u64;
-            let jitter_tenths = jitter_est.observe_rtt_ms(rtt);
-            rtt_stats.rtt_ms.store(rtt, Ordering::Relaxed);
-            rtt_stats
-                .jitter_tenths_ms
-                .store(jitter_tenths, Ordering::Relaxed);
-            rtt_stats
-                .loss_bps
-                .store(rtt_pacer.loss_bps(), Ordering::Relaxed);
-            rtt_stats
-                .dup_active
-                .store(rtt_pacer.is_dup_active(), Ordering::Relaxed);
-        }
-    });
-
     // Background QUIC Datagram receiver on dedicated UDP lane -> dispatch by flow_id
     let udp_dispatch: UdpDispatchMap = Arc::new(DashMap::new());
-    let dispatch_clone = udp_dispatch.clone();
-    let dgram_conn = udp_conn.clone();
-    let dgram_proto = opts.protocol;
-    let dgram_task = tokio::spawn(async move {
-        let mut hy2_reasm = Hy2UdpReassembler::default();
-        while let Ok(raw) = dgram_conn.read_datagram().await {
-            match dgram_proto {
-                NodeProtocol::Gacl => match UdpFrame::decode(raw) {
-                    Ok(frame) => {
-                        if let Some(tx) = dispatch_clone.get(&frame.flow_id) {
-                            let _ = tx.try_send(frame);
-                        }
-                    }
-                    Err(e) => warn!("invalid udp frame from server: {:#}", e),
-                },
-                NodeProtocol::Hysteria2 => match decode_hy2_udp_message(&raw) {
-                    Ok(msg) => {
-                        if let Some((sid, pid, addr_str, payload)) = hy2_reasm.push(msg) {
-                            match parse_hy2_addr(&addr_str) {
-                                Ok(addr) => {
-                                    let flow_id = sid as u16;
-                                    if let Some(tx) = dispatch_clone.get(&flow_id) {
-                                        let _ = tx.try_send(UdpFrame {
-                                            flow_id,
-                                            seq: pid,
-                                            flags: 0,
-                                            addr,
-                                            payload,
-                                        });
-                                    }
-                                }
-                                Err(e) => warn!("invalid hy2 udp addr from server: {:#}", e),
+    let dgram_task = {
+        let dispatch = udp_dispatch.clone();
+        let dgram_conn = udp_conn.clone();
+        let dgram_proto = opts.protocol;
+        AbortOnDrop(tokio::spawn(async move {
+            let mut hy2_reasm = Hy2UdpReassembler::default();
+            while let Ok(raw) = dgram_conn.read_datagram().await {
+                match dgram_proto {
+                    NodeProtocol::Gacl => match UdpFrame::decode(raw) {
+                        Ok(frame) => {
+                            if let Some(tx) = dispatch.get(&frame.flow_id) {
+                                let _ = tx.try_send(frame);
                             }
                         }
-                    }
-                    Err(e) => warn!("invalid hy2 udp datagram from server: {:#}", e),
-                },
+                        Err(e) => warn!("invalid udp frame from server: {:#}", e),
+                    },
+                    NodeProtocol::Hysteria2 => match decode_hy2_udp_message(&raw) {
+                        Ok(msg) => {
+                            if let Some((sid, pid, addr_str, payload)) = hy2_reasm.push(msg) {
+                                match parse_hy2_addr(&addr_str) {
+                                    Ok(addr) => {
+                                        let flow_id = sid as u16;
+                                        if let Some(tx) = dispatch.get(&flow_id) {
+                                            let _ = tx.try_send(UdpFrame {
+                                                flow_id,
+                                                seq: pid,
+                                                flags: 0,
+                                                addr,
+                                                payload,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => warn!("invalid hy2 udp addr from server: {:#}", e),
+                                }
+                            }
+                        }
+                        Err(e) => warn!("invalid hy2 udp datagram from server: {:#}", e),
+                    },
+                }
             }
-        }
-    });
+        }))
+    };
 
     let tunnel = TunnelSession::new(
         tcp_conn.clone(),
@@ -342,77 +580,17 @@ pub async fn run_client_with_shutdown(
         opts.game_dup,
     );
 
-    // Split-routing tables (~140k entries) are parsed once per process, off the runtime.
-    // Built before TUN starts: the mixed proxy and the TUN share one router + dialer.
-    let rules_dir = opts.rules_dir.clone();
-    let rule_data = tokio::task::spawn_blocking(move || RuleData::shared(rules_dir.as_deref()))
-        .await
-        .context("加载分流规则失败")?;
-    emit(format!(
-        "分流模式：{}（{}）",
-        opts.route_mode.get().label(),
-        rule_data.summary(),
-    ));
-    let router = Arc::new(Router::new(opts.route_mode.clone(), rule_data));
-
-    // Optional TUN virtual NIC mode (runs alongside the local mixed proxy)
-    let tun_handle = if opts.enable_tun {
-        let server_ip = server_addr.ip();
-        let tun_tunnel = tunnel.clone();
-        let tun_stats = stats.clone();
-        let tun_log_tx = log_tx.clone();
-        let tun_shutdown = shutdown_rx.clone();
-        let tun_router = router.clone();
-        let tun_err_tx = log_tx.clone();
-        Some(tokio::spawn(async move {
-            let res = tun_mode::run_tun_mode(
-                server_ip,
-                tun_tunnel,
-                tun_stats,
-                tun_router,
-                tun_log_tx,
-                tun_shutdown,
-            )
-            .await;
-            if let Err(e) = &res {
-                info!("TUN 模式异常: {e:#}");
-                if let Some(tx) = &tun_err_tx {
-                    let _ = tx.send(format!("TUN 模式异常: {e:#}"));
-                }
-            }
-            res
-        }))
-    } else {
-        None
-    };
-
-    let res = run_mixed_proxy_server(
-        opts.listen,
+    Ok(Some(Upstream {
         tunnel,
-        stats.clone(),
-        router,
-        log_tx.clone(),
-        shutdown_rx.clone(),
-    )
-    .await;
-
-    // Listener bind failure or shutdown: also stop TUN before awaiting its handle,
-    // otherwise a failed mixed-proxy bind would block here forever.
-    let _ = shutdown_tx.send(true);
-
-    // Errors were already reported by the TUN task itself; this only awaits cleanup.
-    if let Some(handle) = tun_handle {
-        let _ = handle.await;
-    }
-
-    rtt_task.abort();
-    dgram_task.abort();
-    tcp_conn.close(0u32.into(), b"client_shutdown");
-    udp_conn.close(0u32.into(), b"client_shutdown");
-    close_endpoints(&tcp_endpoint, &udp_endpoint, b"client_shutdown");
-    stats.reset();
-    emit("连接已断开".to_string());
-    res
+        tcp_conn,
+        udp_conn,
+        tcp_ep: tcp_endpoint,
+        udp_ep: udp_endpoint,
+        server_addr,
+        _tcp_authed: tcp_authed,
+        _udp_authed: udp_authed,
+        _dgram_task: dgram_task,
+    }))
 }
 
 struct AuthedConn {
@@ -545,15 +723,19 @@ mod tests {
         let stats = Arc::new(ClientStats::default());
         let (tx, rx) = watch::channel(false);
         let opts = ClientOptions {
-            server: "127.0.0.1:9".to_string(),
-            server_name: "localhost".to_string(),
+            primary: UpstreamOptions {
+                server: "127.0.0.1:9".to_string(),
+                server_name: "localhost".to_string(),
+                token: "t".to_string(),
+                protocol: NodeProtocol::Gacl,
+                game_dup: false,
+                insecure: true,
+                brutal_mbps: 0,
+            },
+            secondary: None,
+            domestic: DomesticEgress::Direct,
             listen: "127.0.0.1:0".parse().unwrap(),
-            token: "t".to_string(),
-            protocol: NodeProtocol::Gacl,
-            game_dup: false,
             enable_tun: false,
-            insecure: true,
-            brutal_mbps: 0,
             route_mode: RouteModeCell::new(crate::rules::RouteMode::Rule),
             rules_dir: None,
         };
@@ -749,15 +931,19 @@ mod tests {
         let (shut_tx, shut_rx) = watch::channel(false);
         let stats = Arc::new(ClientStats::default());
         let opts = ClientOptions {
-            server: srv_str,
-            server_name: "localhost".to_string(),
+            primary: UpstreamOptions {
+                server: srv_str,
+                server_name: "localhost".to_string(),
+                token: "hy2-test-token".to_string(),
+                protocol: NodeProtocol::Hysteria2,
+                game_dup: false,
+                insecure: true,
+                brutal_mbps: 0,
+            },
+            secondary: None,
+            domestic: DomesticEgress::Direct,
             listen: free_port,
-            token: "hy2-test-token".to_string(),
-            protocol: NodeProtocol::Hysteria2,
-            game_dup: false,
             enable_tun: false,
-            insecure: true,
-            brutal_mbps: 0,
             route_mode: RouteModeCell::new(crate::rules::RouteMode::Global),
             rules_dir: None,
         };

@@ -588,6 +588,9 @@ impl GameAccelApp {
         }
         if let Some(id) = delete_id {
             self.cfg.nodes.retain(|n| n.id != id);
+            if self.cfg.domestic_node_id.as_deref() == Some(id.as_str()) {
+                self.cfg.domestic_node_id = None;
+            }
             if self.cfg.active_node_id == id {
                 self.cfg.active_node_id = self
                     .cfg

@@ -1,17 +1,19 @@
 //! Split routing (分流): decide per connection whether a target goes DIRECT from this
-//! machine or through the tunnel, Clash-style:
+//! machine, through the primary (foreign) tunnel, or through the domestic tunnel:
 //!
 //! ```text
 //! private / LAN address            -> DIRECT
-//! DOMAIN in proxy-list             -> PROXY   (known foreign sites, skips local DNS)
-//! DOMAIN in direct-list            -> DIRECT  (geosite:cn — ~110k Chinese domains)
-//! IP in geoip:cn                   -> DIRECT
-//! unknown DOMAIN -> local DNS -> CN IP ? DIRECT : PROXY   (like Clash `GEOIP,CN` on a domain)
-//! everything else                  -> PROXY
+//! DOMAIN in proxy-list             -> PRIMARY (known foreign sites, skips local DNS)
+//! DOMAIN in direct-list            -> domestic egress (geosite:cn — ~110k Chinese domains)
+//! IP in geoip:cn                   -> domestic egress
+//! unknown DOMAIN -> local DNS -> CN IP ? domestic egress : PRIMARY
+//! everything else                  -> PRIMARY
 //! ```
 //!
-//! Rule data (Loyalsoldier v2ray-rules-dat / geoip) is embedded in the binary; files with
-//! the same names in the optional `rules_dir` override the embedded copies.
+//! "Domestic egress" is DIRECT unless a domestic node is configured and connected, in which
+//! case domestic traffic is tunnelled through it. Rule data (Loyalsoldier v2ray-rules-dat /
+//! geoip) is embedded in the binary; files with the same names in the optional `rules_dir`
+//! override the embedded copies.
 
 use crate::direct::DirectDialer;
 use dashmap::DashMap;
@@ -32,13 +34,15 @@ const GEOIP_RESOLVE_TIMEOUT: Duration = Duration::from_millis(800);
 const DNS_CACHE_TTL: Duration = Duration::from_secs(120);
 const DNS_CACHE_MAX: usize = 8192;
 
-/// User-facing routing mode (规则 / 全局 / 直连).
+/// User-facing routing mode (大陆直连 / 双节点 / 全局 / 直连).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RouteMode {
-    /// Split routing by rules (default).
+    /// Split routing: domestic direct, foreign via primary node (default).
     #[default]
     Rule,
-    /// Everything through the tunnel (pre-split behaviour).
+    /// Dual-node split routing: domestic via domestic node, foreign via primary node.
+    Dual,
+    /// Everything through the primary tunnel (except LAN/localhost).
     Global,
     /// Everything direct (tunnel effectively bypassed; handy for A/B comparison).
     Direct,
@@ -47,10 +51,15 @@ pub enum RouteMode {
 impl RouteMode {
     pub fn label(self) -> &'static str {
         match self {
-            RouteMode::Rule => "规则分流",
+            RouteMode::Rule => "大陆直连",
+            RouteMode::Dual => "双节点分流",
             RouteMode::Global => "全局代理",
-            RouteMode::Direct => "全部直连",
+            RouteMode::Direct => "纯直连",
         }
+    }
+
+    pub fn is_split(self) -> bool {
+        matches!(self, RouteMode::Rule | RouteMode::Dual)
     }
 }
 
@@ -65,8 +74,9 @@ impl RouteModeCell {
     }
     pub fn get(&self) -> RouteMode {
         match self.0.load(Ordering::Relaxed) {
-            1 => RouteMode::Global,
-            2 => RouteMode::Direct,
+            1 => RouteMode::Dual,
+            2 => RouteMode::Global,
+            3 => RouteMode::Direct,
             _ => RouteMode::Rule,
         }
     }
@@ -75,10 +85,56 @@ impl RouteModeCell {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Route {
     Direct,
-    Proxy,
+    /// Through the primary (foreign) tunnel.
+    Primary,
+    /// Through the domestic tunnel; only produced in `Dual` mode when secondary is up.
+    Secondary,
+}
+
+/// Where the domestic (CN) bucket goes when `RouteMode::Dual` is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomesticEgress {
+    #[default]
+    Direct,
+    /// Route through the secondary (domestic) tunnel.
+    Secondary,
+    /// Reuse the primary tunnel (when the user chose the same node for both roles).
+    Primary,
+}
+
+impl DomesticEgress {
+    pub fn label(self) -> &'static str {
+        match self {
+            DomesticEgress::Direct => "直连",
+            DomesticEgress::Secondary => "国内节点",
+            DomesticEgress::Primary => "复用主节点",
+        }
+    }
+}
+
+/// Live domestic-egress policy shared between the session and its watchdog: if the domestic
+/// tunnel dies, the watchdog flips this to `Direct` so new connections fall back gracefully.
+#[derive(Debug)]
+pub struct DomesticEgressCell(AtomicU8);
+
+impl DomesticEgressCell {
+    pub fn new(egress: DomesticEgress) -> Arc<Self> {
+        Arc::new(Self(AtomicU8::new(egress as u8)))
+    }
+    pub fn get(&self) -> DomesticEgress {
+        match self.0.load(Ordering::Relaxed) {
+            1 => DomesticEgress::Secondary,
+            2 => DomesticEgress::Primary,
+            _ => DomesticEgress::Direct,
+        }
+    }
+    pub fn set(&self, egress: DomesticEgress) {
+        self.0.store(egress as u8, Ordering::Relaxed);
+    }
 }
 
 /// Sorted domain list supporting exact (`full:`) and suffix matches via binary search.
@@ -308,6 +364,7 @@ impl RuleData {
 
 pub struct Router {
     mode: Arc<RouteModeCell>,
+    domestic: Arc<DomesticEgressCell>,
     data: Arc<RuleData>,
     /// host -> first resolved IP (None = resolution failed), for the GEOIP fallback.
     dns_cache: DashMap<String, (Option<IpAddr>, Instant)>,
@@ -335,14 +392,40 @@ pub const DOMESTIC_DNS: std::net::SocketAddr =
     std::net::SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(223, 5, 5, 5), 53));
 const DNS_HINTS_MAX: usize = 65536;
 
+/// Domain-list bucket before the egress policy is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DomainBucket {
+    /// Localhost / machine-local names: strictly DIRECT even in `Dual` or `Global` mode.
+    Local,
+    Domestic,
+    Foreign,
+}
+
 impl Router {
-    pub fn new(mode: Arc<RouteModeCell>, data: Arc<RuleData>) -> Self {
+    pub fn new(
+        mode: Arc<RouteModeCell>,
+        domestic: Arc<DomesticEgressCell>,
+        data: Arc<RuleData>,
+    ) -> Self {
         Self {
             mode,
+            domestic,
             data,
             dns_cache: DashMap::new(),
             dns_hints: DashMap::new(),
             dialer: DirectDialer::default(),
+        }
+    }
+
+    /// Where the domestic bucket currently goes (only uses secondary/primary in `Dual` mode).
+    fn domestic_route(&self) -> Route {
+        if self.mode.get() != RouteMode::Dual {
+            return Route::Direct;
+        }
+        match self.domestic.get() {
+            DomesticEgress::Direct => Route::Direct,
+            DomesticEgress::Secondary => Route::Secondary,
+            DomesticEgress::Primary => Route::Primary,
         }
     }
 
@@ -351,8 +434,13 @@ impl Router {
         match self.mode.get() {
             RouteMode::Global => DnsRoute::Proxy,
             RouteMode::Direct => DnsRoute::Direct,
-            RouteMode::Rule => match crate::dns_msg::question_name(query) {
-                Some(name) if self.decide_domain_static(&name) == Some(Route::Direct) => {
+            RouteMode::Rule | RouteMode::Dual => match crate::dns_msg::question_name(query) {
+                Some(name)
+                    if matches!(
+                        self.domain_bucket(&name),
+                        Some(DomainBucket::Domestic | DomainBucket::Local)
+                    ) =>
+                {
                     DnsRoute::Domestic
                 }
                 _ => DnsRoute::Proxy,
@@ -395,9 +483,22 @@ impl Router {
 
     async fn decide_inner(&self, target: &TargetAddr) -> Route {
         match self.mode.get() {
-            RouteMode::Global => return Route::Proxy,
             RouteMode::Direct => return Route::Direct,
-            RouteMode::Rule => {}
+            RouteMode::Global => {
+                return match target {
+                    TargetAddr::Ip(addr) if is_local_ip(addr.ip()) => Route::Direct,
+                    TargetAddr::Domain(host, _) => {
+                        let h = normalize_host(host);
+                        if h == "localhost" || h.parse::<IpAddr>().is_ok_and(is_local_ip) {
+                            Route::Direct
+                        } else {
+                            Route::Primary
+                        }
+                    }
+                    _ => Route::Primary,
+                };
+            }
+            RouteMode::Rule | RouteMode::Dual => {}
         }
         match target {
             TargetAddr::Ip(addr) => self.decide_ip(addr.ip()),
@@ -410,8 +511,9 @@ impl Router {
                     return route;
                 }
                 match self.resolve_cached(&host).await {
-                    Some(ip) if is_local_ip(ip) || self.data.cn_ip.contains(ip) => Route::Direct,
-                    _ => Route::Proxy,
+                    Some(ip) if is_local_ip(ip) => Route::Direct,
+                    Some(ip) if self.data.cn_ip.contains(ip) => self.domestic_route(),
+                    _ => Route::Primary,
                 }
             }
         }
@@ -425,11 +527,11 @@ impl Router {
                 if is_local_ip(ip) {
                     Route::Direct
                 } else {
-                    Route::Proxy
+                    Route::Primary
                 }
             }
             RouteMode::Direct => Route::Direct,
-            RouteMode::Rule => self.decide_ip(ip),
+            RouteMode::Rule | RouteMode::Dual => self.decide_ip(ip),
         }
     }
 
@@ -445,27 +547,36 @@ impl Router {
             return route;
         }
         if self.data.cn_ip.contains(ip) {
-            Route::Direct
+            self.domestic_route()
         } else {
-            Route::Proxy
+            Route::Primary
         }
     }
 
     /// List-based verdict without any DNS; `None` means "unknown domain".
     fn decide_domain_static(&self, host: &str) -> Option<Route> {
-        // Tunnel-only aliases (server panel) and mDNS names must never be resolved locally.
-        if host.ends_with(".local") || host == "localhost" {
-            return Some(if host == "localhost" {
-                Route::Direct
-            } else {
-                Route::Proxy
-            });
+        Some(match self.domain_bucket(host)? {
+            DomainBucket::Local => Route::Direct,
+            DomainBucket::Foreign => Route::Primary,
+            DomainBucket::Domestic => self.domestic_route(),
+        })
+    }
+
+    /// Domain-list classification, independent of the current egress policy (so DNS
+    /// splitting keeps working when domestic traffic is routed through the domestic node).
+    fn domain_bucket(&self, host: &str) -> Option<DomainBucket> {
+        // Localhost stays strictly local; tunnel-only `.local` aliases (server panel) go primary.
+        if host == "localhost" {
+            return Some(DomainBucket::Local);
+        }
+        if host.ends_with(".local") {
+            return Some(DomainBucket::Foreign);
         }
         if self.data.proxy.matches(host) {
-            return Some(Route::Proxy);
+            return Some(DomainBucket::Foreign);
         }
         if self.data.direct.matches(host) {
-            return Some(Route::Direct);
+            return Some(DomainBucket::Domestic);
         }
         None
     }
@@ -506,7 +617,15 @@ mod tests {
     use std::net::SocketAddr;
 
     fn router(mode: RouteMode) -> Router {
-        Router::new(RouteModeCell::new(mode), RuleData::shared(None))
+        router_with(mode, DomesticEgress::Direct)
+    }
+
+    fn router_with(mode: RouteMode, domestic: DomesticEgress) -> Router {
+        Router::new(
+            RouteModeCell::new(mode),
+            DomesticEgressCell::new(domestic),
+            RuleData::shared(None),
+        )
     }
 
     fn dom(h: &str) -> TargetAddr {
@@ -531,10 +650,58 @@ mod tests {
             assert_eq!(r.decide(&dom(d)).await, Route::Direct, "{d}");
         }
         for d in ["www.google.com", "youtube.com", "i.ytimg.com", "github.com"] {
-            assert_eq!(r.decide(&dom(d)).await, Route::Proxy, "{d}");
+            assert_eq!(r.decide(&dom(d)).await, Route::Primary, "{d}");
         }
         // Tunnel-only panel alias must never be resolved locally or sent direct
-        assert_eq!(r.decide(&dom("panel.gacl.local")).await, Route::Proxy);
+        assert_eq!(r.decide(&dom("panel.gacl.local")).await, Route::Primary);
+    }
+
+    #[tokio::test]
+    async fn domestic_bucket_follows_egress_policy() {
+        let r = router_with(RouteMode::Dual, DomesticEgress::Secondary);
+        for d in ["www.baidu.com", "api.bilibili.com", "gov.cn"] {
+            assert_eq!(r.decide(&dom(d)).await, Route::Secondary, "{d}");
+        }
+        assert_eq!(r.decide(&dom("www.google.com")).await, Route::Primary);
+        assert_eq!(r.decide(&ip("223.5.5.5:53")).await, Route::Secondary);
+        assert_eq!(r.decide(&ip("8.8.8.8:53")).await, Route::Primary);
+        // LAN and localhost MUST always stay direct even in Dual mode!
+        assert_eq!(r.decide(&ip("192.168.1.1:80")).await, Route::Direct);
+        assert_eq!(r.decide(&ip("127.0.0.1:8080")).await, Route::Direct);
+        assert_eq!(r.decide(&dom("localhost")).await, Route::Direct);
+
+        // Rule mode ignores Secondary domestic egress and keeps CN direct
+        let r_rule = router_with(RouteMode::Rule, DomesticEgress::Secondary);
+        assert_eq!(r_rule.decide(&dom("www.baidu.com")).await, Route::Direct);
+        assert_eq!(r_rule.decide(&dom("www.google.com")).await, Route::Primary);
+
+        // DNS splitting classifies by the domain bucket, not the egress
+        use crate::dns_msg::tests::build_query;
+        assert_eq!(
+            r.decide_dns_query(&build_query(1, "www.baidu.com")),
+            DnsRoute::Domestic
+        );
+        assert_eq!(
+            r.decide_dns_query(&build_query(2, "www.google.com")),
+            DnsRoute::Proxy
+        );
+    }
+
+    #[tokio::test]
+    async fn domestic_egress_downgrades_live() {
+        let cell = DomesticEgressCell::new(DomesticEgress::Secondary);
+        let r = Router::new(
+            RouteModeCell::new(RouteMode::Dual),
+            cell.clone(),
+            RuleData::shared(None),
+        );
+        assert_eq!(r.decide(&dom("www.baidu.com")).await, Route::Secondary);
+        cell.set(DomesticEgress::Direct);
+        assert_eq!(r.decide(&dom("www.baidu.com")).await, Route::Direct);
+        assert_eq!(
+            r.decide_ip_sync("223.5.5.5".parse().unwrap()),
+            Route::Direct
+        );
     }
 
     #[tokio::test]
@@ -542,24 +709,28 @@ mod tests {
         let r = router(RouteMode::Rule);
         assert_eq!(r.decide(&ip("114.114.114.114:53")).await, Route::Direct); // CN DNS
         assert_eq!(r.decide(&ip("223.5.5.5:53")).await, Route::Direct); // AliDNS
-        assert_eq!(r.decide(&ip("8.8.8.8:53")).await, Route::Proxy);
-        assert_eq!(r.decide(&ip("1.1.1.1:443")).await, Route::Proxy);
+        assert_eq!(r.decide(&ip("8.8.8.8:53")).await, Route::Primary);
+        assert_eq!(r.decide(&ip("1.1.1.1:443")).await, Route::Primary);
         assert_eq!(r.decide(&ip("192.168.1.1:80")).await, Route::Direct);
         assert_eq!(r.decide(&ip("127.0.0.1:80")).await, Route::Direct);
         assert_eq!(r.decide(&ip("[::1]:80")).await, Route::Direct);
         assert_eq!(
             r.decide(&ip("[2001:4860:4860::8888]:53")).await,
-            Route::Proxy
+            Route::Primary
         );
         // Tunnel-only panel TUN alias (198.18.0.1) is not local -> must be tunnelled
-        assert_eq!(r.decide(&ip("198.18.0.1:80")).await, Route::Proxy);
+        assert_eq!(r.decide(&ip("198.18.0.1:80")).await, Route::Primary);
     }
 
     #[tokio::test]
     async fn modes_override_rules_and_switch_live() {
         let cell = RouteModeCell::new(RouteMode::Global);
-        let r = Router::new(cell.clone(), RuleData::shared(None));
-        assert_eq!(r.decide(&dom("www.baidu.com")).await, Route::Proxy);
+        let r = Router::new(
+            cell.clone(),
+            DomesticEgressCell::new(DomesticEgress::Direct),
+            RuleData::shared(None),
+        );
+        assert_eq!(r.decide(&dom("www.baidu.com")).await, Route::Primary);
         cell.set(RouteMode::Direct);
         assert_eq!(r.decide(&dom("www.google.com")).await, Route::Direct);
         cell.set(RouteMode::Rule);
@@ -585,7 +756,7 @@ mod tests {
 
         // A foreign IP learned as belonging to a domestic domain goes direct (and vice versa).
         let foreign_ip: IpAddr = "8.8.4.4".parse().unwrap();
-        assert_eq!(r.decide_ip(foreign_ip), Route::Proxy);
+        assert_eq!(r.decide_ip(foreign_ip), Route::Primary);
         let mut resp = build_query(4, "www.baidu.com");
         resp[2] = 0x81;
         resp[7] = 1;

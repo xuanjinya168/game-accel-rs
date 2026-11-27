@@ -8,6 +8,7 @@ use crate::relay::{
     ClientStats, SOCKS_FLOW_MAX, SOCKS_FLOW_MIN, TUN_FLOW_MAX, TUN_FLOW_MIN, UdpDispatchMap,
     open_proxy_tcp_stream, relay_fast_open, reserve_flow_id,
 };
+use crate::rules::Route;
 use anyhow::Result;
 use bytes::Bytes;
 use protocol::frame::{FLAG_GAME_MODE, TargetAddr, UdpFrame};
@@ -26,6 +27,36 @@ pub struct TunnelSession {
     udp_dispatch: UdpDispatchMap,
     protocol: NodeProtocol,
     game_dup: bool,
+}
+
+/// Both upstream tunnels of the session, keyed by the router's verdict.
+pub struct Tunnels {
+    primary: Arc<TunnelSession>,
+    secondary: Option<Arc<TunnelSession>>,
+}
+
+impl Tunnels {
+    pub fn new(primary: Arc<TunnelSession>, secondary: Option<Arc<TunnelSession>>) -> Arc<Self> {
+        Arc::new(Self { primary, secondary })
+    }
+
+    pub fn primary(&self) -> &Arc<TunnelSession> {
+        &self.primary
+    }
+
+    pub fn secondary(&self) -> Option<&Arc<TunnelSession>> {
+        self.secondary.as_ref()
+    }
+
+    /// Tunnel that should carry `route`. `Direct` yields `None`; a missing domestic lane also
+    /// yields `None`, so callers never send domestic traffic through the foreign node.
+    pub fn for_route(&self, route: Route) -> Option<&Arc<TunnelSession>> {
+        match route {
+            Route::Primary => Some(&self.primary),
+            Route::Secondary => self.secondary.as_ref(),
+            Route::Direct => None,
+        }
+    }
 }
 
 impl TunnelSession {
@@ -51,6 +82,11 @@ impl TunnelSession {
         self.game_dup
     }
 
+    /// Shared duplicate-send pacer of this tunnel's UDP lane (used by the health sampler).
+    pub fn pacer(&self) -> &UdpDupPacer {
+        &self.pacer
+    }
+
     /// Whether inbound UDP frames carry monotonic dedup sequence numbers (`GACL` only).
     pub fn should_dedup_rx(&self) -> bool {
         self.protocol == NodeProtocol::Gacl
@@ -60,8 +96,18 @@ impl TunnelSession {
         &self.udp_dispatch
     }
 
-    pub fn reserve_socks_flow(&self, cursor: &AtomicU16, tx: mpsc::Sender<UdpFrame>) -> Option<u16> {
-        reserve_flow_id(cursor, &self.udp_dispatch, tx, SOCKS_FLOW_MIN, SOCKS_FLOW_MAX)
+    pub fn reserve_socks_flow(
+        &self,
+        cursor: &AtomicU16,
+        tx: mpsc::Sender<UdpFrame>,
+    ) -> Option<u16> {
+        reserve_flow_id(
+            cursor,
+            &self.udp_dispatch,
+            tx,
+            SOCKS_FLOW_MIN,
+            SOCKS_FLOW_MAX,
+        )
     }
 
     pub fn reserve_tun_flow(&self, cursor: &AtomicU16, tx: mpsc::Sender<UdpFrame>) -> Option<u16> {
@@ -74,7 +120,10 @@ impl TunnelSession {
 
     /// Opens a proxied TCP bidirectional stream on the bulk TCP QUIC lane and writes the
     /// protocol-appropriate open header (`GACL` or `Hysteria2 0x401`).
-    pub async fn open_tcp(&self, target: &TargetAddr) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    pub async fn open_tcp(
+        &self,
+        target: &TargetAddr,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream)> {
         open_proxy_tcp_stream(&self.tcp_conn, self.protocol, target).await
     }
 
@@ -90,7 +139,15 @@ impl TunnelSession {
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
-        relay_fast_open(stream, quic_send, quic_recv, self.protocol, stats, fail_reply).await
+        relay_fast_open(
+            stream,
+            quic_send,
+            quic_recv,
+            self.protocol,
+            stats,
+            fail_reply,
+        )
+        .await
     }
 
     /// Sends a proxied UDP datagram on the dedicated low-latency UDP QUIC lane, engaging adaptive

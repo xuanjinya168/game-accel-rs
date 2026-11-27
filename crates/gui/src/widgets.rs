@@ -710,6 +710,7 @@ fn draw_idle_chart_grid(
 pub fn draw_rtt_sparkline(
     ui: &mut egui::Ui,
     history: &VecDeque<u64>,
+    secondary_history: Option<&VecDeque<Option<u64>>>,
     is_connected: bool,
     p: ThemePalette,
 ) {
@@ -729,7 +730,11 @@ pub fn draw_rtt_sparkline(
         return;
     }
 
-    let peak = history.iter().copied().max().unwrap_or(100).max(50);
+    let sec_max = secondary_history
+        .and_then(|h| h.iter().flatten().copied().max())
+        .unwrap_or(0);
+    let has_dual = secondary_history.is_some_and(|h| h.iter().filter(|v| v.is_some()).count() >= 2);
+    let peak = history.iter().copied().max().unwrap_or(100).max(sec_max).max(50);
     let max_val = ((peak as f32 * 1.35) / 10.0).ceil() * 10.0;
     let left_pad = 46.0;
     let inner = egui::Rect::from_min_max(
@@ -762,40 +767,78 @@ pub fn draw_rtt_sparkline(
         );
     }
 
+    let map_pt = |i: usize, val: u64| -> Pos2 {
+        let x = inner.left() + i as f32 * step_x;
+        let norm = (val as f32 / max_val).clamp(0.0, 1.0);
+        let y = inner.bottom() - norm * inner.height();
+        Pos2::new(x, y)
+    };
+
+    let draw_area_line = |pts: &[Pos2], col: Color32, width: f32, fill_alpha: f32| {
+        if pts.len() < 2 {
+            return;
+        }
+        let mut mesh = egui::Mesh::default();
+        let top_col = col.gamma_multiply(fill_alpha);
+        let bot_col = col.gamma_multiply(0.0);
+        for (i, pt) in pts.iter().enumerate() {
+            let base_idx = (i * 2) as u32;
+            mesh.colored_vertex(*pt, top_col);
+            mesh.colored_vertex(Pos2::new(pt.x, inner.bottom()), bot_col);
+            if i > 0 {
+                let prev = base_idx - 2;
+                mesh.add_triangle(prev, prev + 1, base_idx);
+                mesh.add_triangle(prev + 1, base_idx + 1, base_idx);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(width, col)));
+    };
+
+    // Primary node curve: Slate Ink in Dual mode (clean contrast with Emerald domestic curve),
+    // Emerald in single-node mode.
+    let primary_col = if has_dual {
+        p.data_primary
+    } else {
+        p.success_text
+    };
     let points: Vec<Pos2> = history
         .iter()
         .enumerate()
-        .map(|(i, &val)| {
-            let x = inner.left() + i as f32 * step_x;
-            let norm = (val as f32 / max_val).clamp(0.0, 1.0);
-            let y = inner.bottom() - norm * inner.height();
-            Pos2::new(x, y)
-        })
+        .map(|(i, &val)| map_pt(i, val))
         .collect();
-
-    let line_col = p.success_text;
-    let mut mesh = egui::Mesh::default();
-    let top_col = line_col.gamma_multiply(if p.is_dark { 0.20 } else { 0.14 });
-    let bot_col = line_col.gamma_multiply(0.0);
-    for (i, pt) in points.iter().enumerate() {
-        let base_idx = (i * 2) as u32;
-        mesh.colored_vertex(*pt, top_col);
-        mesh.colored_vertex(Pos2::new(pt.x, inner.bottom()), bot_col);
-        if i > 0 {
-            let prev = base_idx - 2;
-            mesh.add_triangle(prev, prev + 1, base_idx);
-            mesh.add_triangle(prev + 1, base_idx + 1, base_idx);
-        }
-    }
-    painter.add(egui::Shape::mesh(mesh));
-
-    painter.add(egui::Shape::line(
-        points.clone(),
-        Stroke::new(2.0_f32, line_col),
-    ));
+    draw_area_line(
+        &points,
+        primary_col,
+        2.0,
+        if p.is_dark { 0.18 } else { 0.13 },
+    );
     if let Some(&last_pt) = points.last() {
-        painter.circle_filled(last_pt, 5.5, line_col.gamma_multiply(0.22));
-        painter.circle_filled(last_pt, 3.0, line_col);
+        painter.circle_filled(last_pt, 5.2, primary_col.gamma_multiply(0.22));
+        painter.circle_filled(last_pt, 3.0, primary_col);
+    }
+
+    // Secondary (domestic) node curve in Dual mode (split into contiguous runs on `None` gaps).
+    if has_dual && let Some(sec) = secondary_history {
+        let sec_col = p.success_text;
+        let offset = history.len().saturating_sub(sec.len());
+        let mut run: Vec<Pos2> = Vec::new();
+        let mut last_sec_pt: Option<Pos2> = None;
+        for (idx, opt_v) in sec.iter().enumerate() {
+            if let Some(v) = *opt_v {
+                let pt = map_pt(offset + idx, v);
+                run.push(pt);
+                last_sec_pt = Some(pt);
+            } else {
+                draw_area_line(&run, sec_col, 1.8, if p.is_dark { 0.14 } else { 0.10 });
+                run.clear();
+            }
+        }
+        draw_area_line(&run, sec_col, 1.8, if p.is_dark { 0.14 } else { 0.10 });
+        if let Some(pt) = last_sec_pt {
+            painter.circle_filled(pt, 4.8, sec_col.gamma_multiply(0.22));
+            painter.circle_filled(pt, 2.7, sec_col);
+        }
     }
 }
 

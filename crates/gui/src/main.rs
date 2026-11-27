@@ -152,6 +152,8 @@ pub(crate) struct GameAccelApp {
     pub(crate) session_id: u64,
     /// Live split-routing mode shared with the running session (no reconnect needed).
     pub(crate) route_mode_cell: Arc<client::rules::RouteModeCell>,
+    /// Which domestic node ID was actually dialled for the current session (None if not in Dual or same as primary).
+    pub(crate) session_secondary_node_id: Option<String>,
 
     // Telemetry series (bounded 60s throughput & RTT ring buffer)
     pub(crate) telemetry: TelemetrySeries,
@@ -260,6 +262,7 @@ impl GameAccelApp {
         let mut app = Self {
             rt,
             route_mode_cell: client::rules::RouteModeCell::new(cfg.route_mode),
+            session_secondary_node_id: None,
             cfg,
             active_tab: NavTab::Dashboard,
             state: ConnState::Disconnected,

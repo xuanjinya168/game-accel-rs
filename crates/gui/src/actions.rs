@@ -6,8 +6,9 @@ use crate::tray::TrayCmd;
 use crate::{AsyncEvent, ConnState, GameAccelApp, NavTab, ProbeState, relaunch_as_admin};
 use chrono::Local;
 use client::classify;
+use client::rules::{DomesticEgress, RouteMode};
 use client::socks5::ClientStats;
-use client::{ClientOptions, probe_node_rtt, run_client_with_shutdown};
+use client::{ClientOptions, UpstreamOptions, probe_node_rtt, run_client_with_shutdown};
 use eframe::egui;
 use protocol::share::{NodeProfile, parse_import_text};
 use std::net::SocketAddr;
@@ -63,12 +64,78 @@ impl GameAccelApp {
         if self.cfg.route_mode == mode {
             return;
         }
+        // When entering Dual mode with no domestic exit chosen yet, auto-pick another node
+        // if available so dual-node routing works immediately in 1 click.
+        if mode == RouteMode::Dual
+            && self.cfg.domestic_node().is_none()
+            && let Some(other) = self
+                .cfg
+                .nodes
+                .iter()
+                .find(|n| n.id != self.cfg.active_node_id)
+                .or_else(|| self.cfg.nodes.first())
+        {
+            self.cfg.domestic_node_id = Some(other.id.clone());
+        }
+
         self.cfg.route_mode = mode;
         self.route_mode_cell.set(mode);
         save_config(&self.cfg);
+
+        // Entering Dual mode requires dialing the secondary node if it wasn't already dialled
+        // in the current session. Leaving Dual (Dual -> Rule/Global/Direct) is hot & instant.
+        let desired_secondary = self.desired_secondary_node_id();
+        if self.state != ConnState::Disconnected
+            && mode == RouteMode::Dual
+            && desired_secondary != self.session_secondary_node_id
+        {
+            self.push_log("已切换为「双节点分流」，正在建立国内节点隧道...");
+            self.show_toast("已切换为「双节点分流」，正在连接国内节点...");
+            self.stop_connect();
+            self.start_connect();
+            return;
+        }
+
         let msg = format!("分流模式已切换为「{}」（对新连接立即生效）", mode.label());
         self.push_log(msg.clone());
         self.toast = Some((msg, Instant::now()));
+    }
+
+    pub(crate) fn switch_domestic_node(&mut self, node_id: String) {
+        if self.cfg.domestic_node_id.as_deref() == Some(node_id.as_str()) {
+            return;
+        }
+        self.cfg.domestic_node_id = Some(node_id);
+        save_config(&self.cfg);
+        let name = self
+            .cfg
+            .domestic_node()
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| "未知节点".to_string());
+        if self.state != ConnState::Disconnected && self.cfg.route_mode == RouteMode::Dual {
+            self.push_log(format!("国内出口已切换为「{name}」，正在重新建立连接..."));
+            self.show_toast(format!("国内出口已切换为「{name}」"));
+            self.stop_connect();
+            self.start_connect();
+        } else {
+            self.push_log(format!("国内出口已设为「{name}」"));
+            self.show_toast(format!("国内出口已设为「{name}」"));
+        }
+    }
+
+    /// Returns `Some(id)` when `Dual` mode needs a distinct secondary tunnel; `None` if not
+    /// in `Dual` mode, no domestic node is chosen, or the user chose the same node as primary.
+    fn desired_secondary_node_id(&self) -> Option<String> {
+        if self.cfg.route_mode != RouteMode::Dual {
+            return None;
+        }
+        let dom = self.cfg.domestic_node()?;
+        let active_id = self.cfg.active_node().map(|n| n.id.as_str())?;
+        if dom.id == active_id {
+            None
+        } else {
+            Some(dom.id.clone())
+        }
     }
 
     pub(crate) fn switch_proxy_mode(&mut self, mode: ProxyMode) {
@@ -202,6 +269,7 @@ impl GameAccelApp {
         if !reconnect {
             save_config(&self.cfg);
         }
+        self.session_secondary_node_id = None;
         self.session_id = self.session_id.wrapping_add(1);
         let session_id = self.session_id;
         // Allocate fresh stats per session so a winding-down previous task cannot
@@ -236,16 +304,38 @@ impl GameAccelApp {
             }
         });
 
+        let (secondary, domestic, dialed_secondary_id) =
+            if self.cfg.route_mode == RouteMode::Dual {
+                match self.cfg.domestic_node().cloned() {
+                    Some(dom) if dom.id == node.id => (None, DomesticEgress::Primary, None),
+                    Some(dom) if client::validate_server_addr(dom.server.trim()).is_ok() => (
+                        Some(upstream_options(&dom)),
+                        DomesticEgress::Secondary,
+                        Some(dom.id),
+                    ),
+                    Some(dom) => {
+                        self.push_log(format!(
+                            "国内出口「{}」地址无效，国内流量暂回退直连",
+                            dom.name
+                        ));
+                        (None, DomesticEgress::Direct, None)
+                    }
+                    None => {
+                        self.push_log("尚未选择国内出口节点，国内流量暂回退直连");
+                        (None, DomesticEgress::Direct, None)
+                    }
+                }
+            } else {
+                (None, DomesticEgress::Direct, None)
+            };
+        self.session_secondary_node_id = dialed_secondary_id;
+
         let opts = ClientOptions {
-            server,
-            server_name: node.sni.trim().to_string(),
+            primary: upstream_options(&node),
+            secondary,
+            domestic,
             listen,
-            token: node.token.trim().to_string(),
-            protocol: node.protocol,
-            game_dup: node.game_dup,
             enable_tun: self.cfg.proxy_mode == ProxyMode::Tun,
-            insecure: node.insecure,
-            brutal_mbps: node.brutal_mbps,
             route_mode: self.route_mode_cell.clone(),
             rules_dir: Some(storage::config_dir().join("rules")),
         };
@@ -267,6 +357,7 @@ impl GameAccelApp {
     pub(crate) fn stop_connect(&mut self) {
         self.reconnect.reset();
         self.pending_mode_reconnect = None;
+        self.session_secondary_node_id = None;
         self.session_id = self.session_id.wrapping_add(1);
         if let Ok(mut guard) = self.shutdown_slot.lock()
             && let Some(tx) = guard.take()
@@ -872,5 +963,17 @@ impl GameAccelApp {
                 self.show_toast("已取消，继续使用当前模式");
             }
         }
+    }
+}
+
+fn upstream_options(node: &NodeProfile) -> UpstreamOptions {
+    UpstreamOptions {
+        server: node.server.trim().to_string(),
+        server_name: node.sni.trim().to_string(),
+        token: node.token.trim().to_string(),
+        protocol: node.protocol,
+        game_dup: node.game_dup,
+        insecure: node.insecure,
+        brutal_mbps: node.brutal_mbps,
     }
 }

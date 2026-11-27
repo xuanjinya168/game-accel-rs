@@ -4,7 +4,7 @@ use crate::http_proxy::handle_http_proxy_client;
 pub use crate::relay::{ClientStats, UdpDispatchMap};
 use crate::relay::{SOCKS_FLOW_MIN, relay_direct};
 use crate::rules::{Route, Router};
-use crate::tunnel::TunnelSession;
+use crate::tunnel::Tunnels;
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use protocol::dedup::DedupWindow;
@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 /// Mixed (HTTP + HTTPS CONNECT + SOCKS5 TCP/UDP) proxy listener on a single port.
 pub async fn run_mixed_proxy_server(
     listen_addr: SocketAddr,
-    tunnel: Arc<TunnelSession>,
+    tunnels: Arc<Tunnels>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
     log_tx: Option<mpsc::UnboundedSender<String>>,
@@ -54,14 +54,14 @@ pub async fn run_mixed_proxy_server(
                         continue;
                     }
                 };
-                let tunnel = tunnel.clone();
+                let tunnels = tunnels.clone();
                 let next_flow_id = next_flow_id.clone();
                 let stats = stats.clone();
                 let router = router.clone();
 
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
-                    if let Err(e) = handle_mixed_client(stream, tunnel, next_flow_id, stats, router).await {
+                    if let Err(e) = handle_mixed_client(stream, tunnels, next_flow_id, stats, router).await {
                         debug!("proxy client {} ended: {:#}", peer, e);
                     }
                 });
@@ -73,7 +73,7 @@ pub async fn run_mixed_proxy_server(
 
 async fn handle_mixed_client(
     stream: TcpStream,
-    tunnel: Arc<TunnelSession>,
+    tunnels: Arc<Tunnels>,
     next_flow_id: Arc<AtomicU16>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -84,15 +84,15 @@ async fn handle_mixed_client(
         return Ok(());
     }
     if first[0] == 0x05 {
-        handle_socks5_client(stream, tunnel, next_flow_id, stats, router).await
+        handle_socks5_client(stream, tunnels, next_flow_id, stats, router).await
     } else {
-        handle_http_proxy_client(stream, tunnel, stats, router).await
+        handle_http_proxy_client(stream, tunnels, stats, router).await
     }
 }
 
 async fn handle_socks5_client(
     mut client: TcpStream,
-    tunnel: Arc<TunnelSession>,
+    tunnels: Arc<Tunnels>,
     next_flow_id: Arc<AtomicU16>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -115,8 +115,8 @@ async fn handle_socks5_client(
     let target = read_socks5_addr(&mut client, req[3]).await?;
 
     match cmd {
-        0x01 => handle_tcp_connect(client, tunnel, target, stats, router).await,
-        0x03 => handle_udp_associate(client, tunnel, next_flow_id, stats, router).await,
+        0x01 => handle_tcp_connect(client, tunnels, target, stats, router).await,
+        0x03 => handle_udp_associate(client, tunnels, next_flow_id, stats, router).await,
         other => {
             let _ = client
                 .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -128,7 +128,7 @@ async fn handle_socks5_client(
 
 async fn handle_tcp_connect(
     mut client: TcpStream,
-    tunnel: Arc<TunnelSession>,
+    tunnels: Arc<Tunnels>,
     target: TargetAddr,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -136,7 +136,8 @@ async fn handle_tcp_connect(
     const SOCKS_OK: &[u8] = &[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     const SOCKS_HOST_UNREACHABLE: &[u8] = &[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 
-    if router.decide(&target).await == Route::Direct {
+    let route = router.decide(&target).await;
+    let Some(tunnel) = tunnels.for_route(route) else {
         return relay_direct(
             &router,
             client,
@@ -146,7 +147,7 @@ async fn handle_tcp_connect(
             Some(SOCKS_HOST_UNREACHABLE),
         )
         .await;
-    }
+    };
 
     let (quic_send, quic_recv) = tunnel.open_tcp(&target).await?;
     client.write_all(SOCKS_OK).await?;
@@ -159,7 +160,7 @@ async fn handle_tcp_connect(
 
 async fn handle_udp_associate(
     mut tcp_ctrl: TcpStream,
-    tunnel: Arc<TunnelSession>,
+    tunnels: Arc<Tunnels>,
     next_flow_id: Arc<AtomicU16>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
@@ -168,37 +169,39 @@ async fn handle_udp_associate(
     let udp_sock = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
     let bind_addr = udp_sock.local_addr()?;
 
-    let (tx, mut rx) = mpsc::channel::<UdpFrame>(512);
-    let Some(flow_id) = tunnel.reserve_socks_flow(&next_flow_id, tx) else {
-        let _ = tcp_ctrl
-            .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await;
-        bail!("SOCKS5 UDP flow_id space exhausted");
-    };
-
     let mut reply = BytesMut::with_capacity(22);
     reply.put_slice(&[0x05, 0x00, 0x00]);
     TargetAddr::Ip(bind_addr).encode_into(&mut reply)?;
-    if let Err(e) = tcp_ctrl.write_all(&reply).await {
-        tunnel.release_flow(flow_id);
-        return Err(e.into());
-    }
+    tcp_ctrl.write_all(&reply).await?;
 
     stats.active_udp.fetch_add(1, Ordering::Relaxed);
+
+    // Reply frames from every egress flow merge onto this channel -> one local UDP socket.
+    let (out_tx, mut out_rx) = mpsc::channel::<(TargetAddr, Bytes)>(512);
+    let (ctrl_closed_tx, ctrl_closed_rx) = watch::channel(false);
 
     let client_udp_addr: Arc<tokio::sync::RwLock<Option<SocketAddr>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
     let sock_in = udp_sock.clone();
-    let tunnel_tx = tunnel.clone();
+    let tunnels_tx = tunnels.clone();
     let peer_addr_writer = client_udp_addr.clone();
     let stats_tx = stats.clone();
+    let next_flow = next_flow_id.clone();
+    let out_tx_flow = out_tx.clone();
+    let mut ctrl_closed = ctrl_closed_rx.clone();
     let tx_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
-        let mut seq: u16 = 0;
+        // Flow id + sequence counter per egress, reserved lazily on first use.
+        let mut primary_lane: Option<(u16, u16)> = None;
+        let mut secondary_lane: Option<(u16, u16)> = None;
         let mut direct: Option<(Arc<UdpSocket>, AbortOnDrop)> = None;
         loop {
-            let Ok((n, src)) = sock_in.recv_from(&mut buf).await else {
+            let received = tokio::select! {
+                _ = ctrl_closed.changed() => break,
+                res = sock_in.recv_from(&mut buf) => res,
+            };
+            let Ok((n, src)) = received else {
                 break;
             };
             if *peer_addr_writer.read().await != Some(src) {
@@ -209,16 +212,13 @@ async fn handle_udp_associate(
                 continue;
             };
 
-            let is_v6_ip = matches!(dst, TargetAddr::Ip(SocketAddr::V6(_)));
-            let is_direct = if is_v6_ip {
-                false
-            } else {
-                match &dst {
-                    TargetAddr::Ip(a) => router.decide_ip_sync(a.ip()) == Route::Direct,
-                    TargetAddr::Domain(..) => router.decide(&dst).await == Route::Direct,
-                }
+            let route = match &dst {
+                TargetAddr::Ip(SocketAddr::V6(_)) => Route::Primary,
+                TargetAddr::Ip(a) => router.decide_ip_sync(a.ip()),
+                TargetAddr::Domain(..) => router.decide(&dst).await,
             };
-            if is_direct {
+
+            if route == Route::Direct || tunnels_tx.for_route(route).is_none() {
                 if direct.is_none() {
                     match router.dialer.bind_udp_v4() {
                         Ok(s) => {
@@ -252,40 +252,77 @@ async fn handle_udp_associate(
                 continue;
             }
 
-            let cur_seq = seq;
-            seq = seq.wrapping_add(1);
-            let payload_len = payload.len();
-            let is_game_pkt = tunnel_tx.game_dup_enabled() && payload_len < 200;
+            let Some(tunnel) = tunnels_tx.for_route(route) else {
+                continue;
+            };
+            let is_primary = Arc::ptr_eq(tunnel, tunnels_tx.primary());
+            let lane = if is_primary {
+                &mut primary_lane
+            } else {
+                &mut secondary_lane
+            };
+            let (flow_id, cur_seq) = match *lane {
+                Some((fid, seq)) => {
+                    *lane = Some((fid, seq.wrapping_add(1)));
+                    (fid, seq)
+                }
+                None => {
+                    let (f_tx, f_rx) = mpsc::channel::<UdpFrame>(256);
+                    let Some(fid) = tunnel.reserve_socks_flow(&next_flow, f_tx) else {
+                        warn!("SOCKS5 UDP flow_id space exhausted on {route:?} egress");
+                        continue;
+                    };
+                    let out = out_tx_flow.clone();
+                    let dedup_rx = tunnel.should_dedup_rx();
+                    tokio::spawn(pump_socks_udp_flow(f_rx, dedup_rx, out));
+                    *lane = Some((fid, 1));
+                    (fid, 0)
+                }
+            };
 
-            if !tunnel_tx.send_udp(flow_id, cur_seq, is_game_pkt, dst, payload) {
-                break;
+            let payload_len = payload.len();
+            let is_game_pkt = tunnel.game_dup_enabled() && payload_len < 200;
+
+            if !tunnel.send_udp(flow_id, cur_seq, is_game_pkt, dst, payload) {
+                if is_primary {
+                    break;
+                }
+                if let Some((fid, _)) = secondary_lane.take() {
+                    tunnel.release_flow(fid);
+                }
+                continue;
             }
             stats_tx
                 .tx_bytes
                 .fetch_add(payload_len as u64, Ordering::Relaxed);
         }
+
+        // The SOCKS control connection owns these flows: release them when it closes.
+        if let Some((fid, _)) = primary_lane {
+            tunnels_tx.primary().release_flow(fid);
+        }
+        if let (Some(sec), Some((fid, _))) = (tunnels_tx.secondary(), secondary_lane) {
+            sec.release_flow(fid);
+        }
+        drop(direct);
     });
+    drop(out_tx);
 
     let sock_out = udp_sock.clone();
     let peer_addr_reader = client_udp_addr.clone();
     let stats_rx = stats.clone();
-    let dedup_rx = tunnel.should_dedup_rx();
     let rx_task = tokio::spawn(async move {
-        let mut dedup = DedupWindow::new();
-        while let Some(frame) = rx.recv().await {
-            if dedup_rx && !dedup.check_and_insert(frame.seq) {
-                continue;
-            }
+        while let Some((addr, payload)) = out_rx.recv().await {
             let Some(peer) = *peer_addr_reader.read().await else {
                 continue;
             };
-            if let Ok(pkt) = build_socks5_udp_packet(&frame.addr, &frame.payload) {
+            if let Ok(pkt) = build_socks5_udp_packet(&addr, &payload) {
                 if let Err(e) = sock_out.send_to(&pkt, peer).await {
                     warn!("local udp send error: {}", e);
                 } else {
                     stats_rx
                         .rx_bytes
-                        .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
+                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
                 }
             }
         }
@@ -294,9 +331,10 @@ async fn handle_udp_associate(
     let mut drain = [0u8; 16];
     while tcp_ctrl.read(&mut drain).await.unwrap_or(0) > 0 {}
 
-    tx_task.abort();
-    rx_task.abort();
-    tunnel.release_flow(flow_id);
+    let _ = ctrl_closed_tx.send(true);
+    // The tx task releases its reserved flows on exit; the rx task ends when it drops out_tx.
+    let _ = tx_task.await;
+    let _ = rx_task.await;
     stats.active_udp.fetch_sub(1, Ordering::Relaxed);
     Ok(())
 }
@@ -321,6 +359,22 @@ fn spawn_direct_udp_reply_pump(
             }
         }
     })
+}
+
+async fn pump_socks_udp_flow(
+    mut rx: mpsc::Receiver<UdpFrame>,
+    dedup_rx: bool,
+    out: mpsc::Sender<(TargetAddr, Bytes)>,
+) {
+    let mut dedup = DedupWindow::new();
+    while let Some(frame) = rx.recv().await {
+        if dedup_rx && !dedup.check_and_insert(frame.seq) {
+            continue;
+        }
+        if out.send((frame.addr, frame.payload)).await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn read_socks5_addr(stream: &mut TcpStream, atyp: u8) -> Result<TargetAddr> {

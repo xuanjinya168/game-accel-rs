@@ -1,6 +1,6 @@
-use crate::relay::{ClientStats, TUN_FLOW_MIN, UdpDispatchMap};
-use crate::rules::{DOMESTIC_DNS, DnsRoute, Route, RouteMode, Router};
-use crate::tunnel::TunnelSession;
+use crate::relay::{ClientStats, TUN_FLOW_MIN};
+use crate::rules::{DOMESTIC_DNS, DnsRoute, Route, Router};
+use crate::tunnel::{TunnelSession, Tunnels};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -89,20 +89,24 @@ fn detect_physical_gateway() -> Result<Ipv4Addr> {
     bail!("无法自动检测物理默认网关，请检查网络连接")
 }
 
-/// RAII guard that pins the VPS server IP to the physical gateway and installs
+/// RAII guard that pins every node server IP to the physical gateway and installs
 /// two half-default routes (`0.0.0.0/1` and `128.0.0.0/1`) onto the TUN interface.
 struct RouteGuard {
-    server_v4: Option<Ipv4Addr>,
+    server_v4: Vec<Ipv4Addr>,
 }
 
 impl RouteGuard {
     #[cfg(target_os = "windows")]
-    fn install(server_ip: IpAddr, tun_if_index: u32) -> Result<Self> {
+    fn install(server_ips: &[IpAddr], tun_if_index: u32) -> Result<Self> {
         let phys_gw = detect_physical_gateway()?;
         let gw_str = phys_gw.to_string();
 
-        let server_v4 = match server_ip {
-            IpAddr::V4(v4) => {
+        let mut server_v4: Vec<Ipv4Addr> = Vec::new();
+        for ip in server_ips {
+            if let IpAddr::V4(v4) = ip {
+                if server_v4.contains(v4) {
+                    continue;
+                }
                 let ip_str = v4.to_string();
                 let _ = run_hidden("route", &["delete", &ip_str]);
                 run_hidden(
@@ -117,11 +121,10 @@ impl RouteGuard {
                         "1",
                     ],
                 )
-                .context("添加服务器直连防回环路由失败")?;
-                Some(v4)
+                .with_context(|| format!("添加节点直连防回环路由失败 ({ip_str})"))?;
+                server_v4.push(*v4);
             }
-            IpAddr::V6(_) => None,
-        };
+        }
 
         let _ = run_hidden(
             "netsh",
@@ -197,8 +200,10 @@ impl RouteGuard {
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn install(_server_ip: IpAddr, _tun_if_index: u32) -> Result<Self> {
-        Ok(Self { server_v4: None })
+    fn install(_server_ips: &[IpAddr], _tun_if_index: u32) -> Result<Self> {
+        Ok(Self {
+            server_v4: Vec::new(),
+        })
     }
 }
 
@@ -215,7 +220,7 @@ impl Drop for RouteGuard {
                 "route",
                 &["delete", "128.0.0.0", "mask", "128.0.0.0", &tun_gw_str],
             );
-            if let Some(v4) = self.server_v4 {
+            for v4 in &self.server_v4 {
                 let ip_str = v4.to_string();
                 let _ = run_hidden("route", &["delete", &ip_str, "mask", "255.255.255.255"]);
             }
@@ -225,17 +230,17 @@ impl Drop for RouteGuard {
 
 struct TunUdpSession {
     flow_id: u16,
+    tunnel: Arc<TunnelSession>,
     tx_seq: AtomicU16,
     last_active: Arc<AtomicU64>,
     rx_task: JoinHandle<()>,
-    dispatch: UdpDispatchMap,
     stats: Arc<ClientStats>,
 }
 
 impl Drop for TunUdpSession {
     fn drop(&mut self) {
         self.rx_task.abort();
-        self.dispatch.remove(&self.flow_id);
+        self.tunnel.release_flow(self.flow_id);
         self.stats
             .active_udp
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -266,8 +271,8 @@ impl Drop for DialerIfGuard {
 }
 
 pub async fn run_tun_mode(
-    server_ip: IpAddr,
-    tunnel: Arc<TunnelSession>,
+    server_ips: Vec<IpAddr>,
+    tunnels: Arc<Tunnels>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
     log_tx: Option<mpsc::UnboundedSender<String>>,
@@ -314,7 +319,7 @@ pub async fn run_tun_mode(
     router.dialer.set_interface(phys_if);
     let _dialer_guard = DialerIfGuard(router.clone());
 
-    let _route_guard = RouteGuard::install(server_ip, if_index)?;
+    let _route_guard = RouteGuard::install(&server_ips, if_index)?;
     emit(format!(
         "TUN 虚拟网卡已启动 ({TUN_NAME} {TUN_IP}/{TUN_PREFIX}, MTU {TUN_MTU}, 物理出口网卡 {:?}, 智能分流已启用)",
         phys_if
@@ -369,16 +374,16 @@ pub async fn run_tun_mode(
     });
 
     let tcp_task = if let Some(mut listener) = tcp_listener {
-        let tunnel_tcp = tunnel.clone();
+        let tunnels_tcp = tunnels.clone();
         let stats = stats.clone();
         let router = router.clone();
         Some(tokio::spawn(async move {
             while let Some((stream, _local, _remote)) = listener.next().await {
-                let tunnel_tcp = tunnel_tcp.clone();
+                let tunnels_tcp = tunnels_tcp.clone();
                 let stats = stats.clone();
                 let router = router.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_tun_tcp(stream, tunnel_tcp, stats, router).await {
+                    if let Err(e) = handle_tun_tcp(stream, tunnels_tcp, stats, router).await {
                         debug!("tun tcp ended: {:#}", e);
                     }
                 });
@@ -415,7 +420,7 @@ pub async fn run_tun_mode(
         let (mut udp_read, mut udp_write) = udp_sock.split();
         let (out_tx, mut out_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr, bool)>(1024);
 
-        let tunnel_udp = tunnel.clone();
+        let tunnels_udp = tunnels.clone();
         let stats_tx = stats.clone();
         let flow_map = tun_flow_ids.clone();
         let direct_map = direct_flow_ids.clone();
@@ -427,19 +432,25 @@ pub async fn run_tun_mode(
             while let Some((payload, local_src, remote_dst)) = udp_read.next().await {
                 let now = now_secs();
 
-                let direct_target: Option<(SocketAddr, Option<SocketAddr>)> =
+                // DNS: domestic names go to AliDNS directly; foreign queries ride the primary
+                // tunnel. Everything else asks the router for its egress bucket.
+                let (route, direct_target): (Route, Option<(SocketAddr, Option<SocketAddr>)>) =
                     if remote_dst.port() == 53 && remote_dst.is_ipv4() {
                         match router_udp.decide_dns_query(&payload) {
-                            DnsRoute::Domestic => Some((DOMESTIC_DNS, Some(remote_dst))),
-                            DnsRoute::Direct => Some((remote_dst, None)),
-                            DnsRoute::Proxy => None,
+                            DnsRoute::Domestic => {
+                                (Route::Direct, Some((DOMESTIC_DNS, Some(remote_dst))))
+                            }
+                            DnsRoute::Direct => (Route::Direct, Some((remote_dst, None))),
+                            DnsRoute::Proxy => (Route::Primary, None),
                         }
-                    } else if remote_dst.is_ipv4()
-                        && router_udp.decide_ip_sync(remote_dst.ip()) == Route::Direct
-                    {
-                        Some((remote_dst, None))
+                    } else if remote_dst.is_ipv4() {
+                        let route = router_udp.decide_ip_sync(remote_dst.ip());
+                        let direct = (route == Route::Direct
+                            || tunnels_udp.for_route(route).is_none())
+                        .then_some((remote_dst, None));
+                        (route, direct)
                     } else {
-                        None
+                        (Route::Primary, None)
                     };
 
                 if let Some((actual_dst, spoof_reply_src)) = direct_target {
@@ -498,67 +509,85 @@ pub async fn run_tun_mode(
                     continue;
                 }
 
-                // Tunnelled UDP path via TunnelSession
-                let session = if let Some(existing) = flow_map.get(&local_src) {
-                    existing.last_active.store(now, Ordering::Relaxed);
-                    existing.clone()
-                } else {
-                    let (f_tx, mut f_rx) = mpsc::channel::<UdpFrame>(256);
-                    let Some(fid) = tunnel_udp.reserve_tun_flow(&next_flow, f_tx) else {
-                        warn!("TUN UDP flow_id space exhausted, dropping packet from {local_src}");
-                        continue;
-                    };
+                // Tunnelled UDP path: pick the egress tunnel for this datagram's route.
+                let Some(tunnel_udp) = tunnels_udp.for_route(route) else {
+                    warn!(
+                        "TUN UDP route {route:?} has no tunnel, dropping packet from {local_src}"
+                    );
+                    continue;
+                };
 
-                    let last_active = Arc::new(AtomicU64::new(now));
-                    let last_active_rx = last_active.clone();
-                    let out_tx_clone = out_tx_tunnel.clone();
-                    let router_hint = router_udp.clone();
-                    let dedup_rx = tunnel_udp.should_dedup_rx();
-                    let rx_handle = tokio::spawn(async move {
-                        let mut dedup = DedupWindow::new();
-                        while let Some(frame) = f_rx.recv().await {
-                            if dedup_rx && !dedup.check_and_insert(frame.seq) {
-                                continue;
-                            }
-                            last_active_rx.store(now_secs(), Ordering::Relaxed);
-                            if let TargetAddr::Ip(remote_src) = frame.addr {
-                                if remote_src.port() == 53 {
-                                    router_hint.record_dns_answer(&frame.payload);
-                                }
-                                if out_tx_clone
-                                    .send((frame.payload.to_vec(), remote_src, local_src, true))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
+                let session = match flow_map.get(&local_src).map(|e| e.clone()) {
+                    Some(existing) if Arc::ptr_eq(&existing.tunnel, tunnel_udp) => {
+                        existing.last_active.store(now, Ordering::Relaxed);
+                        existing
+                    }
+                    stale => {
+                        if stale.is_some() {
+                            // Egress policy switched mid-session (e.g. domestic lane died):
+                            // release the old flow and reserve one on the new tunnel.
+                            flow_map.remove(&local_src);
                         }
-                    });
+                        drop(stale);
+                        let (f_tx, mut f_rx) = mpsc::channel::<UdpFrame>(256);
+                        let Some(fid) = tunnel_udp.reserve_tun_flow(&next_flow, f_tx) else {
+                            warn!(
+                                "TUN UDP flow_id space exhausted, dropping packet from {local_src}"
+                            );
+                            continue;
+                        };
 
-                    stats_tx.active_udp.fetch_add(1, Ordering::Relaxed);
-                    let session = Arc::new(TunUdpSession {
-                        flow_id: fid,
-                        tx_seq: AtomicU16::new(0),
-                        last_active,
-                        rx_task: rx_handle,
-                        dispatch: tunnel_udp.dispatch_map().clone(),
-                        stats: stats_tx.clone(),
-                    });
-                    flow_map.insert(local_src, session.clone());
-                    session
+                        let last_active = Arc::new(AtomicU64::new(now));
+                        let last_active_rx = last_active.clone();
+                        let out_tx_clone = out_tx_tunnel.clone();
+                        let router_hint = router_udp.clone();
+                        let dedup_rx = tunnel_udp.should_dedup_rx();
+                        let rx_handle = tokio::spawn(async move {
+                            let mut dedup = DedupWindow::new();
+                            while let Some(frame) = f_rx.recv().await {
+                                if dedup_rx && !dedup.check_and_insert(frame.seq) {
+                                    continue;
+                                }
+                                last_active_rx.store(now_secs(), Ordering::Relaxed);
+                                if let TargetAddr::Ip(remote_src) = frame.addr {
+                                    if remote_src.port() == 53 {
+                                        router_hint.record_dns_answer(&frame.payload);
+                                    }
+                                    if out_tx_clone
+                                        .send((frame.payload.to_vec(), remote_src, local_src, true))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        stats_tx.active_udp.fetch_add(1, Ordering::Relaxed);
+                        let session = Arc::new(TunUdpSession {
+                            flow_id: fid,
+                            tunnel: tunnel_udp.clone(),
+                            tx_seq: AtomicU16::new(0),
+                            last_active,
+                            rx_task: rx_handle,
+                            stats: stats_tx.clone(),
+                        });
+                        flow_map.insert(local_src, session.clone());
+                        session
+                    }
                 };
 
                 let seq = session.tx_seq.fetch_add(1, Ordering::Relaxed);
                 let payload_len = payload.len();
                 let payload_bytes = Bytes::from(payload);
 
-                let is_game_pkt = tunnel_udp.game_dup_enabled()
+                let is_game_pkt = session.tunnel.game_dup_enabled()
                     && payload_len < 200
                     && remote_dst.port() != 53
                     && remote_dst.port() != 443;
 
-                if !tunnel_udp.send_udp(
+                if !session.tunnel.send_udp(
                     session.flow_id,
                     seq,
                     is_game_pkt,
@@ -622,7 +651,7 @@ pub async fn run_tun_mode(
 
 async fn handle_tun_tcp(
     mut stream: netstack_smoltcp::TcpStream,
-    tunnel: Arc<TunnelSession>,
+    tunnels: Arc<Tunnels>,
     stats: Arc<ClientStats>,
     router: Arc<Router>,
 ) -> Result<()> {
@@ -631,8 +660,8 @@ async fn handle_tun_tcp(
 
     let mut first_chunk: Vec<u8> = Vec::new();
     let route = if is_panel_ip {
-        Route::Proxy
-    } else if router.mode() == RouteMode::Rule
+        Route::Primary
+    } else if router.mode().is_split()
         && matches!(dst.port(), 80 | 443)
         && !router.has_dns_hint(dst.ip())
     {
@@ -652,7 +681,8 @@ async fn handle_tun_tcp(
         router.decide(&TargetAddr::Ip(dst)).await
     };
 
-    if route == Route::Direct {
+    // No tunnel for this route (Direct, or the domestic lane is gone) => dial out directly.
+    let Some(tunnel) = tunnels.for_route(route) else {
         let mut upstream =
             tokio::time::timeout(Duration::from_secs(10), router.dialer.connect_tcp(dst))
                 .await
@@ -663,7 +693,7 @@ async fn handle_tun_tcp(
         }
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
         return Ok(());
-    }
+    };
 
     let (mut quic_send, quic_recv) = tunnel.open_tcp(&TargetAddr::Ip(dst)).await?;
     if !first_chunk.is_empty() {

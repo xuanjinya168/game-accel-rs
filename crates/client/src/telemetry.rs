@@ -40,6 +40,8 @@ pub struct TelemetrySeries {
     pub tx_speed_bps: f64,
     pub rx_speed_bps: f64,
     pub rtt_history: VecDeque<u64>,
+    /// Optional domestic (secondary) node RTT history in `Dual` mode (`None` when offline/inactive).
+    pub secondary_rtt_history: VecDeque<Option<u64>>,
     pub speed_history: VecDeque<(f64, f64)>,
 }
 
@@ -58,6 +60,7 @@ impl TelemetrySeries {
             tx_speed_bps: 0.0,
             rx_speed_bps: 0.0,
             rtt_history: VecDeque::with_capacity(DEFAULT_HISTORY_CAP),
+            secondary_rtt_history: VecDeque::with_capacity(DEFAULT_HISTORY_CAP),
             speed_history: VecDeque::with_capacity(DEFAULT_HISTORY_CAP),
         }
     }
@@ -69,6 +72,7 @@ impl TelemetrySeries {
         self.tx_speed_bps = 0.0;
         self.rx_speed_bps = 0.0;
         self.rtt_history.clear();
+        self.secondary_rtt_history.clear();
         self.speed_history.clear();
     }
 
@@ -94,6 +98,15 @@ impl TelemetrySeries {
                 self.rtt_history.pop_front();
             }
             self.rtt_history.push_back(rtt);
+            let sec_rtt = stats
+                .secondary_connected
+                .load(Ordering::Relaxed)
+                .then(|| stats.secondary_rtt_ms.load(Ordering::Relaxed))
+                .filter(|&v| v > 0);
+            if self.secondary_rtt_history.len() >= DEFAULT_HISTORY_CAP {
+                self.secondary_rtt_history.pop_front();
+            }
+            self.secondary_rtt_history.push_back(sec_rtt);
             if self.speed_history.len() >= DEFAULT_HISTORY_CAP {
                 self.speed_history.pop_front();
             }

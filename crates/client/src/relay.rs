@@ -39,6 +39,9 @@ pub struct ClientStats {
     pub dup_active: AtomicBool,
     /// Unix timestamp (seconds) when the current tunnel session authenticated.
     pub connected_at_unix: AtomicU64,
+    /// Live status of the optional domestic (secondary) tunnel in `Dual` mode.
+    pub secondary_connected: AtomicBool,
+    pub secondary_rtt_ms: AtomicU64,
 }
 
 impl ClientStats {
@@ -53,6 +56,8 @@ impl ClientStats {
         self.loss_bps.store(0, Ordering::Relaxed);
         self.dup_active.store(false, Ordering::Relaxed);
         self.connected_at_unix.store(0, Ordering::Relaxed);
+        self.secondary_connected.store(false, Ordering::Relaxed);
+        self.secondary_rtt_ms.store(0, Ordering::Relaxed);
     }
 
     pub fn link_quality(&self) -> LinkQuality {

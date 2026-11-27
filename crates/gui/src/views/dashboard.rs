@@ -237,9 +237,34 @@ impl GameAccelApp {
 
     fn plain_takeover_summary(&self) -> String {
         let routing = match self.cfg.route_mode {
-            RouteMode::Rule => "大陆网站直连，海外与游戏流量走加速隧道",
-            RouteMode::Global => "全部连接均通过加密隧道转发",
-            RouteMode::Direct => "全部流量直连本地物理网卡（用于延迟对比）",
+            RouteMode::Rule => "大陆网站直连，海外与游戏流量走加速隧道".to_string(),
+            RouteMode::Dual => match self.cfg.domestic_node() {
+                Some(dom) => {
+                    let same_as_primary = self
+                        .cfg
+                        .active_node()
+                        .is_some_and(|act| act.id == dom.id);
+                    if self.state == ConnState::Connected {
+                        if same_as_primary {
+                            format!("海外与国内均走「{}」", dom.name)
+                        } else if self.stats.secondary_connected.load(Ordering::Relaxed) {
+                            let rtt = self.stats.secondary_rtt_ms.load(Ordering::Relaxed);
+                            if rtt > 0 {
+                                format!("海外走主节点 · 国内走「{}」({rtt} ms)", dom.name)
+                            } else {
+                                format!("海外走主节点 · 国内走「{}」", dom.name)
+                            }
+                        } else {
+                            format!("海外走主节点 · 国内节点「{}」未连接，暂回退直连", dom.name)
+                        }
+                    } else {
+                        format!("海外走主节点 · 国内走「{}」", dom.name)
+                    }
+                }
+                None => "双节点分流（尚未选择国内出口，暂回退直连）".to_string(),
+            },
+            RouteMode::Global => "全部连接均通过加密隧道转发".to_string(),
+            RouteMode::Direct => "全部流量直连本地物理网卡（用于延迟对比）".to_string(),
         };
         match (self.state, self.cfg.proxy_mode) {
             (ConnState::Connected, ProxyMode::Tun) => {
@@ -429,21 +454,59 @@ impl GameAccelApp {
                                 .on_hover_text(format!("累计下载 {}", format_bytes(rx)));
                             }
                             ChartMode::Rtt => {
-                                let summary = if is_live
+                                let sec_live = is_live
+                                    && self.cfg.route_mode == RouteMode::Dual
+                                    && self.stats.secondary_connected.load(Ordering::Relaxed);
+                                let sec_rtt = self.stats.secondary_rtt_ms.load(Ordering::Relaxed);
+                                if sec_live
+                                    && sec_rtt > 0
                                     && let Some(&last) = self.telemetry.rtt_history.back()
                                 {
-                                    let avg: u64 = self.telemetry.rtt_history.iter().sum::<u64>()
-                                        / self.telemetry.rtt_history.len().max(1) as u64;
-                                    format!("当前 {last} ms · 均值 {avg} ms")
+                                    // Right-to-left layout: render domestic legend first, then primary legend
+                                    ui.label(
+                                        RichText::new(format!("国内 {sec_rtt} ms"))
+                                            .size(11.5)
+                                            .monospace()
+                                            .color(p.text_secondary),
+                                    );
+                                    let (d2, _) = ui.allocate_exact_size(
+                                        Vec2::splat(7.0),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(d2.center(), 3.0, p.success_text);
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new(format!("主 {last} ms"))
+                                            .size(11.5)
+                                            .monospace()
+                                            .color(p.text_secondary),
+                                    );
+                                    let (d1, _) = ui.allocate_exact_size(
+                                        Vec2::splat(7.0),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(d1.center(), 3.0, p.data_primary);
                                 } else {
-                                    "1s 实时采样".to_string()
-                                };
-                                ui.label(
-                                    RichText::new(summary)
-                                        .size(11.5)
-                                        .monospace()
-                                        .color(p.text_muted),
-                                );
+                                    let summary = if is_live
+                                        && let Some(&last) = self.telemetry.rtt_history.back()
+                                    {
+                                        let avg: u64 = self
+                                            .telemetry
+                                            .rtt_history
+                                            .iter()
+                                            .sum::<u64>()
+                                            / self.telemetry.rtt_history.len().max(1) as u64;
+                                        format!("当前 {last} ms · 均值 {avg} ms")
+                                    } else {
+                                        "1s 实时采样".to_string()
+                                    };
+                                    ui.label(
+                                        RichText::new(summary)
+                                            .size(11.5)
+                                            .monospace()
+                                            .color(p.text_muted),
+                                    );
+                                }
                             }
                         }
                     });
@@ -455,7 +518,15 @@ impl GameAccelApp {
                         draw_traffic_sparkline(ui, &self.telemetry.speed_history, is_live, p)
                     }
                     ChartMode::Rtt => {
-                        draw_rtt_sparkline(ui, &self.telemetry.rtt_history, is_live, p)
+                        let sec_hist = (self.cfg.route_mode == RouteMode::Dual)
+                            .then_some(&self.telemetry.secondary_rtt_history);
+                        draw_rtt_sparkline(
+                            ui,
+                            &self.telemetry.rtt_history,
+                            sec_hist,
+                            is_live,
+                            p,
+                        )
                     }
                 }
             },
@@ -470,11 +541,21 @@ impl GameAccelApp {
         gap: f32,
         p: ThemePalette,
     ) {
-        let top_card_h = 94.0_f32;
+        let is_dual = self.cfg.route_mode == RouteMode::Dual;
+        let top_card_h = if is_dual { 132.0_f32 } else { 94.0_f32 };
         let mut picked_proxy: Option<ProxyMode> = None;
         let mut picked_route: Option<RouteMode> = None;
+        let mut picked_domestic_node: Option<String> = None;
+        let mut domestic_trigger_rect: Option<egui::Rect> = None;
+        let domestic_popup_id = egui::Id::new("bento_domestic_node_popup");
+        let mut domestic_popup_open = ui
+            .ctx()
+            .memory(|m| m.data.get_temp::<bool>(domestic_popup_id).unwrap_or(false));
+        if !is_dual {
+            domestic_popup_open = false;
+        }
 
-        // Top Card (94px exact): Fixed-Token Mode Controls (`flex-1` full-width segmented wells)
+        // Top Card (94px standard / 132px when Dual mode reveals the inline domestic picker)
         bento_card_exact(
             ui,
             Vec2::new(col_w, top_card_h),
@@ -535,32 +616,272 @@ impl GameAccelApp {
                             (
                                 RouteMode::Rule,
                                 "大陆直连",
-                                Some("大陆网站与 IP 直连，海外与游戏走加速隧道"),
+                                Some("大陆网站与 IP 直连，海外与游戏走主节点"),
+                            ),
+                            (
+                                RouteMode::Dual,
+                                "双节点",
+                                Some("海外走主节点，大陆网站与国内游戏走下方选定节点"),
                             ),
                             (
                                 RouteMode::Global,
-                                "全局代理",
-                                Some("所有流量全部经加速隧道转发"),
+                                "全局",
+                                Some("所有公网流量全部经主节点转发"),
                             ),
                             (
                                 RouteMode::Direct,
-                                "纯直连",
+                                "直连",
                                 Some("全部流量直接走本地网卡，方便对比延迟"),
                             ),
                         ],
                         Vec2::new(seg_w, 28.0),
-                        FONT_SM,
+                        11.5,
                         p,
                     );
                 });
+
+                if is_dual {
+                    aligned_row(ui, 28.0, |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.label(
+                            RichText::new("国内")
+                                .font(font_bold(FONT_SM))
+                                .color(p.text_secondary),
+                        );
+                        let picker_w = ui.available_width().max(140.0);
+                        let (rect, resp) =
+                            ui.allocate_exact_size(Vec2::new(picker_w, 28.0), Sense::click());
+                        domestic_trigger_rect = Some(rect);
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
+                            domestic_popup_open = !domestic_popup_open;
+                        }
+
+                        let painter = ui.painter();
+                        let (fill, border) = if domestic_popup_open || resp.hovered() {
+                            (p.bg_nav_hover, p.border_strong)
+                        } else {
+                            (p.bg_card_alt, p.border_subtle)
+                        };
+                        painter.rect(
+                            rect,
+                            CornerRadius::same(7),
+                            fill,
+                            Stroke::new(1.0_f32, border),
+                            egui::StrokeKind::Inside,
+                        );
+
+                        let dom_node = self.cfg.domestic_node();
+                        let same_as_primary = dom_node.is_some_and(|d| {
+                            self.cfg.active_node().is_some_and(|a| a.id == d.id)
+                        });
+                        let dot_col = if self.state == ConnState::Connected {
+                            if dom_node.is_some()
+                                && (same_as_primary
+                                    || self.stats.secondary_connected.load(Ordering::Relaxed))
+                            {
+                                p.success_text
+                            } else {
+                                p.warn_text
+                            }
+                        } else if dom_node.is_some() {
+                            p.accent
+                        } else {
+                            p.border_strong
+                        };
+                        painter.circle_filled(
+                            Pos2::new(rect.left() + 11.0, rect.center().y),
+                            3.0,
+                            dot_col,
+                        );
+
+                        let (raw_label, lbl_col) = match dom_node {
+                            Some(n) => (n.name.as_str(), p.text_primary),
+                            None => ("选择国内出口节点", p.text_muted),
+                        };
+                        let shown = elide_text(
+                            ui,
+                            raw_label,
+                            FontId::proportional(FONT_SM),
+                            (picker_w - 42.0).max(40.0),
+                        );
+                        let galley = ui.fonts(|f| {
+                            f.layout_no_wrap(shown, FontId::proportional(FONT_SM), lbl_col)
+                        });
+                        painter.galley(
+                            Pos2::new(rect.left() + 20.0, rect.center().y - galley.size().y * 0.5),
+                            galley,
+                            lbl_col,
+                        );
+
+                        crate::icons::draw_chevron(
+                            painter,
+                            Pos2::new(rect.right() - 12.0, rect.center().y),
+                            domestic_popup_open,
+                            p.text_muted,
+                        );
+                    });
+                }
             },
         );
+
+        // Inline dropdown popup for picking ANY node as the domestic exit (no page jump!)
+        if domestic_popup_open && let Some(trigger_rect) = domestic_trigger_rect {
+            let popup_pos = Pos2::new(trigger_rect.left(), trigger_rect.bottom() + 4.0);
+            let popup_w = trigger_rect.width().max(200.0);
+            let area_resp = egui::Area::new(domestic_popup_id)
+                .order(egui::Order::Foreground)
+                .fixed_pos(popup_pos)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::new()
+                        .fill(p.bg_card)
+                        .stroke(Stroke::new(1.0_f32, p.border_strong))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::same(5))
+                        .shadow(egui::Shadow {
+                            offset: [0, 4],
+                            blur: 14,
+                            spread: 0,
+                            color: Color32::from_black_alpha(if p.is_dark { 100 } else { 28 }),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width((popup_w - 10.0).max(180.0));
+                            if self.cfg.nodes.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("暂无可选节点，请先导入线路")
+                                        .size(FONT_SM)
+                                        .color(p.text_muted),
+                                );
+                                ui.add_space(4.0);
+                            } else {
+                                let row_w = ui.available_width();
+                                egui::ScrollArea::vertical()
+                                    .max_height(196.0)
+                                    .show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        for node in &self.cfg.nodes {
+                                            let is_sel = self.cfg.domestic_node_id.as_deref()
+                                                == Some(node.id.as_str());
+                                            let (r, resp) = ui.allocate_exact_size(
+                                                Vec2::new(row_w, 28.0),
+                                                Sense::click(),
+                                            );
+                                            if resp.hovered() {
+                                                ui.ctx().set_cursor_icon(
+                                                    egui::CursorIcon::PointingHand,
+                                                );
+                                            }
+                                            if is_sel {
+                                                ui.painter().rect_filled(
+                                                    r,
+                                                    CornerRadius::same(6),
+                                                    p.bg_card_alt,
+                                                );
+                                            } else if resp.hovered() {
+                                                ui.painter().rect_filled(
+                                                    r,
+                                                    CornerRadius::same(6),
+                                                    p.bg_nav_hover,
+                                                );
+                                            }
+                                            ui.painter().circle_filled(
+                                                Pos2::new(r.left() + 10.0, r.center().y),
+                                                2.8,
+                                                if is_sel { p.accent } else { p.border_strong },
+                                            );
+
+                                            let (rtt_txt, rtt_col) = match self.probes.get(&node.id)
+                                            {
+                                                Some(ProbeState::Ok(ms)) => (
+                                                    format!("{ms} ms"),
+                                                    if *ms < 80 {
+                                                        p.success_text
+                                                    } else if *ms < 160 {
+                                                        p.warn_text
+                                                    } else {
+                                                        p.danger_text
+                                                    },
+                                                ),
+                                                Some(ProbeState::Probing) => {
+                                                    ("…".to_string(), p.text_muted)
+                                                }
+                                                Some(ProbeState::Err(_)) => {
+                                                    ("超时".to_string(), p.danger_text)
+                                                }
+                                                None => ("--".to_string(), p.text_muted),
+                                            };
+                                            let rtt_galley = ui.fonts(|f| {
+                                                f.layout_no_wrap(
+                                                    rtt_txt,
+                                                    FontId::monospace(10.5),
+                                                    rtt_col,
+                                                )
+                                            });
+                                            let rtt_w = rtt_galley.size().x;
+                                            let shown = elide_text(
+                                                ui,
+                                                &node.name,
+                                                FontId::proportional(FONT_SM),
+                                                (row_w - rtt_w - 34.0).max(50.0),
+                                            );
+                                            let name_galley = ui.fonts(|f| {
+                                                f.layout_no_wrap(
+                                                    shown,
+                                                    FontId::proportional(FONT_SM),
+                                                    p.text_primary,
+                                                )
+                                            });
+                                            ui.painter().galley(
+                                                Pos2::new(
+                                                    r.left() + 20.0,
+                                                    r.center().y - name_galley.size().y * 0.5,
+                                                ),
+                                                name_galley,
+                                                p.text_primary,
+                                            );
+                                            ui.painter().galley(
+                                                Pos2::new(
+                                                    r.right() - 8.0 - rtt_w,
+                                                    r.center().y - rtt_galley.size().y * 0.5,
+                                                ),
+                                                rtt_galley,
+                                                rtt_col,
+                                            );
+                                            if resp.clicked() {
+                                                picked_domestic_node = Some(node.id.clone());
+                                                domestic_popup_open = false;
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                });
+
+            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let clicked_outside = ui.input(|i| {
+                i.pointer.primary_clicked()
+                    && i.pointer.interact_pos().is_some_and(|pos| {
+                        !area_resp.response.rect.contains(pos) && !trigger_rect.contains(pos)
+                    })
+            });
+            if esc || clicked_outside {
+                domestic_popup_open = false;
+            }
+        }
+        ui.ctx()
+            .memory_mut(|m| m.data.insert_temp(domestic_popup_id, domestic_popup_open));
 
         if let Some(m) = picked_proxy {
             self.switch_proxy_mode(m);
         }
         if let Some(r) = picked_route {
             self.switch_route_mode(r);
+        }
+        if let Some(dom_id) = picked_domestic_node {
+            self.switch_domestic_node(dom_id);
         }
 
         // Bottom Card: Borderless Quick Node Switcher (`快捷换线` + `全部线路 ›`, matches HTML!)

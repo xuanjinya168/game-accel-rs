@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GameAccel v0.3.6 桌面端交互式设计规范（自包含离线预览）</title>
+  <title>GameAccel v0.3.7 桌面端交互式设计规范（自包含离线预览）</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; }
@@ -1056,11 +1056,23 @@
                 </div>
                 <div class="mode-row">
                   <span class="mode-lbl">分流</span>
-                  <div id="segRoute" class="seg">
+                  <div id="segRoute" class="seg" style="grid-template-columns:repeat(4,1fr);">
                     <button onclick="setRoute('rule')" data-v="rule" class="active">大陆直连</button>
-                    <button onclick="setRoute('global')" data-v="global">全局代理</button>
-                    <button onclick="setRoute('direct')" data-v="direct">纯直连</button>
+                    <button onclick="setRoute('dual')" data-v="dual">双节点</button>
+                    <button onclick="setRoute('global')" data-v="global">全局</button>
+                    <button onclick="setRoute('direct')" data-v="direct">直连</button>
                   </div>
+                </div>
+                <div id="dualDomesticRow" class="mode-row hidden" style="position:relative;">
+                  <span class="mode-lbl">国内</span>
+                  <button id="btnDomesticPicker" onclick="toggleDomesticMenu()" class="chip-btn" style="flex:1;min-width:0;height:28px;background:var(--c-well);display:flex;align-items:center;justify-content:space-between;gap:6px;padding:0 10px;font-size:12px;">
+                    <span style="display:flex;align-items:center;gap:7px;min-width:0;">
+                      <span id="domDot" class="state-dot" style="background:var(--c-ok);"></span>
+                      <span id="domNodeLabel" class="truncate">上海 BGP 国内节点 (43.138.174.91)</span>
+                    </span>
+                    <svg id="domChevron" width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;color:var(--c-muted);transition:transform 0.12s;"><polyline points="3,4.5 6,7.5 9,4.5"/></svg>
+                  </button>
+                  <div id="domesticDropdown" class="more-popover hidden" style="left:36px;right:0;top:32px;min-width:0;max-height:190px;overflow-y:auto;"></div>
                 </div>
               </section>
 
@@ -1176,7 +1188,7 @@
             <div class="bento-card set-card">
               <div class="set-row">
                 <div style="display:flex;align-items:center;gap:10px;">
-                  <span style="font-size:13px;">当前版本 v0.3.6</span>
+                  <span style="font-size:13px;">当前版本 v0.3.7</span>
                   <span style="font-size:12px;color:var(--c-muted);">已是最新</span>
                 </div>
                 <div style="display:flex;gap:6px;">
@@ -1416,8 +1428,9 @@
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
             <span style="font-size:12px;color:var(--c-ink-2);flex-shrink:0;">分流策略</span>
-            <div id="trayRouteSeg" class="seg" style="width:214px;height:26px;grid-template-columns:repeat(3,1fr);">
-              <button onclick="setRoute('rule')" data-v="rule" class="active">规则</button>
+            <div id="trayRouteSeg" class="seg" style="width:214px;height:26px;grid-template-columns:repeat(4,1fr);">
+              <button onclick="setRoute('rule')" data-v="rule" class="active">大陆直连</button>
+              <button onclick="setRoute('dual')" data-v="dual">双节点</button>
               <button onclick="setRoute('global')" data-v="global">全局</button>
               <button onclick="setRoute('direct')" data-v="direct">直连</button>
             </div>
@@ -1463,6 +1476,8 @@
       phase: 'connected',
       takeover: 'tun',
       route: 'rule',
+      domesticId: 'n4',
+      domesticMenuOpen: false,
       chart: 'traffic',
       stress: false,
       activeId: 'n1',
@@ -1499,6 +1514,7 @@
       rxHist: [8.5, 11.2, 10.4, 13.8, 16.5, 19.2, 15.6, 14.0, 17.4, 21.0, 18.2, 15.0, 14.2, 16.1, 15.4, 14.8],
       txHist: [1.0, 1.3, 1.1, 1.6, 1.9, 2.2, 1.5, 1.3, 1.8, 2.3, 1.9, 1.4, 1.2, 1.5, 1.3, 1.24],
       rttHist: [26, 27, 25, 26, 28, 27, 26, 25, 26, 27, 26, 25, 26, 27, 26, 26],
+      secRttHist: [14, 15, 13, 14, 15, 14, 14, 13, 14, 15, 14, 14, 15, 13, 14, 14],
     };
 
     let toastTimer = null;
@@ -1546,7 +1562,9 @@
       renderAll();
     }
     function setTakeover(v) { st.takeover = v; renderAll(); }
-    function setRoute(v) { st.route = v; renderAll(); }
+    function setRoute(v) { st.route = v; st.domesticMenuOpen = false; renderAll(); }
+    function toggleDomesticMenu() { st.domesticMenuOpen = !st.domesticMenuOpen; renderAll(); }
+    function pickDomestic(id) { st.domesticId = id; st.domesticMenuOpen = false; renderAll(); toast('已切换国内出口节点'); }
     function setChart(c) { st.chart = c; renderAll(); }
     function pickNode(id) { st.activeId = id; renderAll(); }
     function setLogFilter(f) { st.logFilter = f; renderLogs(); }
@@ -1747,8 +1765,10 @@
         sys: '已接管 Windows 系统代理',
         port: '仅监听本地混合端口（未修改系统设置）'
       }[st.takeover];
+      const domNode = nodes.find(x => x.id === st.domesticId) || nodes[nodes.length - 1];
       const routeDesc = {
         rule: '大陆网站直连，海外与游戏流量走加速隧道',
+        dual: `海外走主节点 · 国内走「${domNode ? domNode.name : '未选择'}」`,
         global: '全部连接均通过加密隧道转发',
         direct: '全部流量直连本地物理网卡（用于延迟对比）'
       }[st.route];
@@ -1831,6 +1851,23 @@
 
       paintSeg('segTakeover', st.takeover);
       paintSeg('segRoute', st.route);
+      const isDual = st.route === 'dual';
+      document.getElementById('dualDomesticRow').classList.toggle('hidden', !isDual);
+      if (isDual) {
+        document.getElementById('domNodeLabel').textContent = domNode ? domNode.name : '选择国内出口节点';
+        document.getElementById('domDot').style.background = st.phase === 'connected' ? 'var(--c-ok)' : 'var(--c-cta)';
+        document.getElementById('domChevron').style.transform = st.domesticMenuOpen ? 'rotate(180deg)' : 'rotate(0deg)';
+        const dd = document.getElementById('domesticDropdown');
+        dd.classList.toggle('hidden', !st.domesticMenuOpen);
+        dd.innerHTML = nodes.map(n => `
+          <button class="pop-item" style="display:flex;align-items:center;justify-content:space-between;gap:8px;" onclick="pickDomestic('${n.id}')">
+            <span style="display:flex;align-items:center;gap:7px;min-width:0;">
+              <span class="state-dot" style="background:${n.id === st.domesticId ? 'var(--c-cta)' : 'var(--c-border-strong)'};"></span>
+              <span class="truncate">${n.name}</span>
+            </span>
+            <span class="mono" style="font-size:10.5px;color:var(--c-muted);flex-shrink:0;">${n.rtt}</span>
+          </button>`).join('');
+      }
       paintSeg('trayTakeSeg', st.takeover);
       paintSeg('trayRouteSeg', st.route);
       paintSeg('chartSeg', st.chart);
@@ -1912,6 +1949,7 @@
       const border = cs.getPropertyValue('--c-border').trim();
       const dataCol = cs.getPropertyValue('--c-data').trim();
       const data2Col = cs.getPropertyValue('--c-data-2').trim();
+      const okCol = cs.getPropertyValue('--c-ok').trim();
       const dataFill = cs.getPropertyValue('--c-data-fill').trim();
 
       if (st.phase !== 'connected') {
@@ -1919,14 +1957,16 @@
         ctx.font = '12px "Microsoft YaHei", sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText('开启加速后展示实时吞吐曲线', w / 2, h / 2);
+        ctx.fillText(st.chart === 'traffic' ? '开启加速后展示实时吞吐曲线' : '连接开启后实时绘制延迟曲线', w / 2, h / 2);
         return;
       }
 
       const padL = 48, padR = 8, padT = 8, padB = 10;
       const cw = w - padL - padR, ch = h - padT - padB;
+      const dualRtt = st.chart === 'rtt' && st.route === 'dual';
       const series = st.chart === 'traffic' ? st.rxHist : st.rttHist;
       const maxVal = st.chart === 'traffic' ? 24 : 50;
+      const mainCol = st.chart === 'rtt' && !dualRtt ? okCol : dataCol;
 
       ctx.strokeStyle = border;
       ctx.lineWidth = 1;
@@ -1955,7 +1995,7 @@
 
       ctx.beginPath();
       pts.forEach(([x, y], i) => i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
-      ctx.strokeStyle = dataCol;
+      ctx.strokeStyle = mainCol;
       ctx.lineWidth = 1.8;
       ctx.stroke();
 
@@ -1969,11 +2009,24 @@
         ctx.strokeStyle = data2Col;
         ctx.lineWidth = 1.3;
         ctx.stroke();
+      } else if (dualRtt) {
+        const secPts = st.secRttHist.map((v, idx) => [
+          padL + (cw / (st.secRttHist.length - 1)) * idx,
+          padT + ch * (1 - Math.min(v, maxVal) / maxVal)
+        ]);
+        ctx.beginPath();
+        secPts.forEach(([x, y], i) => i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
+        ctx.strokeStyle = okCol;
+        ctx.lineWidth = 1.8;
+        ctx.stroke();
+        const sl = secPts[secPts.length - 1];
+        ctx.beginPath(); ctx.arc(sl[0], sl[1], 3.0, 0, Math.PI * 2);
+        ctx.fillStyle = okCol; ctx.fill();
       }
 
       const last = pts[pts.length - 1];
       ctx.beginPath(); ctx.arc(last[0], last[1], 3.2, 0, Math.PI * 2);
-      ctx.fillStyle = dataCol; ctx.fill();
+      ctx.fillStyle = mainCol; ctx.fill();
     }
 
     // Hollow-to-Solid Terracotta Brand Logo Animation (exact 1:1 mirror of crates/gui/src/icons.rs)

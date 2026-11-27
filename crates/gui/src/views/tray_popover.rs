@@ -477,7 +477,8 @@ impl GameAccelApp {
                                     "pop_route_mode",
                                     self.cfg.route_mode,
                                     &[
-                                        (RouteMode::Rule, "规则", None),
+                                        (RouteMode::Rule, "大陆直连", None),
+                                        (RouteMode::Dual, "双节点", None),
                                         (RouteMode::Global, "全局", None),
                                         (RouteMode::Direct, "直连", None),
                                     ],
