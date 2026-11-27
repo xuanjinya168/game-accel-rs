@@ -270,25 +270,15 @@ impl Drop for DialerIfGuard {
     }
 }
 
-pub async fn run_tun_mode(
-    server_ips: Vec<IpAddr>,
-    tunnels: Arc<Tunnels>,
-    stats: Arc<ClientStats>,
-    router: Arc<Router>,
-    log_tx: Option<mpsc::UnboundedSender<String>>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    let emit = |msg: String| {
-        info!("{}", msg);
-        if let Some(tx) = &log_tx {
-            let _ = tx.send(msg);
-        }
-    };
+/// Transient Windows Wintun creation errors that happen while NDIS/PnP is still finishing
+/// asynchronous teardown of the previous adapter with the same name (`GameAccel`).
+fn is_retryable_wintun_create_error(err: &std::io::Error) -> bool {
+    // 1247 = ERROR_ALREADY_INITIALIZED ("试图进行初始操作，但是初始化已完成。")
+    // 183  = ERROR_ALREADY_EXISTS
+    matches!(err.raw_os_error(), Some(1247 | 183))
+}
 
-    if !is_elevated() {
-        bail!("TUN 模式需要管理员权限，请点击「以管理员身份重启」后再开启 TUN");
-    }
-
+fn build_tun_device_sync() -> std::io::Result<tun_rs::AsyncDevice> {
     let mut builder = tun_rs::DeviceBuilder::new()
         .name(TUN_NAME)
         .ipv4(TUN_IP, TUN_PREFIX, None);
@@ -310,16 +300,108 @@ pub async fn run_tun_mode(
         builder = builder.mtu(TUN_MTU);
     }
 
-    let dev = builder
-        .build_async()
-        .context("创建 Wintun 虚拟网卡失败（请确认同目录存在 wintun.dll 且已用管理员身份运行）")?;
+    builder.build_async()
+}
+
+async fn drop_tun_device_cleanly(dev: tun_rs::AsyncDevice) {
+    // `AsyncDevice::drop` triggers tun-rs's interrupt event and calls `inner.shutdown()`,
+    // waking the background reader thread so `WinTunAdapter::drop` (`WintunCloseAdapter`) runs.
+    let _ = tokio::task::spawn_blocking(move || drop(dev)).await;
+    // Give tun-rs's interrupted background reader thread & Windows NDIS a short beat to
+    // finish WintunCloseAdapter before the next session recreates the adapter name.
+    #[cfg(target_os = "windows")]
+    tokio::time::sleep(Duration::from_millis(120)).await;
+}
+
+/// Creates the Wintun/TUN device off the Tokio async worker pool with cancellable retry
+/// on transient Windows PnP teardown overlap (`os error 1247` / `183`).
+/// Returns `Ok(None)` if shutdown was requested before or during device creation.
+async fn create_tun_device_cancellable(
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<Option<tun_rs::AsyncDevice>> {
+    const MAX_ATTEMPTS: usize = 6;
+    const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        if *shutdown_rx.borrow() {
+            return Ok(None);
+        }
+        let build_res = tokio::task::spawn_blocking(build_tun_device_sync)
+            .await
+            .context("创建 Wintun 虚拟网卡任务异常中止")?;
+
+        match build_res {
+            Ok(dev) => {
+                if *shutdown_rx.borrow() {
+                    drop_tun_device_cleanly(dev).await;
+                    return Ok(None);
+                }
+                return Ok(Some(dev));
+            }
+            Err(e) if attempt < MAX_ATTEMPTS && is_retryable_wintun_create_error(&e) => {
+                warn!(
+                    "Wintun 网卡仍在释放中（{e}），{}ms 后重试 ({attempt}/{MAX_ATTEMPTS})",
+                    RETRY_DELAY.as_millis()
+                );
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            return Ok(None);
+                        }
+                    }
+                    _ = tokio::time::sleep(RETRY_DELAY) => {}
+                }
+            }
+            Err(e) => {
+                return Err(e).context(
+                    "创建 Wintun 虚拟网卡失败（请确认同目录存在 wintun.dll 且已用管理员身份运行）",
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub async fn run_tun_mode(
+    server_ips: Vec<IpAddr>,
+    tunnels: Arc<Tunnels>,
+    stats: Arc<ClientStats>,
+    router: Arc<Router>,
+    log_tx: Option<mpsc::UnboundedSender<String>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let emit = |msg: String| {
+        info!("{}", msg);
+        if let Some(tx) = &log_tx {
+            let _ = tx.send(msg);
+        }
+    };
+
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+
+    if !is_elevated() {
+        bail!("TUN 模式需要管理员权限，请点击「以管理员身份重启」后再开启 TUN");
+    }
+
+    let Some(dev) = create_tun_device_cancellable(&mut shutdown_rx).await? else {
+        return Ok(());
+    };
 
     let if_index = dev.if_index().context("获取 TUN 网卡索引失败")?;
     let phys_if = crate::direct::detect_physical_interface_v4().filter(|&idx| idx != if_index);
     router.dialer.set_interface(phys_if);
     let _dialer_guard = DialerIfGuard(router.clone());
 
-    let _route_guard = RouteGuard::install(&server_ips, if_index)?;
+    let route_guard = tokio::task::spawn_blocking(move || RouteGuard::install(&server_ips, if_index))
+        .await
+        .context("安装 TUN 路由任务异常中止")??;
+    if *shutdown_rx.borrow() {
+        let _ = tokio::task::spawn_blocking(move || drop(route_guard)).await;
+        drop_tun_device_cleanly(dev).await;
+        return Ok(());
+    }
     emit(format!(
         "TUN 虚拟网卡已启动 ({TUN_NAME} {TUN_IP}/{TUN_PREFIX}, MTU {TUN_MTU}, 物理出口网卡 {:?}, 智能分流已启用)",
         phys_if
@@ -628,23 +710,46 @@ pub async fn run_tun_mode(
         }
     }
 
+    // Abort & await every task holding `Arc<AsyncDevice>` so `AsyncDevice::drop` runs
+    // right here (triggering tun-rs's interrupt event & `WintunCloseAdapter`) before we
+    // release the process-wide session lock.
     reaper_task.abort();
     tun_to_stack.abort();
     stack_to_tun.abort();
     if let Some(t) = tcp_task {
         t.abort();
+        let _ = t.await;
     }
     if let Some(t) = udp_tx_task {
         t.abort();
+        let _ = t.await;
     }
     if let Some(t) = udp_rx_task {
         t.abort();
+        let _ = t.await;
     }
     if let Some(t) = runner_task {
         t.abort();
+        let _ = t.await;
     }
+    let _ = reaper_task.await;
+    let _ = tun_to_stack.await;
+    let _ = stack_to_tun.await;
+
     tun_flow_ids.clear();
     direct_flow_ids.clear();
+
+    // Restore system routes and close Wintun adapter completely BEFORE releasing the
+    // process-wide session lock or emitting the restored log.
+    let _ = tokio::task::spawn_blocking(move || drop(route_guard)).await;
+    match Arc::try_unwrap(dev) {
+        Ok(owned_dev) => drop_tun_device_cleanly(owned_dev).await,
+        Err(shared_dev) => {
+            let _ = tokio::task::spawn_blocking(move || drop(shared_dev)).await;
+            #[cfg(target_os = "windows")]
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+    }
     emit("TUN 虚拟网卡与系统路由已安全还原".to_string());
     Ok(())
 }
@@ -707,4 +812,22 @@ async fn handle_tun_tcp(
         .relay_tcp(stream, quic_send, quic_recv, stats, None)
         .await
         .with_context(|| format!("tcp to {dst}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_retryable_wintun_create_error;
+
+    #[test]
+    fn wintun_retryable_create_errors() {
+        assert!(is_retryable_wintun_create_error(
+            &std::io::Error::from_raw_os_error(1247)
+        ));
+        assert!(is_retryable_wintun_create_error(
+            &std::io::Error::from_raw_os_error(183)
+        ));
+        assert!(!is_retryable_wintun_create_error(
+            &std::io::Error::from_raw_os_error(126)
+        ));
+    }
 }

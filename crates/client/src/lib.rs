@@ -34,11 +34,11 @@ use protocol::pacer::UdpDupPacer;
 use protocol::share::NodeProtocol;
 use quinn::Endpoint;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
@@ -102,6 +102,13 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// Process-wide lock serializing local OS resources (mixed proxy listen port + Wintun adapter +
+/// Windows system routes) across overlapping sessions during rapid node/mode switches.
+fn local_session_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub async fn run_client_with_shutdown(
@@ -168,6 +175,34 @@ pub async fn run_client_with_shutdown(
         return Ok(());
     };
     if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+
+    // Wait for any previous session to finish tearing down its local listener, Wintun adapter,
+    // and system routes before taking ownership of them. If superseded while waiting, exit
+    // immediately without touching OS networking or emitting stale logs.
+    let mut lock_wait_rx = shutdown_rx.clone();
+    let _session_guard = tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                if *lock_wait_rx.borrow() {
+                    break;
+                }
+                if lock_wait_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        } => {
+            drop(primary);
+            drop(secondary_res);
+            return Ok(());
+        }
+        guard = local_session_lock().lock() => guard,
+    };
+    if *shutdown_rx.borrow() {
+        drop(primary);
+        drop(secondary_res);
         return Ok(());
     }
 

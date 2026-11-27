@@ -148,6 +148,7 @@ impl GameAccelApp {
         let always_on_top = self.cfg.floating_pill_always_on_top;
         let locked = self.cfg.floating_pill_locked;
         let fs_hidden = self.floating_pill_fs_hidden;
+        let own_popup_open = self.floating_menu_open || self.tray_popover_open;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("game_accel_floating_pill"),
@@ -162,7 +163,13 @@ impl GameAccelApp {
             |vctx, _class| {
                 let vppp = vctx.pixels_per_point().max(1.0);
                 set_taskbar_guard(always_on_top && !fs_hidden);
-                ensure_floating_card_window(vppp, always_on_top, fs_hidden, force_raise);
+                ensure_floating_card_window(
+                    vppp,
+                    always_on_top,
+                    fs_hidden,
+                    force_raise,
+                    own_popup_open,
+                );
 
                 if let Some(outer) = vctx.input(|i| i.viewport().outer_rect) {
                     latest_outer_pos = Some([outer.min.x, outer.min.y]);
@@ -877,9 +884,10 @@ fn set_taskbar_guard(enabled: bool) {
         const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
         const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 
-        /// The taskbar is itself a topmost window: when it's activated (e.g. clicking a tray
-        /// icon) it jumps above a card placed over it. Re-assert our z-order right away instead
-        /// of waiting for the next frame / tray poll, which showed up as a visible blink.
+        /// The taskbar is itself a topmost window: on Windows 11, not only activating
+        /// `Shell_TrayWnd` directly but also opening/closing Start, tray overflow, Quick
+        /// Settings, or switching windows can push `Shell_TrayWnd` above our card in the
+        /// topmost Z-band. Check the real Z-order and re-assert immediately when buried.
         unsafe extern "system" fn on_foreground(
             _hook: isize,
             _event: u32,
@@ -889,8 +897,11 @@ fn set_taskbar_guard(enabled: bool) {
             _thread: u32,
             _time: u32,
         ) {
-            if KEEP_ABOVE_TASKBAR.load(Ordering::Relaxed) && is_taskbar_window(hwnd) {
-                raise_card_topmost();
+            if KEEP_ABOVE_TASKBAR.load(Ordering::Relaxed) {
+                let card = CARD_HWND.load(Ordering::Relaxed);
+                if is_taskbar_window(hwnd) || (card != 0 && is_card_behind_taskbar(card)) {
+                    raise_card_topmost();
+                }
             }
         }
 
@@ -936,6 +947,39 @@ fn is_taskbar_window(hwnd: isize) -> bool {
         let cls = String::from_utf16_lossy(&buf[..n as usize]);
         cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd"
     }
+}
+
+/// Returns `true` when `Shell_TrayWnd` or `Shell_SecondaryTrayWnd` currently sits ABOVE
+/// `card_hwnd` in the Win32 Z-order (meaning a card parked over the taskbar is buried behind it).
+#[cfg(target_os = "windows")]
+fn is_card_behind_taskbar(card_hwnd: isize) -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindow(hwnd: isize, cmd: u32) -> isize;
+        fn IsWindowVisible(hwnd: *mut std::ffi::c_void) -> i32;
+        fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+    }
+    const GW_HWNDPREV: u32 = 3;
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_TOPMOST: isize = 0x0000_0008;
+    if card_hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        let mut cur = GetWindow(card_hwnd, GW_HWNDPREV);
+        let mut steps = 0usize;
+        while cur != 0 && steps < 64 {
+            steps += 1;
+            if IsWindowVisible(cur as *mut std::ffi::c_void) != 0
+                && (GetWindowLongPtrW(cur, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0
+                && is_taskbar_window(cur)
+            {
+                return true;
+            }
+            cur = GetWindow(cur, GW_HWNDPREV);
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -1100,7 +1144,13 @@ fn find_own_window_by_size(
 
 /// Keep the floating card detached from the main window owner, respect topmost/fullscreen
 /// visibility settings, and clip its Win32 region to an exact rounded rectangle.
-fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, force_raise: bool) {
+fn ensure_floating_card_window(
+    ppp: f32,
+    always_on_top: bool,
+    fs_hidden: bool,
+    force_raise: bool,
+    own_popup_open: bool,
+) {
     #[cfg(target_os = "windows")]
     {
         use std::ffi::c_void;
@@ -1213,13 +1263,16 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
             }
 
             let cur_topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
-            // Fallback for the taskbar guard hook: while the taskbar is the foreground window,
-            // keep re-asserting our position above it.
+            // Re-assert above the taskbar both when the taskbar itself is foreground and
+            // whenever Windows 11 Shell silently pushed `Shell_TrayWnd` above us in Z-order.
             let taskbar_active = always_on_top && is_taskbar_window(GetForegroundWindow() as isize);
+            let buried_behind_taskbar =
+                always_on_top && !own_popup_open && is_card_behind_taskbar(hwnd);
             if !visible
                 || cur_topmost != always_on_top
                 || (force_raise && always_on_top)
                 || taskbar_active
+                || buried_behind_taskbar
             {
                 if !visible {
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -1282,7 +1335,7 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (ppp, always_on_top, fs_hidden, force_raise);
+        let _ = (ppp, always_on_top, fs_hidden, force_raise, own_popup_open);
     }
 }
 
@@ -1319,6 +1372,7 @@ fn is_another_app_fullscreen() -> bool {
         #[link(name = "user32")]
         unsafe extern "system" {
             fn GetForegroundWindow() -> Hwnd;
+            fn IsWindowVisible(hwnd: Hwnd) -> i32;
             fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
             fn GetClassNameW(hwnd: Hwnd, buf: *mut u16, max_count: i32) -> i32;
             fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
@@ -1330,7 +1384,7 @@ fn is_another_app_fullscreen() -> bool {
 
         unsafe {
             let fg = GetForegroundWindow();
-            if fg.is_null() {
+            if fg.is_null() || IsWindowVisible(fg) == 0 {
                 return false;
             }
             let mut fg_pid: u32 = 0;
@@ -1354,7 +1408,16 @@ fn is_another_app_fullscreen() -> bool {
                 let cls = String::from_utf16_lossy(&cls_buf[..cls_len as usize]);
                 if matches!(
                     cls.as_str(),
-                    "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+                    "Progman"
+                        | "WorkerW"
+                        | "Shell_TrayWnd"
+                        | "Shell_SecondaryTrayWnd"
+                        | "Windows.UI.Core.CoreWindow"
+                        | "XamlExplorerHostIslandWindow"
+                        | "TopLevelWindowForOverflowXamlIsland"
+                        | "Shell_InputSwitchTopLevelWindow"
+                        | "MultitaskingViewFrame"
+                        | "ForegroundStaging"
                 ) {
                     return false;
                 }
