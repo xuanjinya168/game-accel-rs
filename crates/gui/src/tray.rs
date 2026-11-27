@@ -338,8 +338,6 @@ fn install_chromeless_subclass(hwnd: isize) {
 pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
     #[cfg(target_os = "windows")]
     {
-        use std::ffi::c_void;
-
         #[link(name = "user32")]
         unsafe extern "system" {
             fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
@@ -365,15 +363,6 @@ pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
         unsafe extern "system" {
             fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
         }
-        #[link(name = "dwmapi")]
-        unsafe extern "system" {
-            fn DwmSetWindowAttribute(
-                hwnd: *mut c_void,
-                dw_attribute: u32,
-                pv_attribute: *const c_void,
-                cb_attribute: u32,
-            ) -> i32;
-        }
 
         let hwnd = find_own_window(title);
         if hwnd == 0 || rect.w <= 0 || rect.h <= 0 {
@@ -392,17 +381,8 @@ pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
         const SWP_FRAMECHANGED: u32 = 0x0020;
         const SWP_SHOWWINDOW: u32 = 0x0040;
 
-        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
-        const DWMWCP_ROUND: u32 = 2;
-
         unsafe {
-            let corner_pref: u32 = DWMWCP_ROUND;
-            let _ = DwmSetWindowAttribute(
-                hwnd as *mut c_void,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                (&corner_pref as *const u32).cast::<c_void>(),
-                std::mem::size_of::<u32>() as u32,
-            );
+            let win11_rounded = apply_win11_rounded_corners_to(hwnd, true);
 
             if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != 0 {
                 let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
@@ -423,10 +403,14 @@ pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
             // eliminating the 1-frame blank/white WGL flash on `ShowWindow`.
             let _ = SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
 
-            let diam = rect.corner_diam.max(8);
-            let hrgn = CreateRoundRectRgn(0, 0, rect.w + 1, rect.h + 1, diam, diam);
-            if hrgn != 0 {
-                let _ = SetWindowRgn(hwnd, hrgn, 0);
+            // Only fall back to 1-bit GDI `SetWindowRgn` on Windows 10; on Windows 11,
+            // `DWMWCP_ROUND` provides smooth GPU anti-aliased 8px corners and soft shadow.
+            if !win11_rounded {
+                let diam = rect.corner_diam.max(8);
+                let hrgn = CreateRoundRectRgn(0, 0, rect.w + 1, rect.h + 1, diam, diam);
+                if hrgn != 0 {
+                    let _ = SetWindowRgn(hwnd, hrgn, 0);
+                }
             }
 
             let _ = SetWindowPos(
@@ -666,16 +650,67 @@ pub(crate) fn find_own_window(title: &str) -> isize {
     }
 }
 
-/// Clip the main window to an exact rounded rectangle while floating, and drop the
-/// region again while maximized. Clipping at the OS level bounds the surface itself,
-/// so the corners outside the radius can never composite as the DWM white fallback.
-pub fn ensure_main_window_region(is_maximized: bool, radius_points: f32, ppp: f32) {
+/// Request Windows 11 native GPU anti-aliased rounded corners (`DWMWCP_ROUND`, 8px radius)
+/// or square corners (`DWMWCP_DONOTROUND`). Returns `true` on Windows 11 (`S_OK`), and
+/// `false` on Windows 10 or non-Windows platforms where callers should fall back.
+pub(crate) fn apply_win11_rounded_corners_to(hwnd: isize, round: bool) -> bool {
     #[cfg(target_os = "windows")]
     {
+        use std::ffi::c_void;
+        if hwnd == 0 {
+            return false;
+        }
+        #[link(name = "dwmapi")]
+        unsafe extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: *mut c_void,
+                dw_attribute: u32,
+                pv_attribute: *const c_void,
+                cb_attribute: u32,
+            ) -> i32;
+        }
+        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+        const DWMWCP_DONOTROUND: u32 = 1;
+        const DWMWCP_ROUND: u32 = 2;
+        let pref: u32 = if round { DWMWCP_ROUND } else { DWMWCP_DONOTROUND };
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd as *mut c_void,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                (&pref as *const u32).cast::<c_void>(),
+                std::mem::size_of::<u32>() as u32,
+            ) == 0
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (hwnd, round);
+        false
+    }
+}
+
+/// Apply Windows 11 native DWM rounded corners (8px anti-aliased + soft shadow + theme border)
+/// to the main window, falling back to `CreateRoundRectRgn` only on Windows 10.
+///
+/// Returns `true` when Windows 11 native DWM rounding and border are active so the caller can
+/// paint edge-to-edge without a jagged GDI region or duplicate outer stroke.
+pub fn ensure_main_window_region(
+    is_maximized: bool,
+    radius_points: f32,
+    border_col: egui::Color32,
+    bg_col: egui::Color32,
+    ppp: f32,
+) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::c_void;
         use std::sync::atomic::AtomicIsize;
 
         static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
-        static APPLIED: std::sync::Mutex<Option<(i32, i32, i32, bool)>> = std::sync::Mutex::new(None);
+        static WIN11_APPLIED: std::sync::Mutex<Option<(bool, u32, u32)>> =
+            std::sync::Mutex::new(None);
+        static WIN10_APPLIED: std::sync::Mutex<Option<(i32, i32, i32, bool)>> =
+            std::sync::Mutex::new(None);
 
         #[repr(C)]
         struct WinRect {
@@ -694,16 +729,66 @@ pub fn ensure_main_window_region(is_maximized: bool, radius_points: f32, ppp: f3
         unsafe extern "system" {
             fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
         }
+        #[link(name = "dwmapi")]
+        unsafe extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: *mut c_void,
+                dw_attribute: u32,
+                pv_attribute: *const c_void,
+                cb_attribute: u32,
+            ) -> i32;
+        }
 
         let mut hwnd = MAIN_HWND.load(Ordering::Relaxed);
         if hwnd == 0 {
             hwnd = find_own_window("GameAccel");
             if hwnd == 0 {
-                return;
+                return false;
             }
             MAIN_HWND.store(hwnd, Ordering::Relaxed);
         }
 
+        const DWMWA_BORDER_COLOR: u32 = 34;
+        const DWMWA_CAPTION_COLOR: u32 = 35;
+        const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+        let to_colorref = |c: egui::Color32| -> u32 {
+            u32::from(c.r()) | (u32::from(c.g()) << 8) | (u32::from(c.b()) << 16)
+        };
+        let border_ref = if is_maximized {
+            DWMWA_COLOR_NONE
+        } else {
+            to_colorref(border_col)
+        };
+        let bg_ref = to_colorref(bg_col);
+
+        {
+            let applied = WIN11_APPLIED.lock().unwrap_or_else(|p| p.into_inner());
+            if *applied == Some((is_maximized, border_ref, bg_ref)) {
+                return true;
+            }
+        }
+
+        if apply_win11_rounded_corners_to(hwnd, !is_maximized) {
+            unsafe {
+                let _ = DwmSetWindowAttribute(
+                    hwnd as *mut c_void,
+                    DWMWA_BORDER_COLOR,
+                    (&border_ref as *const u32).cast::<c_void>(),
+                    std::mem::size_of::<u32>() as u32,
+                );
+                let _ = DwmSetWindowAttribute(
+                    hwnd as *mut c_void,
+                    DWMWA_CAPTION_COLOR,
+                    (&bg_ref as *const u32).cast::<c_void>(),
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+            let mut applied = WIN11_APPLIED.lock().unwrap_or_else(|p| p.into_inner());
+            *applied = Some((is_maximized, border_ref, bg_ref));
+            return true;
+        }
+
+        // Windows 10 fallback: clip to rounded GDI region.
         let mut rc = WinRect {
             left: 0,
             top: 0,
@@ -711,11 +796,11 @@ pub fn ensure_main_window_region(is_maximized: bool, radius_points: f32, ppp: f3
             bottom: 0,
         };
         if unsafe { GetClientRect(hwnd, &mut rc) } == 0 {
-            return;
+            return false;
         }
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         if w <= 0 || h <= 0 {
-            return;
+            return false;
         }
 
         let diam = if is_maximized {
@@ -724,14 +809,13 @@ pub fn ensure_main_window_region(is_maximized: bool, radius_points: f32, ppp: f3
             (radius_points * 2.0 * ppp).round().max(8.0) as i32
         };
 
-        let mut applied = APPLIED.lock().unwrap_or_else(|p| p.into_inner());
+        let mut applied = WIN10_APPLIED.lock().unwrap_or_else(|p| p.into_inner());
         if *applied == Some((w, h, diam, is_maximized)) {
-            return;
+            return false;
         }
 
         let ok = unsafe {
             if is_maximized {
-                // NULL region = plain rectangular window.
                 SetWindowRgn(hwnd, 0, 1) != 0
             } else {
                 let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diam, diam);
@@ -741,10 +825,12 @@ pub fn ensure_main_window_region(is_maximized: bool, radius_points: f32, ppp: f3
         if ok {
             *applied = Some((w, h, diam, is_maximized));
         }
+        false
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (is_maximized, radius_points, ppp);
+        let _ = (is_maximized, radius_points, border_col, bg_col, ppp);
+        false
     }
 }
 

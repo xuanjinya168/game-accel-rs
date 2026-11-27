@@ -443,7 +443,9 @@ impl Drop for GameAccelApp {
 
 impl eframe::App for GameAccelApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        Color32::TRANSPARENT.to_normalized_gamma_f32()
+        ThemePalette::from_mode(self.cfg.theme_mode)
+            .bg_root
+            .to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -512,15 +514,18 @@ impl eframe::App for GameAccelApp {
                 .show(ctx, |ui| {
                     let total_rect = ui.max_rect();
                     let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    let radius = if is_maximized { 0u8 } else { 14u8 };
+                    let radius = if is_maximized { 0u8 } else { 8u8 };
 
-                    // Bound the OS window surface to the painted radius, so the area outside
-                    // the arc can never fall back to an opaque white fill during compositing.
-                    tray::ensure_main_window_region(
+                    // Prefer Windows 11 native DWM 8px anti-aliased rounding + soft shadow;
+                    // only fall back to GDI region + egui outer stroke on Windows 10 / others.
+                    let native_dwm_round = tray::ensure_main_window_region(
                         is_maximized,
                         radius as f32,
+                        p.border_strong,
+                        p.bg_root,
                         ctx.pixels_per_point(),
                     );
+                    let paint_radius = if native_dwm_round { 0u8 } else { radius };
 
                     // Enable native 8-direction edge & corner drag resizing on frameless window
                     if !is_maximized {
@@ -530,7 +535,7 @@ impl eframe::App for GameAccelApp {
                     let sidebar_w = 68.0;
                     let split_x = total_rect.min.x + sidebar_w;
 
-                    // Paint 68px icon rail & right studio stage as two non-overlapping rounded halves
+                    // Paint 68px icon rail & right studio stage as two non-overlapping halves
                     let sidebar_rect = egui::Rect::from_min_max(
                         total_rect.min,
                         Pos2::new(split_x, total_rect.max.y),
@@ -543,8 +548,8 @@ impl eframe::App for GameAccelApp {
                     ui.painter().rect_filled(
                         sidebar_rect,
                         CornerRadius {
-                            nw: radius,
-                            sw: radius,
+                            nw: paint_radius,
+                            sw: paint_radius,
                             ne: 0,
                             se: 0,
                         },
@@ -555,8 +560,8 @@ impl eframe::App for GameAccelApp {
                         CornerRadius {
                             nw: 0,
                             sw: 0,
-                            ne: radius,
-                            se: radius,
+                            ne: paint_radius,
+                            se: paint_radius,
                         },
                         p.bg_root,
                     );
@@ -604,8 +609,9 @@ impl eframe::App for GameAccelApp {
                         );
                     });
 
-                    // Single crisp 1px outer border on top (skipped when maximized flush to screen)
-                    if !is_maximized {
+                    // Single crisp 1px outer border on top (skipped when maximized or when
+                    // Windows 11 DWM already renders the native 1px rounded border).
+                    if !is_maximized && !native_dwm_round {
                         ui.painter().rect_stroke(
                             total_rect,
                             CornerRadius::same(radius),
@@ -760,7 +766,6 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("GameAccel")
             .with_decorations(false)
-            .with_transparent(true)
             .with_resizable(true)
             .with_inner_size([840.0, 548.0])
             .with_min_inner_size([780.0, 508.0])

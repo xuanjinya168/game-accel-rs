@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 const CARD_W: f32 = 98.0;
 const CARD_H: f32 = 44.0;
-const CARD_RADIUS: f32 = 6.0;
+const CARD_RADIUS: f32 = 8.0;
 
 const MENU_W: f32 = 166.0;
 const MENU_H: f32 = 236.0;
@@ -1234,21 +1234,39 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
                 );
             }
 
-            let mut rgn_rc = WinRect {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            let rgn_type = GetWindowRgnBox(hwnd, &mut rgn_rc);
-            if rgn_type == 0
-                || (rgn_rc.right - rgn_rc.left - w).abs() > 2
-                || (rgn_rc.bottom - rgn_rc.top - h).abs() > 2
+            // Prefer Windows 11 native GPU anti-aliased 8px corners; only fall back to 1-bit
+            // GDI `CreateRoundRectRgn` on Windows 10 where `DWMWA_WINDOW_CORNER_PREFERENCE`
+            // is unsupported.
+            static CARD_ROUNDED_HWND: std::sync::atomic::AtomicIsize =
+                std::sync::atomic::AtomicIsize::new(0);
+            let win11_rounded = if CARD_ROUNDED_HWND.load(std::sync::atomic::Ordering::Relaxed)
+                == hwnd
             {
-                let diam = (CARD_RADIUS * 2.0 * ppp).round().max(8.0) as i32;
-                let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diam, diam);
-                if hrgn != 0 {
-                    let _ = SetWindowRgn(hwnd, hrgn, 1);
+                true
+            } else if crate::tray::apply_win11_rounded_corners_to(hwnd, true) {
+                CARD_ROUNDED_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+                true
+            } else {
+                false
+            };
+
+            if !win11_rounded {
+                let mut rgn_rc = WinRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                let rgn_type = GetWindowRgnBox(hwnd, &mut rgn_rc);
+                if rgn_type == 0
+                    || (rgn_rc.right - rgn_rc.left - w).abs() > 2
+                    || (rgn_rc.bottom - rgn_rc.top - h).abs() > 2
+                {
+                    let diam = (CARD_RADIUS * 2.0 * ppp).round().max(8.0) as i32;
+                    let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diam, diam);
+                    if hrgn != 0 {
+                        let _ = SetWindowRgn(hwnd, hrgn, 1);
+                    }
                 }
             }
         }

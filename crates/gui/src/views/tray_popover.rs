@@ -47,7 +47,7 @@ enum PopoverAction {
 }
 
 const TRAY_POPOVER_TITLE: &str = "GameAccel 托盘面板";
-const TRAY_POPOVER_RADIUS: f32 = 10.0;
+const TRAY_POPOVER_RADIUS: f32 = 8.0;
 
 impl GameAccelApp {
     pub(crate) fn close_tray_popover(&mut self) {
@@ -150,7 +150,7 @@ impl GameAccelApp {
                         Frame::new()
                             .fill(p.bg_card)
                             .stroke(Stroke::new(1.0_f32, p.border_strong))
-                            .corner_radius(CornerRadius::same(10))
+                            .corner_radius(CornerRadius::same(TRAY_POPOVER_RADIUS as u8))
                             .inner_margin(Margin::same(14)),
                     )
                     .show(vctx, |ui| {
