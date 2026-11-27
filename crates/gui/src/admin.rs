@@ -5,13 +5,20 @@ use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AdminSubTab {
+    #[default]
+    Links,
+    Logs,
+    Settings,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct OverviewView {
     pub uptime_secs: u64,
     pub public_host: String,
     pub udp_port: u16,
     pub sni: String,
-    #[allow(dead_code)]
     pub insecure: bool,
     pub total_links: usize,
     pub active_links: usize,
@@ -38,6 +45,36 @@ pub(crate) struct LinkView {
     #[serde(default)]
     pub hy2_uri: String,
     pub status: LinkStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct AccessLogEntry {
+    #[allow(dead_code)]
+    pub id: u64,
+    pub time: String,
+    #[allow(dead_code)]
+    pub link_id: String,
+    pub link_name: String,
+    pub client_ip: String,
+    pub proto: String,
+    pub root_domain: String,
+    pub target: String,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub duration_ms: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct AccessLogsResponse {
+    pub enabled: bool,
+    pub total_buffered: usize,
+    pub logs: Vec<AccessLogEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToggleLogsResp {
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +157,22 @@ pub(crate) enum AdminEvent {
         server_id: String,
         result: Result<(OverviewView, Vec<LinkView>), AdminApiErr>,
     },
+    LogsData {
+        server_id: String,
+        result: Result<AccessLogsResponse, AdminApiErr>,
+    },
+    LogsToggled {
+        server_id: String,
+        result: Result<bool, AdminApiErr>,
+    },
+    NodeSettingsSaved {
+        server_id: String,
+        result: Result<OverviewView, AdminApiErr>,
+    },
+    PasswordUpdated {
+        server_id: String,
+        result: Result<(), AdminApiErr>,
+    },
     MutationResult {
         server_id: String,
         ok_msg: String,
@@ -134,22 +187,40 @@ pub(crate) enum AdminApiErr {
 }
 
 pub(crate) struct AdminState {
-    /// Active server ID that the current `session_cookie` belongs to.
     pub logged_in_server_id: Option<String>,
     pub session_cookie: Option<String>,
     pub login_user: String,
     pub login_pass: String,
     pub login_error: Option<String>,
     pub busy: bool,
+    pub sub_tab: AdminSubTab,
     pub overview: Option<OverviewView>,
     pub links: Vec<LinkView>,
     pub last_refresh: Option<Instant>,
     pub link_editor: Option<AdminLinkEditor>,
     pub server_editor: Option<AdminServerEditor>,
-    /// Link ID whose `更多 ▾` action popover is currently open.
     pub open_more_link_id: Option<String>,
-    /// Inline confirmation guard for destructive actions (delete / reset token).
-    pub confirm_action: Option<(String, String)>, // (action_kind, link_id)
+    pub confirm_action: Option<(String, String)>,
+
+    // Access Audit Logs tab state
+    pub logs_enabled: bool,
+    pub logs_total_buffered: usize,
+    pub logs: Vec<AccessLogEntry>,
+    pub log_link_filter: String,
+    pub log_proto_filter: String,
+    pub log_search: String,
+    pub log_link_picker_open: bool,
+    pub confirm_clear_logs: bool,
+
+    // Node & Security Settings tab state
+    pub node_form_dirty: bool,
+    pub node_form_synced: bool,
+    pub set_public_host: String,
+    pub set_udp_port: String,
+    pub set_sni: String,
+    pub set_insecure: bool,
+    pub old_password: String,
+    pub new_password: String,
 }
 
 impl Default for AdminState {
@@ -161,6 +232,7 @@ impl Default for AdminState {
             login_pass: String::new(),
             login_error: None,
             busy: false,
+            sub_tab: AdminSubTab::Links,
             overview: None,
             links: Vec::new(),
             last_refresh: None,
@@ -168,6 +240,22 @@ impl Default for AdminState {
             server_editor: None,
             open_more_link_id: None,
             confirm_action: None,
+            logs_enabled: true,
+            logs_total_buffered: 0,
+            logs: Vec::new(),
+            log_link_filter: String::new(),
+            log_proto_filter: String::new(),
+            log_search: String::new(),
+            log_link_picker_open: false,
+            confirm_clear_logs: false,
+            node_form_dirty: false,
+            node_form_synced: false,
+            set_public_host: String::new(),
+            set_udp_port: String::new(),
+            set_sni: String::new(),
+            set_insecure: false,
+            old_password: String::new(),
+            new_password: String::new(),
         }
     }
 }
@@ -178,11 +266,28 @@ impl AdminState {
         self.session_cookie = None;
         self.overview = None;
         self.links.clear();
+        self.logs.clear();
+        self.logs_total_buffered = 0;
         self.last_refresh = None;
         self.link_editor = None;
         self.open_more_link_id = None;
         self.confirm_action = None;
+        self.log_link_picker_open = false;
+        self.confirm_clear_logs = false;
+        self.node_form_dirty = false;
+        self.node_form_synced = false;
+        self.old_password.clear();
+        self.new_password.clear();
         self.busy = false;
+    }
+
+    pub(crate) fn sync_node_form_from(&mut self, ov: &OverviewView) {
+        self.set_public_host = ov.public_host.clone();
+        self.set_udp_port = ov.udp_port.to_string();
+        self.set_sni = ov.sni.clone();
+        self.set_insecure = ov.insecure;
+        self.node_form_synced = true;
+        self.node_form_dirty = false;
     }
 
     pub(crate) fn is_logged_in_for(&self, server_id: &str) -> bool {
@@ -205,6 +310,18 @@ pub(crate) fn format_uptime(secs: u64) -> String {
 
 fn normalized_base(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
+}
+
+fn encode_query_val(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn build_client(via_tunnel: bool, listen_addr: &str) -> Result<reqwest::Client> {
@@ -331,6 +448,163 @@ pub(crate) async fn api_fetch_dashboard(
     Ok((ov, links))
 }
 
+#[derive(Clone)]
+pub(crate) struct LogsQueryInput {
+    pub link_id: String,
+    pub proto: String,
+    pub keyword: String,
+}
+
+pub(crate) async fn api_fetch_logs(
+    server: &AdminServerProfile,
+    listen_addr: &str,
+    cookie: &str,
+    q: LogsQueryInput,
+) -> std::result::Result<AccessLogsResponse, AdminApiErr> {
+    let client = build_client(server.via_tunnel, listen_addr)
+        .map_err(|e| AdminApiErr::Message(format!("{e:#}")))?;
+    let base = normalized_base(&server.base_url);
+    let url = format!(
+        "{base}/api/logs?link_id={}&proto={}&q={}",
+        encode_query_val(q.link_id.trim()),
+        encode_query_val(q.proto.trim()),
+        encode_query_val(q.keyword.trim()),
+    );
+    let res = client
+        .get(url)
+        .header(COOKIE, cookie)
+        .send()
+        .await
+        .map_err(|e| AdminApiErr::Message(format!("拉取访问日志失败: {e}")))?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(AdminApiErr::Unauthorized);
+    }
+    if !res.status().is_success() {
+        return Err(AdminApiErr::Message(parse_error_msg(res).await));
+    }
+    let text = res
+        .text()
+        .await
+        .map_err(|e| AdminApiErr::Message(format!("读取日志响应失败: {e}")))?;
+    serde_json::from_str(&text).map_err(|e| AdminApiErr::Message(format!("解析日志数据失败: {e}")))
+}
+
+pub(crate) async fn api_toggle_logs(
+    server: &AdminServerProfile,
+    listen_addr: &str,
+    cookie: &str,
+    enabled: bool,
+) -> std::result::Result<bool, AdminApiErr> {
+    let client = build_client(server.via_tunnel, listen_addr)
+        .map_err(|e| AdminApiErr::Message(format!("{e:#}")))?;
+    let base = normalized_base(&server.base_url);
+    let body = serde_json::json!({ "enabled": enabled }).to_string();
+    let res = client
+        .put(format!("{base}/api/logs/toggle"))
+        .header(COOKIE, cookie)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| AdminApiErr::Message(format!("切换日志开关失败: {e}")))?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(AdminApiErr::Unauthorized);
+    }
+    if !res.status().is_success() {
+        return Err(AdminApiErr::Message(parse_error_msg(res).await));
+    }
+    let text = res
+        .text()
+        .await
+        .map_err(|e| AdminApiErr::Message(format!("读取响应失败: {e}")))?;
+    let parsed: ToggleLogsResp =
+        serde_json::from_str(&text).map_err(|e| AdminApiErr::Message(format!("解析响应失败: {e}")))?;
+    Ok(parsed.enabled)
+}
+
+pub(crate) async fn api_clear_logs(
+    server: &AdminServerProfile,
+    listen_addr: &str,
+    cookie: &str,
+) -> std::result::Result<(), AdminApiErr> {
+    let client = build_client(server.via_tunnel, listen_addr)
+        .map_err(|e| AdminApiErr::Message(format!("{e:#}")))?;
+    let base = normalized_base(&server.base_url);
+    let res = client
+        .post(format!("{base}/api/logs/clear"))
+        .header(COOKIE, cookie)
+        .send()
+        .await
+        .map_err(|e| AdminApiErr::Message(format!("清空访问日志失败: {e}")))?;
+    check_mutation_resp(res).await
+}
+
+#[derive(Serialize)]
+pub(crate) struct NodeSettingsPayload {
+    pub public_host: String,
+    pub udp_port: u16,
+    pub sni: String,
+    pub insecure: bool,
+}
+
+pub(crate) async fn api_update_node_settings(
+    server: &AdminServerProfile,
+    listen_addr: &str,
+    cookie: &str,
+    payload: NodeSettingsPayload,
+) -> std::result::Result<OverviewView, AdminApiErr> {
+    let client = build_client(server.via_tunnel, listen_addr)
+        .map_err(|e| AdminApiErr::Message(format!("{e:#}")))?;
+    let base = normalized_base(&server.base_url);
+    let body = serde_json::to_string(&payload)
+        .map_err(|e| AdminApiErr::Message(format!("序列化设置失败: {e}")))?;
+    let res = client
+        .put(format!("{base}/api/settings/node"))
+        .header(COOKIE, cookie)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| AdminApiErr::Message(format!("保存节点设置失败: {e}")))?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(AdminApiErr::Unauthorized);
+    }
+    if !res.status().is_success() {
+        return Err(AdminApiErr::Message(parse_error_msg(res).await));
+    }
+    let text = res
+        .text()
+        .await
+        .map_err(|e| AdminApiErr::Message(format!("读取响应失败: {e}")))?;
+    serde_json::from_str(&text).map_err(|e| AdminApiErr::Message(format!("解析概览失败: {e}")))
+}
+
+pub(crate) async fn api_update_password(
+    server: &AdminServerProfile,
+    listen_addr: &str,
+    cookie: &str,
+    old_password: String,
+    new_password: String,
+) -> std::result::Result<(), AdminApiErr> {
+    let client = build_client(server.via_tunnel, listen_addr)
+        .map_err(|e| AdminApiErr::Message(format!("{e:#}")))?;
+    let base = normalized_base(&server.base_url);
+    let body = serde_json::json!({
+        "old_password": old_password,
+        "new_password": new_password,
+    })
+    .to_string();
+    let res = client
+        .put(format!("{base}/api/settings/password"))
+        .header(COOKIE, cookie)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| AdminApiErr::Message(format!("更新管理密码失败: {e}")))?;
+    check_mutation_resp(res).await
+}
+
 pub(crate) struct SaveLinkRequest {
     pub editing_id: Option<String>,
     pub name: String,
@@ -412,7 +686,7 @@ pub(crate) async fn api_post_link_action(
     listen_addr: &str,
     cookie: &str,
     id: &str,
-    action: &str, // "reset-token" | "reset-traffic"
+    action: &str,
 ) -> std::result::Result<(), AdminApiErr> {
     let client = build_client(server.via_tunnel, listen_addr)
         .map_err(|e| AdminApiErr::Message(format!("{e:#}")))?;

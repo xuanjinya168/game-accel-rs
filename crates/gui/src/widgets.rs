@@ -285,7 +285,8 @@ pub fn soft_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette) -> egui::Respons
     resp
 }
 
-/// Compact inline action button (`26px` height) for node rows, filters, and log toolbar.
+/// Compact inline action button (`26px` height) with crisp card surface & 1px border so it
+/// remains clearly visible inside both `bg_card` and `bg_card_alt` containers.
 pub fn chip_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette, is_danger: bool) -> egui::Response {
     let font = FontId::proportional(FONT_SM);
     let enabled = ui.is_enabled();
@@ -300,32 +301,80 @@ pub fn chip_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette, is_danger: bool)
     let w = (galley.size().x + 18.0).max(44.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click());
 
-    let fill = if !enabled {
-        p.bg_card_alt
+    let (fill, border) = if !enabled {
+        (p.bg_card_alt, p.border_subtle)
     } else if is_danger && resp.hovered() {
-        p.danger_soft
-    } else if resp.is_pointer_button_down_on() || resp.hovered() {
-        p.bg_nav_hover
+        (p.danger_soft, p.danger_text)
+    } else if resp.is_pointer_button_down_on() {
+        (p.bg_nav_active, p.border_strong)
+    } else if resp.hovered() {
+        (p.bg_nav_hover, p.border_strong)
     } else {
-        p.bg_card_alt
+        (p.bg_card, p.border_subtle)
     };
 
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(6), fill);
-    if is_danger && resp.hovered() {
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(6),
-            Stroke::new(1.0_f32, p.danger_text),
-            StrokeKind::Inside,
-        );
-    }
+    painter.rect(
+        rect,
+        CornerRadius::same(7),
+        fill,
+        Stroke::new(1.0_f32, border),
+        StrokeKind::Inside,
+    );
     painter.galley(
         Pos2::new(
             rect.center().x - galley.size().x * 0.5,
             rect.center().y - galley.size().y * 0.5,
         ),
         galley,
+        fg,
+    );
+    resp
+}
+
+/// Compact dropdown trigger chip (`26px` height) with a vector chevron icon so it never
+/// depends on missing Unicode triangle glyphs (`▾` -> `□`).
+pub fn dropdown_chip_btn(
+    ui: &mut egui::Ui,
+    text: &str,
+    is_open: bool,
+    p: ThemePalette,
+) -> egui::Response {
+    let font = FontId::proportional(FONT_SM);
+    let fg = if is_open {
+        p.accent_text
+    } else {
+        p.text_secondary
+    };
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font, fg));
+    let w = (galley.size().x + 30.0).max(56.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click());
+
+    let (fill, border) = if is_open {
+        (p.accent_soft, p.accent)
+    } else if resp.hovered() {
+        (p.bg_nav_hover, p.border_strong)
+    } else {
+        (p.bg_card, p.border_subtle)
+    };
+
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(7),
+        fill,
+        Stroke::new(1.0_f32, border),
+        StrokeKind::Inside,
+    );
+    painter.galley(
+        Pos2::new(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        fg,
+    );
+    icons::draw_chevron(
+        painter,
+        Pos2::new(rect.right() - 11.0, rect.center().y + 0.5),
+        is_open,
         fg,
     );
     resp

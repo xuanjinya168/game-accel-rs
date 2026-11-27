@@ -252,6 +252,17 @@ pub fn draw_win_close_icon(painter: &Painter, center: Pos2, color: Color32) {
     );
 }
 
+/// Crisp vector chevron (down when `up == false`, up when `up == true`), avoiding missing Unicode glyphs.
+pub fn draw_chevron(painter: &Painter, center: Pos2, up: bool, color: Color32) {
+    let stroke = Stroke::new(1.45_f32, color);
+    let dy = if up { -1.8 } else { 1.8 };
+    let left = Pos2::new(center.x - 3.4, center.y - dy * 0.55);
+    let mid = Pos2::new(center.x, center.y + dy * 0.95);
+    let right = Pos2::new(center.x + 3.4, center.y - dy * 0.55);
+    painter.line_segment([left, mid], stroke);
+    painter.line_segment([mid, right], stroke);
+}
+
 /// Power icon for the primary connection button.
 pub fn draw_power_icon(painter: &Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(1.8_f32, color);

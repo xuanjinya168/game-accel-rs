@@ -558,6 +558,9 @@ impl GameAccelApp {
                         }
                         match result {
                             Ok((ov, links)) => {
+                                if !self.admin.node_form_synced || !self.admin.node_form_dirty {
+                                    self.admin.sync_node_form_from(&ov);
+                                }
                                 self.admin.overview = Some(ov);
                                 self.admin.links = links;
                                 self.admin.last_refresh = Some(Instant::now());
@@ -569,6 +572,90 @@ impl GameAccelApp {
                             }
                             Err(AdminApiErr::Message(e)) => {
                                 self.show_toast(format!("刷新失败: {e}"));
+                            }
+                        }
+                    }
+                    AdminEvent::LogsData { server_id, result } => {
+                        if !self.admin.is_logged_in_for(&server_id) {
+                            continue;
+                        }
+                        match result {
+                            Ok(resp) => {
+                                self.admin.logs_enabled = resp.enabled;
+                                self.admin.logs_total_buffered = resp.total_buffered;
+                                self.admin.logs = resp.logs;
+                            }
+                            Err(AdminApiErr::Unauthorized) => {
+                                self.admin.clear_session();
+                                self.admin.login_error = Some("会话已过期，请重新登录".to_string());
+                            }
+                            Err(AdminApiErr::Message(e)) => {
+                                self.show_toast(format!("日志拉取失败: {e}"));
+                            }
+                        }
+                    }
+                    AdminEvent::LogsToggled { server_id, result } => {
+                        self.admin.busy = false;
+                        if !self.admin.is_logged_in_for(&server_id) {
+                            continue;
+                        }
+                        match result {
+                            Ok(enabled) => {
+                                self.admin.logs_enabled = enabled;
+                                self.show_toast(if enabled {
+                                    "已开启服务端访问日志记录"
+                                } else {
+                                    "已暂停服务端访问日志记录"
+                                });
+                                self.admin_refresh_logs();
+                            }
+                            Err(AdminApiErr::Unauthorized) => {
+                                self.admin.clear_session();
+                                self.admin.login_error = Some("会话已过期，请重新登录".to_string());
+                            }
+                            Err(AdminApiErr::Message(e)) => {
+                                self.show_toast(format!("切换日志开关失败: {e}"));
+                            }
+                        }
+                    }
+                    AdminEvent::NodeSettingsSaved { server_id, result } => {
+                        self.admin.busy = false;
+                        if !self.admin.is_logged_in_for(&server_id) {
+                            continue;
+                        }
+                        match result {
+                            Ok(ov) => {
+                                self.admin.sync_node_form_from(&ov);
+                                self.admin.overview = Some(ov);
+                                self.show_toast("节点对外参数已保存，分享链接已同步更新");
+                                self.admin_refresh();
+                            }
+                            Err(AdminApiErr::Unauthorized) => {
+                                self.admin.clear_session();
+                                self.admin.login_error = Some("会话已过期，请重新登录".to_string());
+                            }
+                            Err(AdminApiErr::Message(e)) => {
+                                self.show_toast(format!("保存节点设置失败: {e}"));
+                            }
+                        }
+                    }
+                    AdminEvent::PasswordUpdated { server_id, result } => {
+                        self.admin.busy = false;
+                        if !self.admin.is_logged_in_for(&server_id) {
+                            continue;
+                        }
+                        match result {
+                            Ok(()) => {
+                                self.admin.clear_session();
+                                self.admin.login_error = None;
+                                self.show_toast("管理密码已更新，请使用新密码重新登录");
+                            }
+                            Err(AdminApiErr::Unauthorized) => {
+                                self.admin.clear_session();
+                                self.admin.login_error = Some("会话已过期，请重新登录".to_string());
+                            }
+                            Err(AdminApiErr::Message(e)) => {
+                                self.show_toast(format!("更新密码失败: {e}"));
                             }
                         }
                     }
