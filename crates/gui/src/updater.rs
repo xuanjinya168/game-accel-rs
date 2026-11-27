@@ -188,10 +188,20 @@ async fn fetch_latest() -> Result<Option<ReleaseInfo>> {
         .build()
         .context("创建 HTTP 客户端失败")?;
 
-    let latest_url = format!("https://github.com/{REPO}/releases/latest");
-    let resp = tokio::time::timeout(Duration::from_secs(20), no_redirect.head(&latest_url).send())
-        .await
-        .context("连接 GitHub 超时")??;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let latest_url = format!("https://github.com/{REPO}/releases/latest?_t={ts}");
+    let resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        no_redirect
+            .head(&latest_url)
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .send(),
+    )
+    .await
+    .context("连接 GitHub 超时")??;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
