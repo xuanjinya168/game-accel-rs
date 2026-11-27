@@ -4,10 +4,10 @@ use crate::tray::{
     PopupRect, PopupStage, any_mouse_button_down, hide_popup_window, is_popup_dismissed,
     prepare_popup_window, reveal_popup_window, wake_window,
 };
-use crate::widgets::hairline_divider;
+use crate::widgets::{galley_center_y, hairline_divider};
 use crate::{ConnState, GameAccelApp, NavTab};
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Frame, Margin, PointerButton, Pos2, Sense, Stroke,
+    self, Color32, CornerRadius, FontId, Frame, Margin, PointerButton, Pos2, Sense, Stroke,
     StrokeKind, Vec2,
 };
 use std::time::{Duration, Instant};
@@ -259,22 +259,34 @@ impl GameAccelApp {
                         let down_tint = down_col.gamma_multiply(alpha_mul);
 
                         draw_arrow(painter, Pos2::new(arrow_x, up_y), true, up_tint);
-                        painter.text(
-                            Pos2::new(text_x, up_y),
-                            Align2::LEFT_CENTER,
-                            format_card_speed(self.telemetry.tx_speed_bps),
-                            FontId::proportional(12.5),
-                            up_tint,
-                        );
+                        let up_galley = ui.fonts(|f| {
+                            f.layout_no_wrap(
+                                format_card_speed(self.telemetry.tx_speed_bps),
+                                FontId::proportional(12.5),
+                                up_tint,
+                            )
+                        });
+                        let up_ty = if up_galley.mesh_bounds.is_positive() {
+                            up_y - up_galley.mesh_bounds.center().y
+                        } else {
+                            up_y - up_galley.size().y * 0.5
+                        };
+                        painter.galley(Pos2::new(text_x, up_ty), up_galley, up_tint);
 
                         draw_arrow(painter, Pos2::new(arrow_x, down_y), false, down_tint);
-                        painter.text(
-                            Pos2::new(text_x, down_y),
-                            Align2::LEFT_CENTER,
-                            format_card_speed(self.telemetry.rx_speed_bps),
-                            FontId::proportional(12.5),
-                            down_tint,
-                        );
+                        let down_galley = ui.fonts(|f| {
+                            f.layout_no_wrap(
+                                format_card_speed(self.telemetry.rx_speed_bps),
+                                FontId::proportional(12.5),
+                                down_tint,
+                            )
+                        });
+                        let down_ty = if down_galley.mesh_bounds.is_positive() {
+                            down_y - down_galley.mesh_bounds.center().y
+                        } else {
+                            down_y - down_galley.size().y * 0.5
+                        };
+                        painter.galley(Pos2::new(text_x, down_ty), down_galley, down_tint);
                     });
             },
         );
@@ -616,13 +628,10 @@ fn menu_row(
     } else {
         p.text_primary
     };
-    ui.painter().text(
-        Pos2::new(rect.left() + 28.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(FONT_SM),
-        text_col,
-    );
+    let galley =
+        ui.fonts(|f| f.layout_no_wrap(label.to_string(), FontId::proportional(FONT_SM), text_col));
+    let ty = galley_center_y(rect, &galley);
+    ui.painter().galley(Pos2::new(rect.left() + 28.0, ty), galley, text_col);
     resp
 }
 

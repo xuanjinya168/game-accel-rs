@@ -1,5 +1,5 @@
 use crate::theme::ThemeMode;
-pub use client::rules::RouteMode;
+pub use client::rules::{CustomRule, CustomRuleAction, RouteMode};
 use protocol::share::NodeProfile;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -86,6 +86,9 @@ pub struct AppConfig {
     /// Chosen domestic exit node ID used when `route_mode == RouteMode::Dual`.
     #[serde(default)]
     pub domestic_node_id: Option<String>,
+    /// Highest-priority user custom split-routing rules (override built-in lists, hot-reloaded).
+    #[serde(default)]
+    pub custom_rules: Vec<CustomRule>,
     /// Tray right-click behavior: floating popover panel vs native context menu.
     #[serde(default)]
     pub tray_style: TrayStyle,
@@ -131,6 +134,7 @@ impl Default for AppConfig {
             active_admin_server_id,
             route_mode: RouteMode::default(),
             domestic_node_id: None,
+            custom_rules: Vec::new(),
             tray_style: TrayStyle::default(),
             show_floating_pill: false,
             floating_pill_light: PillLightStyle::default(),
@@ -255,6 +259,7 @@ pub fn load_config() -> AppConfig {
             active_admin_server_id,
             route_mode: RouteMode::default(),
             domestic_node_id: None,
+            custom_rules: Vec::new(),
             tray_style: TrayStyle::default(),
             show_floating_pill: false,
             floating_pill_light: PillLightStyle::default(),

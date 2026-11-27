@@ -22,6 +22,19 @@ impl GameAccelApp {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    /// Persist `cfg.custom_rules` and hot-swap them into any running `Router` immediately.
+    pub(crate) fn apply_custom_rules(&mut self) {
+        self.custom_rules_cell.replace(&self.cfg.custom_rules);
+        save_config(&self.cfg);
+    }
+
+    pub(crate) fn open_custom_rules_modal(&mut self) {
+        self.custom_rules_modal = Some(crate::views::custom_rules::CustomRulesModalState::new(
+            &self.cfg.custom_rules,
+            self.cfg.route_mode,
+        ));
+    }
+
     pub(crate) fn push_log(&mut self, msg: impl AsRef<str>) {
         let s = msg.as_ref();
         let level = if s.contains("异常") || s.contains("失败") || s.contains("无效") {
@@ -337,6 +350,7 @@ impl GameAccelApp {
             listen,
             enable_tun: self.cfg.proxy_mode == ProxyMode::Tun,
             route_mode: self.route_mode_cell.clone(),
+            custom_rules: self.custom_rules_cell.clone(),
             rules_dir: Some(storage::config_dir().join("rules")),
         };
         let stats = self.stats.clone();

@@ -2,8 +2,8 @@ use crate::icons;
 use crate::storage::save_config;
 use crate::theme::{FONT_BODY, FONT_SM, FONT_SUB, FONT_XS, ThemePalette};
 use crate::widgets::{
-    accent_chip_btn, aligned_row, card_frame, chip_btn, elide_text, modal_dialog, pill, primary_btn,
-    soft_btn, styled_input, styled_multiline,
+    accent_chip_btn, aligned_row, card_frame, chip_btn, elide_text, galley_center_y, modal_dialog,
+    pill, primary_btn, soft_btn, styled_input, styled_multiline,
 };
 use crate::{ConnState, GameAccelApp, NodeEditorState, ProbeState};
 use chrono::Local;
@@ -269,20 +269,24 @@ impl GameAccelApp {
                                 .size(FONT_BODY)
                                 .color(p.text_secondary),
                         );
-                        ui.horizontal(|ui| {
-                            styled_input(
-                                ui,
-                                &mut ed.token,
-                                "粘贴鉴权 Token",
-                                254.0,
-                                !ed.show_token,
-                                p,
-                            );
-                            let lbl = if ed.show_token { "隐藏" } else { "显示" };
-                            if chip_btn(ui, lbl, p, false).clicked() {
-                                ed.show_token = !ed.show_token;
-                            }
-                        });
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(310.0, 30.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                styled_input(
+                                    ui,
+                                    &mut ed.token,
+                                    "粘贴鉴权 Token",
+                                    254.0,
+                                    !ed.show_token,
+                                    p,
+                                );
+                                let lbl = if ed.show_token { "隐藏" } else { "显示" };
+                                if chip_btn(ui, lbl, p, false).clicked() {
+                                    ed.show_token = !ed.show_token;
+                                }
+                            },
+                        );
                         ui.end_row();
 
                         ui.label(
@@ -490,19 +494,33 @@ impl GameAccelApp {
                                         pill(ui, &format!("{ms} ms"), bg, fg);
                                     }
                                     ProbeState::Err(err_msg) => {
-                                        Frame::new()
-                                            .fill(p.danger_soft)
-                                            .corner_radius(CornerRadius::same(10))
-                                            .inner_margin(Margin::symmetric(8, 3))
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    RichText::new("超时")
-                                                        .size(FONT_XS)
-                                                        .strong()
-                                                        .color(p.danger_text),
-                                                )
-                                                .on_hover_text(err_msg);
-                                            });
+                                        let galley = ui.fonts(|f| {
+                                            f.layout_no_wrap(
+                                                "超时".to_string(),
+                                                FontId::proportional(FONT_XS),
+                                                p.danger_text,
+                                            )
+                                        });
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(galley.size().x + 14.0, 20.0),
+                                            Sense::hover(),
+                                        );
+                                        let painter = ui.painter();
+                                        painter.rect_filled(
+                                            rect,
+                                            CornerRadius::same(6),
+                                            p.danger_soft,
+                                        );
+                                        let ty = galley_center_y(rect, &galley);
+                                        painter.galley(
+                                            egui::Pos2::new(
+                                                rect.center().x - galley.size().x * 0.5,
+                                                ty,
+                                            ),
+                                            galley,
+                                            p.danger_text,
+                                        );
+                                        resp.on_hover_text(err_msg);
                                     }
                                 }
                             }
@@ -554,7 +572,7 @@ impl GameAccelApp {
                                 parts.push(format!("Brutal {}M", node.brutal_mbps));
                             }
                             ui.label(
-                                RichText::new(parts.join("  ·  "))
+                                RichText::new(parts.join(" · "))
                                     .size(FONT_SM)
                                     .monospace()
                                     .color(p.text_muted),

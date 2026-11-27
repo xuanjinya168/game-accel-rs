@@ -70,6 +70,34 @@ impl GameAccelApp {
             aligned_row(ui, 34.0, |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.label(
+                    RichText::new("自定义分流规则")
+                        .size(FONT_BODY)
+                        .strong()
+                        .color(p.text_primary),
+                );
+                let enabled_cnt = self.cfg.custom_rules.iter().filter(|r| r.enabled).count();
+                let desc = if enabled_cnt > 0 {
+                    format!("已启用 {enabled_cnt} 条（优先级高于内置规则）")
+                } else {
+                    "可针对慢站点单独指定「直连 / 国内节点 / 主节点」".to_string()
+                };
+                let max_desc_w = (ui.available_width() - 104.0).max(80.0);
+                let shown_desc = elide_text(ui, &desc, FontId::proportional(FONT_SM), max_desc_w);
+                ui.label(RichText::new(shown_desc).size(FONT_SM).color(p.text_muted))
+                    .on_hover_text(desc);
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if crate::widgets::chip_btn(ui, "管理规则 ›", p, false).clicked() {
+                        self.open_custom_rules_modal();
+                    }
+                });
+            });
+
+            hairline_divider(ui, p);
+
+            aligned_row(ui, 34.0, |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
                     RichText::new("运行权限")
                         .size(FONT_BODY)
                         .strong()
@@ -196,9 +224,23 @@ impl GameAccelApp {
 
             if self.cfg.show_floating_pill {
                 aligned_row(ui, 32.0, |ui| {
-                    ui.add_space(10.0);
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.add_space(6.0);
+                    // Crisp vector L-branch connector aligned optically to sub-label centerline
+                    let (br, _) = ui.allocate_exact_size(Vec2::new(10.0, 18.0), egui::Sense::hover());
+                    let s = egui::Stroke::new(1.25_f32, p.border_strong);
+                    let x0 = br.left() + 2.0;
+                    let cy = br.center().y;
+                    ui.painter().line_segment(
+                        [egui::Pos2::new(x0, br.top() + 1.0), egui::Pos2::new(x0, cy)],
+                        s,
+                    );
+                    ui.painter().line_segment(
+                        [egui::Pos2::new(x0, cy), egui::Pos2::new(br.right(), cy)],
+                        s,
+                    );
                     ui.label(
-                        RichText::new("└ 悬浮窗呼吸灯效")
+                        RichText::new("悬浮窗呼吸灯效")
                             .size(FONT_SM)
                             .color(p.text_secondary),
                     );

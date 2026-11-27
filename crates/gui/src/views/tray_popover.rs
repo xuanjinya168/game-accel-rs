@@ -7,7 +7,8 @@ use crate::tray::{
     prepare_popup_window, reveal_popup_window, wake_window,
 };
 use crate::widgets::{
-    accent_chip_btn, aligned_row, chip_btn, elide_text, hairline_divider, pill, segmented_control,
+    accent_chip_btn, aligned_row, chip_btn, elide_text, galley_center_y, hairline_divider, pill,
+    segmented_control, styled_input_exact,
 };
 use crate::{ConnState, GameAccelApp, NavTab, ProbeState};
 use eframe::egui::{
@@ -429,10 +430,11 @@ impl GameAccelApp {
                                         fg,
                                     )
                                 });
+                                let btn_ty = galley_center_y(btn_rect, &btn_galley);
                                 ui.painter().galley(
                                     Pos2::new(
                                         btn_rect.center().x - btn_galley.size().x * 0.5,
-                                        btn_rect.center().y - btn_galley.size().y * 0.5,
+                                        btn_ty,
                                     ),
                                     btn_galley,
                                     fg,
@@ -528,20 +530,15 @@ impl GameAccelApp {
 
                         // Search bar only when > 5 nodes (exact 28px height)
                         if node_count > 5 {
-                            Frame::new()
-                                .fill(p.bg_input)
-                                .stroke(Stroke::new(1.0_f32, p.border_subtle))
-                                .corner_radius(CornerRadius::same(7))
-                                .inner_margin(Margin::symmetric(8, 5))
-                                .show(ui, |ui| {
-                                    ui.add_sized(
-                                        Vec2::new(ui.available_width(), 18.0),
-                                        egui::TextEdit::singleline(&mut self.tray_popover_search)
-                                            .frame(false)
-                                            .font(FontId::proportional(FONT_SM))
-                                            .hint_text("筛选节点…"),
-                                    );
-                                });
+                            styled_input_exact(
+                                ui,
+                                &mut self.tray_popover_search,
+                                "筛选节点…",
+                                Vec2::new(ui.available_width(), 28.0),
+                                FONT_SM,
+                                false,
+                                p,
+                            );
                         }
 
                         // Snug node list (exact list_h height, pixel-accurate elision)
@@ -657,12 +654,9 @@ impl GameAccelApp {
                                                     )
                                                 });
                                                 let rtt_w = rtt_galley.size().x;
+                                                let rtt_y = galley_center_y(rect, &rtt_galley);
                                                 ui.painter().galley(
-                                                    Pos2::new(
-                                                        rect.right() - 10.0 - rtt_w,
-                                                        rect.center().y
-                                                            - rtt_galley.size().y * 0.5,
-                                                    ),
+                                                    Pos2::new(rect.right() - 10.0 - rtt_w, rtt_y),
                                                     rtt_galley,
                                                     rtt_col,
                                                 );
@@ -687,12 +681,9 @@ impl GameAccelApp {
                                                         name_col,
                                                     )
                                                 });
+                                                let name_y = galley_center_y(rect, &name_galley);
                                                 ui.painter().galley(
-                                                    Pos2::new(
-                                                        rect.left() + 21.0,
-                                                        rect.center().y
-                                                            - name_galley.size().y * 0.5,
-                                                    ),
+                                                    Pos2::new(rect.left() + 21.0, name_y),
                                                     name_galley,
                                                     name_col,
                                                 );

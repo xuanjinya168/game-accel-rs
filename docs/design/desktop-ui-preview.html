@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GameAccel v0.3.7 桌面端交互式设计规范（自包含离线预览）</title>
+  <title>GameAccel v0.3.8 桌面端交互式设计规范（自包含离线预览）</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; }
@@ -853,6 +853,121 @@
       color: var(--page-ink);
     }
 
+    /* Custom Split-Routing Rules Entry & Modal */
+    .hero-rule-link {
+      font-size: 11px;
+      color: var(--c-cta-ink);
+      padding: 1px 4px;
+      border-radius: 4px;
+      transition: background 0.12s;
+    }
+    .hero-rule-link:hover { background: var(--c-cta-soft); }
+    .hero-rule-link.empty { color: var(--c-muted); }
+
+    .cr-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(15, 15, 14, 0.44);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 35;
+    }
+    .cr-modal {
+      width: 590px;
+      max-height: 492px;
+      background: var(--c-surface);
+      border: 1px solid var(--c-border-strong);
+      border-radius: 12px;
+      box-shadow: var(--c-pop-shadow);
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .cr-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .cr-add-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .cr-list {
+      max-height: 196px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      padding-right: 2px;
+    }
+    .cr-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      background: var(--c-well);
+      border: 1px solid var(--c-border);
+      min-height: 36px;
+    }
+    .cr-row.off { opacity: 0.56; }
+    .cr-kind {
+      font-size: 10.5px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--c-surface);
+      border: 1px solid var(--c-border);
+      color: var(--c-ink-2);
+      flex-shrink: 0;
+    }
+    .cr-act-btn {
+      height: 22px;
+      padding: 0 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid transparent;
+      flex-shrink: 0;
+    }
+    .cr-act-btn.direct { background: var(--c-well); color: var(--c-ink); border-color: var(--c-border-strong); }
+    .cr-act-btn.domestic { background: var(--c-ok-soft); color: var(--c-ok); border-color: rgba(21,122,80,0.32); }
+    .cr-act-btn.primary { background: var(--c-cta-soft); color: var(--c-cta-ink); border-color: rgba(217,119,87,0.35); }
+    .cr-bulk {
+      width: 100%;
+      height: 190px;
+      resize: none;
+      padding: 9px 11px;
+      border-radius: 8px;
+      border: 1px solid var(--c-border-strong);
+      background: var(--c-well);
+      color: var(--c-ink);
+      font-family: Consolas, ui-monospace, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      outline: none;
+    }
+    .cr-bulk:focus { border-color: var(--c-cta); }
+    .cr-test-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 8px;
+      background: var(--c-well);
+      border: 1px solid var(--c-border);
+    }
+    .cr-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding-top: 2px;
+    }
+
     /* Toast Overlay inside main window */
     .toast-pill {
       position: absolute;
@@ -990,6 +1105,7 @@
                 </span>
                 <span id="heroTimer" class="mono slot-lock" style="font-size:12px;color:var(--c-muted);">00:18:42</span>
                 <span id="heroProtoBadge" class="pill pill-muted mono">GACL · 双通道</span>
+                <button id="heroRuleLink" class="hero-rule-link" onclick="openRulesModal()" title="管理自定义域名 / IP 分流规则（优先级高于内置规则，热生效）">规则 3 ›</button>
               </div>
               <h2 id="heroNodeTitle" class="hero-title truncate">默认主力节点 (www.goldpeak.top)</h2>
               <p id="heroFeedbackLine" class="hero-desc truncate">已接管全局虚拟网卡 (Wintun) · 大陆网站直连，海外与游戏流量走加速隧道</p>
@@ -1136,6 +1252,14 @@
               <div class="hairline"></div>
               <div class="set-row">
                 <div style="display:flex;align-items:center;gap:10px;">
+                  <span style="font-size:13px;">自定义分流规则</span>
+                  <span id="setRulesCount" style="font-size:12px;color:var(--c-muted);">已启用 3 条（共 3 条）· 优先级最高，热生效</span>
+                </div>
+                <button class="chip-btn" onclick="openRulesModal()">管理规则 ›</button>
+              </div>
+              <div class="hairline"></div>
+              <div class="set-row">
+                <div style="display:flex;align-items:center;gap:10px;">
                   <span style="font-size:13px;">运行权限</span>
                   <span style="font-size:12px;color:var(--c-ok);">已获管理员权限（支持 TUN 全局网卡）</span>
                 </div>
@@ -1188,7 +1312,7 @@
             <div class="bento-card set-card">
               <div class="set-row">
                 <div style="display:flex;align-items:center;gap:10px;">
-                  <span style="font-size:13px;">当前版本 v0.3.7</span>
+                  <span style="font-size:13px;">当前版本 v0.3.8</span>
                   <span style="font-size:12px;color:var(--c-muted);">已是最新</span>
                 </div>
                 <div style="display:flex;gap:6px;">
@@ -1328,6 +1452,59 @@
             </div>
           </div>
         </main>
+      </div>
+
+      <!-- Custom Split-Routing Rules Modal -->
+      <div id="rulesModalBackdrop" class="cr-backdrop hidden" onclick="if(event.target===this)closeRulesModal()">
+        <div class="cr-modal">
+          <div class="cr-head">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="font-size:15px;font-weight:600;">自定义分流规则</span>
+              <span id="crHeadCount" class="pill pill-ok">3 条生效</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <div id="crTabSeg" class="seg" style="width:132px;height:26px;grid-template-columns:1fr 1fr;">
+                <button onclick="setRulesTab('list')" data-v="list" class="active">列表</button>
+                <button onclick="setRulesTab('bulk')" data-v="bulk">批量文本</button>
+              </div>
+              <button class="chip-btn" style="height:26px;padding:0 8px;" onclick="closeRulesModal()">×</button>
+            </div>
+          </div>
+
+          <div id="crListPane" style="display:flex;flex-direction:column;gap:8px;">
+            <div class="cr-add-row">
+              <input id="crNewInput" class="styled-input mono" style="flex:1;" placeholder="域名 / full:精确域名 / IP / CIDR" oninput="renderRulesModal()" onkeydown="if(event.key==='Enter')addDraftRule()" />
+              <span id="crAutoKind" class="cr-kind hidden"></span>
+              <div id="crActionSeg" class="seg" style="width:168px;height:28px;grid-template-columns:repeat(3,1fr);flex-shrink:0;">
+                <button onclick="setNewRuleAction('direct')" data-v="direct">直连</button>
+                <button onclick="setNewRuleAction('domestic')" data-v="domestic" class="active">国内节点</button>
+                <button onclick="setNewRuleAction('primary')" data-v="primary">主节点</button>
+              </div>
+              <button class="btn-primary" style="height:28px;padding:0 12px;flex-shrink:0;" onclick="addDraftRule()">+ 添加</button>
+            </div>
+            <div id="crErrorLine" class="hidden" style="font-size:11.5px;color:var(--c-err);"></div>
+            <div id="crRowsBox" class="cr-list scroll"></div>
+          </div>
+
+          <div id="crBulkPane" class="hidden" style="display:flex;flex-direction:column;gap:6px;">
+            <textarea id="crBulkArea" class="cr-bulk scroll" spellcheck="false" placeholder="每行一条：目标, direct | domestic | primary（# 注释，! 暂停）" oninput="st.rulesBulkText=this.value;renderRuleTest()"></textarea>
+            <div id="crBulkErr" class="hidden" style="font-size:11.5px;color:var(--c-err);"></div>
+          </div>
+
+          <div class="cr-test-bar">
+            <span style="font-size:11.5px;color:var(--c-ink-2);flex-shrink:0;">命中测试</span>
+            <input id="crTestInput" class="styled-input mono" style="width:200px;height:26px;" placeholder="输入域名或 IP 测出口…" oninput="st.rulesTestInput=this.value;renderRuleTest()" />
+            <div id="crTestResult" style="font-size:11.5px;color:var(--c-muted);min-width:0;flex:1;" class="truncate"></div>
+          </div>
+
+          <div class="cr-foot">
+            <span id="crFootHint" style="font-size:11px;color:var(--c-muted);">点击出口标签可循环切换</span>
+            <div style="display:flex;gap:8px;">
+              <button class="chip-btn" onclick="closeRulesModal()">取消</button>
+              <button class="btn-primary" onclick="saveRulesModal()">保存并生效</button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- Toast Feedback -->
@@ -1515,6 +1692,18 @@
       txHist: [1.0, 1.3, 1.1, 1.6, 1.9, 2.2, 1.5, 1.3, 1.8, 2.3, 1.9, 1.4, 1.2, 1.5, 1.3, 1.24],
       rttHist: [26, 27, 25, 26, 28, 27, 26, 25, 26, 27, 26, 25, 26, 27, 26, 26],
       secRttHist: [14, 15, 13, 14, 15, 14, 14, 13, 14, 15, 14, 14, 15, 13, 14, 14],
+      customRules: [
+        { pattern: 'steampowered.com', action: 'domestic', enabled: true },
+        { pattern: 'full:dl.google.com', action: 'direct', enabled: true },
+        { pattern: '104.16.0.0/16', action: 'direct', enabled: true },
+      ],
+      rulesModalOpen: false,
+      rulesDraft: [],
+      rulesTab: 'list',
+      rulesNewAction: 'domestic',
+      rulesBulkText: '',
+      rulesTestInput: '',
+      rulesError: '',
     };
 
     let toastTimer = null;
@@ -1602,6 +1791,306 @@
       renderAdmin();
     }
     function setAdminProto(p) { st.adminProto = p; renderAdminLogs(); }
+
+    const RULE_ACTION_META = {
+      direct: { label: '直连', next: 'domestic' },
+      domestic: { label: '国内节点', next: 'primary' },
+      primary: { label: '主节点', next: 'direct' },
+    };
+
+    function escHtml(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function parseIpv4Int(s) {
+      const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+      if (!m) return null;
+      let v = 0;
+      for (let i = 1; i <= 4; i++) {
+        const o = Number(m[i]);
+        if (o < 0 || o > 255) return null;
+        v = ((v << 8) | o) >>> 0;
+      }
+      return v;
+    }
+
+    function normalizeRulePattern(raw) {
+      let s = (raw || '').trim().toLowerCase();
+      if (!s) return { ok: false, err: '请输入域名、IP 或 CIDR 网段' };
+      let exact = false;
+      if (s.startsWith('full:')) { exact = true; s = s.slice(5).trim(); }
+      else if (s.startsWith('domain:')) { s = s.slice(7).trim(); }
+      if (s.includes('://')) s = s.split('://')[1];
+      const hasCidr = /^\d+\.\d+\.\d+\.\d+\/\d+$/.test(s);
+      if (hasCidr && !exact) {
+        const [ipStr, pStr] = s.split('/');
+        const ip = parseIpv4Int(ipStr);
+        const p = Number(pStr);
+        if (ip !== null && Number.isInteger(p) && p >= 0 && p <= 32) {
+          return { ok: true, pattern: `${ipStr}/${p}`, kind: 'IP段' };
+        }
+        return { ok: false, err: 'CIDR 格式无效（示例：104.16.0.0/16）' };
+      }
+      s = s.split('/')[0];
+      const hostOnly = s.includes(':') && /^\d+\.\d+\.\d+\.\d+:\d+$/.test(s) ? s.split(':')[0] : s;
+      if (!exact && parseIpv4Int(hostOnly) !== null) {
+        return { ok: true, pattern: `${hostOnly}/32`, kind: 'IP' };
+      }
+      const dom = s.split(':')[0].replace(/^\*\./, '').replace(/^\.+|\.+$/g, '');
+      const labels = dom.split('.');
+      const validDom = labels.length >= 2 && labels.every(l => l.length > 0 && l.length <= 63 && !l.startsWith('-') && !l.endsWith('-') && /^[a-z0-9-]+$/.test(l)) && !labels.every(l => /^\d+$/.test(l));
+      if (!validDom) {
+        return { ok: false, err: '域名或 IP 格式无效（示例：steampowered.com 或 104.16.0.0/16）' };
+      }
+      return { ok: true, pattern: exact ? `full:${dom}` : dom, kind: exact ? '精确域名' : '域名后缀' };
+    }
+
+    function detectRuleKind(pat) {
+      if (pat.startsWith('full:')) return '精确域名';
+      if (pat.endsWith('/32')) return 'IP';
+      if (pat.includes('/')) return 'IP段';
+      return '域名后缀';
+    }
+
+    function formatBulkRules(list) {
+      return list.map(r => `${r.enabled ? '' : '!'}${r.pattern}, ${r.action}`).join('\n');
+    }
+
+    function parseBulkRules(text) {
+      const out = [];
+      const lines = (text || '').split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim();
+        if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+        let enabled = true;
+        if (line.startsWith('!')) { enabled = false; line = line.slice(1).trim(); }
+        if (!line) continue;
+        const parts = line.split(/[,\s]+/).filter(Boolean);
+        if (parts.length < 2) return { ok: false, err: `第 ${i + 1} 行缺少出口动作（direct / domestic / primary）` };
+        const norm = normalizeRulePattern(parts[0]);
+        if (!norm.ok) return { ok: false, err: `第 ${i + 1} 行：${norm.err}` };
+        const tok = parts[1].toLowerCase();
+        const act = ({ direct: 'direct', '直连': 'direct', domestic: 'domestic', cn: 'domestic', '国内': 'domestic', '国内节点': 'domestic', primary: 'primary', proxy: 'primary', '主节点': 'primary', '代理': 'primary' })[tok];
+        if (!act) return { ok: false, err: `第 ${i + 1} 行未知出口「${parts[1]}」` };
+        out.push({ pattern: norm.pattern, action: act, enabled });
+      }
+      return { ok: true, rules: out };
+    }
+
+    function openRulesModal() {
+      st.rulesModalOpen = true;
+      st.rulesDraft = st.customRules.map(r => ({ ...r }));
+      st.rulesTab = 'list';
+      st.rulesBulkText = formatBulkRules(st.rulesDraft);
+      st.rulesError = '';
+      document.getElementById('crNewInput').value = '';
+      document.getElementById('crTestInput').value = st.rulesTestInput;
+      document.getElementById('rulesModalBackdrop').classList.remove('hidden');
+      renderRulesModal();
+    }
+
+    function closeRulesModal() {
+      st.rulesModalOpen = false;
+      document.getElementById('rulesModalBackdrop').classList.add('hidden');
+    }
+
+    function setRulesTab(tab) {
+      if (tab === st.rulesTab) return;
+      if (tab === 'bulk') {
+        st.rulesBulkText = formatBulkRules(st.rulesDraft);
+        document.getElementById('crBulkArea').value = st.rulesBulkText;
+        st.rulesError = '';
+      } else {
+        const parsed = parseBulkRules(st.rulesBulkText);
+        if (!parsed.ok) {
+          st.rulesError = parsed.err;
+          renderRulesModal();
+          return;
+        }
+        st.rulesDraft = parsed.rules;
+        st.rulesError = '';
+      }
+      st.rulesTab = tab;
+      renderRulesModal();
+    }
+
+    function setNewRuleAction(act) {
+      st.rulesNewAction = act;
+      renderRulesModal();
+    }
+
+    function addDraftRule() {
+      const inp = document.getElementById('crNewInput');
+      const res = normalizeRulePattern(inp.value);
+      if (!res.ok) {
+        st.rulesError = res.err;
+        renderRulesModal();
+        return;
+      }
+      st.rulesError = '';
+      const idx = st.rulesDraft.findIndex(r => r.pattern === res.pattern);
+      if (idx >= 0) {
+        st.rulesDraft[idx].action = st.rulesNewAction;
+        st.rulesDraft[idx].enabled = true;
+      } else {
+        st.rulesDraft.unshift({ pattern: res.pattern, action: st.rulesNewAction, enabled: true });
+      }
+      inp.value = '';
+      renderRulesModal();
+    }
+
+    function toggleDraftRule(i) {
+      if (!st.rulesDraft[i]) return;
+      st.rulesDraft[i].enabled = !st.rulesDraft[i].enabled;
+      renderRulesModal();
+    }
+
+    function cycleDraftAction(i) {
+      if (!st.rulesDraft[i]) return;
+      st.rulesDraft[i].action = RULE_ACTION_META[st.rulesDraft[i].action].next;
+      renderRulesModal();
+    }
+
+    function removeDraftRule(i) {
+      st.rulesDraft.splice(i, 1);
+      renderRulesModal();
+    }
+
+    function saveRulesModal() {
+      let finalRules = st.rulesDraft;
+      if (st.rulesTab === 'bulk') {
+        const parsed = parseBulkRules(st.rulesBulkText);
+        if (!parsed.ok) {
+          st.rulesError = parsed.err;
+          renderRulesModal();
+          return;
+        }
+        finalRules = parsed.rules;
+      }
+      st.customRules = finalRules.map(r => ({ ...r }));
+      closeRulesModal();
+      renderAll();
+      const onCnt = st.customRules.filter(r => r.enabled).length;
+      toast(`已应用 ${onCnt} 条自定义规则（无需重连，热生效）`);
+    }
+
+    function evalRuleTest() {
+      const q = (st.rulesTestInput || '').trim().toLowerCase();
+      if (!q) return null;
+      if (st.route === 'global') return { action: 'primary', source: '全局代理模式（不经过分流规则）' };
+      if (st.route === 'direct') return { action: 'direct', source: '纯直连模式（不经过分流规则）' };
+      let activeList = st.rulesDraft;
+      if (st.rulesTab === 'bulk') {
+        const parsed = parseBulkRules(st.rulesBulkText);
+        if (!parsed.ok) return { err: parsed.err };
+        activeList = parsed.rules;
+      }
+      const qIp = parseIpv4Int(q);
+      for (const r of activeList) {
+        if (!r.enabled) continue;
+        if (qIp !== null && r.pattern.includes('/')) {
+          const [ipS, pS] = r.pattern.split('/');
+          const net = parseIpv4Int(ipS);
+          const p = Number(pS);
+          const mask = p === 0 ? 0 : (0xFFFFFFFF << (32 - p)) >>> 0;
+          if (net !== null && ((qIp & mask) >>> 0) === ((net & mask) >>> 0)) {
+            return { action: r.action, source: `自定义规则 ${r.pattern}` };
+          }
+        } else if (qIp === null) {
+          if (r.pattern.startsWith('full:') && q === r.pattern.slice(5)) {
+            return { action: r.action, source: `自定义精确规则 ${r.pattern}` };
+          }
+          if (!r.pattern.startsWith('full:') && !r.pattern.includes('/') && (q === r.pattern || q.endsWith('.' + r.pattern))) {
+            return { action: r.action, source: `自定义后缀规则 ${r.pattern}` };
+          }
+        }
+      }
+      if (q.endsWith('.cn') || q.includes('baidu') || q.includes('qq.com') || q.includes('bilibili')) {
+        return { action: st.route === 'dual' ? 'domestic' : 'direct', source: '内置国内域名表' };
+      }
+      return { action: 'primary', source: '默认海外代理策略' };
+    }
+
+    function renderRuleTest() {
+      const box = document.getElementById('crTestResult');
+      if (!box) return;
+      const res = evalRuleTest();
+      if (!res) {
+        box.style.color = 'var(--c-muted)';
+        const modeLbl = ({ rule: '大陆直连', dual: '双节点分流', global: '全局代理', direct: '纯直连' })[st.route] || st.route;
+        box.textContent = `当前：${modeLbl}`;
+        return;
+      }
+      if (res.err) {
+        box.style.color = 'var(--c-err)';
+        box.textContent = res.err;
+        return;
+      }
+      const fallback = res.action === 'domestic' && st.route !== 'dual';
+      const lbl = fallback ? '直连（回落）' : RULE_ACTION_META[res.action].label;
+      const col = fallback ? 'var(--c-warn)' : (res.action === 'direct' ? 'var(--c-ink)' : (res.action === 'domestic' ? 'var(--c-ok)' : 'var(--c-cta-ink)'));
+      box.style.color = 'var(--c-ink-2)';
+      box.innerHTML = `<strong style="color:${col};font-weight:600;">→ ${lbl}</strong> · ${escHtml(res.source)}`;
+    }
+
+    function renderRulesModal() {
+      if (!st.rulesModalOpen) return;
+      paintSeg('crTabSeg', st.rulesTab);
+      paintSeg('crActionSeg', st.rulesNewAction);
+      document.getElementById('crListPane').classList.toggle('hidden', st.rulesTab !== 'list');
+      document.getElementById('crBulkPane').classList.toggle('hidden', st.rulesTab !== 'bulk');
+      const headCnt = document.getElementById('crHeadCount');
+      const onCnt = st.rulesDraft.filter(r => r.enabled).length;
+      if (headCnt) {
+        headCnt.textContent = `${onCnt} 条生效`;
+        headCnt.classList.toggle('hidden', onCnt === 0);
+      }
+      const footHint = document.getElementById('crFootHint');
+      if (footHint) {
+        footHint.style.visibility = (st.rulesTab === 'list' && st.rulesDraft.length > 0) ? 'visible' : 'hidden';
+      }
+
+      const newVal = (document.getElementById('crNewInput').value || '').trim();
+      const autoPill = document.getElementById('crAutoKind');
+      if (newVal) {
+        const res = normalizeRulePattern(newVal);
+        autoPill.textContent = res.ok ? res.kind : '格式待完善';
+        autoPill.classList.remove('hidden');
+      } else {
+        autoPill.classList.add('hidden');
+      }
+
+      const errEl = document.getElementById(st.rulesTab === 'list' ? 'crErrorLine' : 'crBulkErr');
+      document.getElementById('crErrorLine').classList.add('hidden');
+      document.getElementById('crBulkErr').classList.add('hidden');
+      if (st.rulesError) {
+        errEl.textContent = st.rulesError;
+        errEl.classList.remove('hidden');
+      }
+
+      const rowsBox = document.getElementById('crRowsBox');
+      if (st.rulesDraft.length === 0) {
+        rowsBox.innerHTML = `<div style="text-align:center;padding:24px 0;font-size:12px;color:var(--c-muted);">暂无自定义规则</div>`;
+      } else {
+        rowsBox.innerHTML = st.rulesDraft.map((r, i) => {
+          const fallback = r.action === 'domestic' && st.route !== 'dual';
+          return `
+            <div class="cr-row ${r.enabled ? '' : 'off'}">
+              <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1;">
+                <input type="checkbox" ${r.enabled ? 'checked' : ''} onchange="toggleDraftRule(${i})" style="accent-color:var(--c-cta);cursor:pointer;" />
+                <span class="cr-kind">${detectRuleKind(r.pattern)}</span>
+                <span class="mono truncate" style="font-size:12px;${r.enabled ? '' : 'text-decoration:line-through;'}">${escHtml(r.pattern)}</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+                ${fallback ? `<span style="font-size:10.5px;color:var(--c-warn);" title="当前为非双节点模式，国内节点规则将自动回落为直连">→直连</span>` : ''}
+                <button class="cr-act-btn ${r.action}" onclick="cycleDraftAction(${i})" title="点击循环切换出口">${RULE_ACTION_META[r.action].label}</button>
+                <button class="chip-btn" style="height:22px;padding:0 7px;font-size:11px;" onclick="removeDraftRule(${i})" title="删除规则">×</button>
+              </div>
+            </div>`;
+        }).join('');
+      }
+      renderRuleTest();
+    }
 
     function paintSeg(id, val) {
       const box = document.getElementById(id);
@@ -1759,6 +2248,18 @@
       document.getElementById('heroNodeTitle').textContent = active.name;
       document.getElementById('heroNodeTitle').title = active.name;
       document.getElementById('heroProtoBadge').textContent = `${active.proto} · 双通道`;
+      const onRules = st.customRules.filter(r => r.enabled).length;
+      const heroRuleEl = document.getElementById('heroRuleLink');
+      if (heroRuleEl) {
+        heroRuleEl.textContent = onRules > 0 ? `规则 ${onRules} ›` : '自定义规则 ›';
+        heroRuleEl.classList.toggle('empty', onRules === 0);
+      }
+      const setRuleEl = document.getElementById('setRulesCount');
+      if (setRuleEl) {
+        setRuleEl.textContent = st.customRules.length > 0
+          ? `已启用 ${onRules} 条（共 ${st.customRules.length} 条）· 优先级最高，热生效`
+          : '未配置规则 · 优先级高于内置列表，支持热生效';
+      }
 
       const takeDesc = {
         tun: '已接管全局虚拟网卡 (Wintun)',

@@ -152,6 +152,10 @@ pub(crate) struct GameAccelApp {
     pub(crate) session_id: u64,
     /// Live split-routing mode shared with the running session (no reconnect needed).
     pub(crate) route_mode_cell: Arc<client::rules::RouteModeCell>,
+    /// Live highest-priority custom split-routing rules shared with the running session.
+    pub(crate) custom_rules_cell: Arc<client::rules::CustomRulesCell>,
+    /// Custom split-routing rules editor modal state.
+    pub(crate) custom_rules_modal: Option<views::custom_rules::CustomRulesModalState>,
     /// Which domestic node ID was actually dialled for the current session (None if not in Dual or same as primary).
     pub(crate) session_secondary_node_id: Option<String>,
 
@@ -259,9 +263,12 @@ impl GameAccelApp {
             ..AdminState::default()
         };
 
+        let custom_rules_cell = client::rules::CustomRulesCell::new(&cfg.custom_rules);
         let mut app = Self {
             rt,
             route_mode_cell: client::rules::RouteModeCell::new(cfg.route_mode),
+            custom_rules_cell,
+            custom_rules_modal: None,
             session_secondary_node_id: None,
             cfg,
             active_tab: NavTab::Dashboard,
@@ -465,31 +472,40 @@ impl GameAccelApp {
             .pivot(egui::Align2::CENTER_BOTTOM)
             .fixed_pos(anchor_pos)
             .show(ctx, |ui| {
-                let frame_resp = Frame::new()
-                    .fill(bg)
-                    .stroke(Stroke::new(1.0_f32, border))
-                    .corner_radius(CornerRadius::same(18))
-                    .inner_margin(Margin::symmetric(14, 8))
-                    .shadow(egui::Shadow {
+                let max_txt_w = (right_rect.width() - 80.0).max(120.0);
+                let shown_msg = widgets::elide_text(
+                    ui,
+                    &msg,
+                    egui::FontId::proportional(theme::FONT_SM),
+                    max_txt_w,
+                );
+                let galley = ui.fonts(|f| {
+                    f.layout_no_wrap(shown_msg, egui::FontId::proportional(theme::FONT_SM), text_col)
+                });
+                let pill_w = (14.0 + 7.0 + 8.0 + galley.size().x + 16.0).min(right_rect.width() - 32.0);
+                let (rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(pill_w, 34.0), egui::Sense::click());
+                let painter = ui.painter();
+                painter.add(
+                    egui::Shadow {
                         offset: [0, 4],
                         blur: 14,
                         spread: 0,
                         color: Color32::from_black_alpha(shadow_alpha),
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            let (dot_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(7.0), egui::Sense::hover());
-                            ui.painter().circle_filled(dot_rect.center(), 3.5, dot);
-                            ui.label(
-                                egui::RichText::new(&msg)
-                                    .size(theme::FONT_SM)
-                                    .color(text_col),
-                            );
-                        });
-                    });
-                if frame_resp.response.interact(egui::Sense::click()).clicked() {
+                    }
+                    .as_shape(rect, CornerRadius::same(17)),
+                );
+                painter.rect(
+                    rect,
+                    CornerRadius::same(17),
+                    bg,
+                    Stroke::new(1.0_f32, border),
+                    egui::StrokeKind::Inside,
+                );
+                painter.circle_filled(Pos2::new(rect.left() + 17.5, rect.center().y), 3.5, dot);
+                let ty = widgets::galley_center_y(rect, &galley);
+                painter.galley(Pos2::new(rect.left() + 29.0, ty), galley, text_col);
+                if resp.clicked() {
                     dismissed = true;
                 }
             });
@@ -693,6 +709,7 @@ impl eframe::App for GameAccelApp {
         }
 
         self.render_tun_admin_prompt(ctx, p);
+        self.render_custom_rules_modal(ctx, p);
 
         self.render_tray_popover(ctx, p);
         self.render_floating_pill(ctx, p);

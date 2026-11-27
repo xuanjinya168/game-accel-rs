@@ -16,7 +16,9 @@ pub use quic::{resolve_server_addr, validate_server_addr};
 
 use crate::quic::{bind_tuned_udp_socket, build_client_config, unspecified_bind_for};
 use crate::relay::{ClientStats, UdpDispatchMap};
-use crate::rules::{DomesticEgress, DomesticEgressCell, RouteModeCell, Router, RuleData};
+use crate::rules::{
+    CustomRulesCell, DomesticEgress, DomesticEgressCell, RouteModeCell, Router, RuleData,
+};
 use crate::socks5::run_mixed_proxy_server;
 use crate::telemetry::JitterEstimator;
 use crate::tunnel::{TunnelSession, Tunnels};
@@ -63,6 +65,8 @@ pub struct ClientOptions {
     pub enable_tun: bool,
     /// Split-routing mode, shared live with the UI (applies to new connections).
     pub route_mode: Arc<RouteModeCell>,
+    /// Highest-priority user custom split-routing rules, hot-reloadable from the UI.
+    pub custom_rules: Arc<CustomRulesCell>,
     /// Optional directory whose `direct-list.txt` / `proxy-list.txt` / `geoip-cn.txt`
     /// override the embedded rule data.
     pub rules_dir: Option<std::path::PathBuf>,
@@ -303,15 +307,18 @@ pub async fn run_client_with_shutdown(
     let rule_data = tokio::task::spawn_blocking(move || RuleData::shared(rules_dir.as_deref()))
         .await
         .context("加载分流规则失败")?;
+    let custom_count = opts.custom_rules.snapshot().len();
     emit(format!(
-        "分流模式：{}（国内流量：{}；{}）",
+        "分流模式：{}（国内流量：{}；自定义规则 {} 条；{}）",
         opts.route_mode.get().label(),
         domestic_cell.get().label(),
+        custom_count,
         rule_data.summary(),
     ));
     let router = Arc::new(Router::new(
         opts.route_mode.clone(),
         domestic_cell.clone(),
+        opts.custom_rules.clone(),
         rule_data,
     ));
 
@@ -737,6 +744,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             enable_tun: false,
             route_mode: RouteModeCell::new(crate::rules::RouteMode::Rule),
+            custom_rules: CustomRulesCell::empty(),
             rules_dir: None,
         };
         let client = tokio::spawn(run_client_with_shutdown(opts, stats, None, rx));
@@ -945,6 +953,7 @@ mod tests {
             listen: free_port,
             enable_tun: false,
             route_mode: RouteModeCell::new(crate::rules::RouteMode::Global),
+            custom_rules: CustomRulesCell::empty(),
             rules_dir: None,
         };
         let client_stats = stats.clone();

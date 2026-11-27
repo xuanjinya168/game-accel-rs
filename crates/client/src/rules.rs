@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 const EMBEDDED_DIRECT: &str = include_str!("../data/direct-list.txt");
@@ -135,6 +135,495 @@ impl DomesticEgressCell {
     pub fn set(&self, egress: DomesticEgress) {
         self.0.store(egress as u8, Ordering::Relaxed);
     }
+}
+
+/// Explicit exit action for a user-defined highest-priority split-routing rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomRuleAction {
+    /// Always bypass tunnels and dial directly from this machine (even in `Dual` mode).
+    #[default]
+    Direct,
+    /// Route through the domestic (secondary) node in `Dual` mode; falls back to Direct otherwise.
+    Domestic,
+    /// Always route through the primary (foreign) node.
+    Primary,
+}
+
+impl CustomRuleAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            CustomRuleAction::Direct => "直连",
+            CustomRuleAction::Domestic => "国内节点",
+            CustomRuleAction::Primary => "主节点",
+        }
+    }
+
+    pub fn token(self) -> &'static str {
+        match self {
+            CustomRuleAction::Direct => "direct",
+            CustomRuleAction::Domestic => "domestic",
+            CustomRuleAction::Primary => "primary",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            CustomRuleAction::Direct => CustomRuleAction::Domestic,
+            CustomRuleAction::Domestic => CustomRuleAction::Primary,
+            CustomRuleAction::Primary => CustomRuleAction::Direct,
+        }
+    }
+
+    pub fn parse_token(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "direct" | "直连" => Some(Self::Direct),
+            "domestic" | "cn" | "secondary" | "国内" | "国内节点" => Some(Self::Domestic),
+            "primary" | "proxy" | "foreign" | "主节点" | "代理" => Some(Self::Primary),
+            _ => None,
+        }
+    }
+}
+
+fn default_rule_enabled() -> bool {
+    true
+}
+
+/// Serializable user-defined custom split-routing rule (persisted in GUI `config.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomRule {
+    /// Domain suffix (`steampowered.com`), exact (`full:dl.google.com`), IP (`45.67.89.10/32`),
+    /// or CIDR (`104.16.0.0/16` / `2606:4700::/32`).
+    pub pattern: String,
+    #[serde(default)]
+    pub action: CustomRuleAction,
+    #[serde(default = "default_rule_enabled")]
+    pub enabled: bool,
+}
+
+fn is_valid_domain_host(h: &str) -> bool {
+    if h.is_empty() || !h.contains('.') || h.len() > 253 {
+        return false;
+    }
+    let mut last_label = "";
+    for label in h.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+        last_label = label;
+    }
+    // Reject all-numeric pseudo-domains like `123.456.789.0`
+    !last_label.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl CustomRule {
+    /// Normalize user input:
+    /// - supports `full:` (exact domain), `domain:` / `*.` (domain suffix), bare IP, `IP:port`,
+    ///   CIDR (`ip/prefix`), and accidental `http(s)://.../path` URLs.
+    /// - Returns `None` if the input is empty or structurally invalid.
+    pub fn normalize_pattern(raw: &str) -> Option<String> {
+        let mut s = raw.trim().to_ascii_lowercase();
+        if s.is_empty() || s.contains(char::is_whitespace) {
+            return None;
+        }
+        let mut exact = false;
+        if let Some(rest) = s.strip_prefix("full:") {
+            exact = true;
+            s = rest.trim().to_string();
+        } else if let Some(rest) = s.strip_prefix("domain:") {
+            s = rest.trim().to_string();
+        }
+        if let Some(rest) = s
+            .strip_prefix("https://")
+            .or_else(|| s.strip_prefix("http://"))
+        {
+            s = rest.split('/').next().unwrap_or("").to_string();
+        }
+
+        if !exact {
+            // CIDR (`ip/prefix`)
+            if let Some((ip_s, len_s)) = s.split_once('/') {
+                let ip: IpAddr = ip_s.trim_matches(['[', ']']).parse().ok()?;
+                let len: u32 = len_s.parse().ok()?;
+                return match ip {
+                    IpAddr::V4(v4) if len <= 32 => Some(format!("{v4}/{len}")),
+                    IpAddr::V6(v6) if len <= 128 => Some(format!("{v6}/{len}")),
+                    _ => None,
+                };
+            }
+            // Bare IP or `IP:port` / `[IPv6]:port`
+            let bare_ip = s
+                .trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .ok()
+                .or_else(|| s.parse::<std::net::SocketAddr>().ok().map(|sa| sa.ip()));
+            if let Some(ip) = bare_ip {
+                return Some(match ip {
+                    IpAddr::V4(v4) => format!("{v4}/32"),
+                    IpAddr::V6(v6) => format!("{v6}/128"),
+                });
+            }
+        }
+
+        // Strip optional `:port`, wildcard `*.`, leading/trailing dots
+        let no_path = s.split('/').next().unwrap_or("");
+        let domain_only = no_path.split(':').next().unwrap_or("");
+        let stripped = domain_only
+            .strip_prefix("*.")
+            .unwrap_or(domain_only)
+            .trim_start_matches('.');
+        let h = normalize_host(stripped);
+        if !is_valid_domain_host(&h) {
+            return None;
+        }
+        if exact { Some(format!("full:{h}")) } else { Some(h) }
+    }
+
+    /// Human-readable classification badge for UI display.
+    pub fn kind_label(raw: &str) -> &'static str {
+        let Some(norm) = Self::normalize_pattern(raw) else {
+            return if raw.trim().is_empty() {
+                "自动识别"
+            } else {
+                "格式无效"
+            };
+        };
+        if norm.starts_with("full:") {
+            "精确域名"
+        } else if let Some((_, len)) = norm.split_once('/') {
+            if len == "32" || len == "128" {
+                "IP"
+            } else {
+                "CIDR"
+            }
+        } else {
+            "域名后缀"
+        }
+    }
+}
+
+/// Strictly parse bulk text rules, returning a line-numbered error on malformed entries.
+/// - `# ...` lines are comments; inline `# ...` comments are stripped.
+/// - Leading `!` marks a paused (`enabled = false`) rule so paused rules survive bulk round-trips.
+pub fn parse_bulk_custom_rules_checked(text: &str) -> Result<Vec<CustomRule>, String> {
+    let mut out = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        let content = trimmed.split('#').next().unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
+        let (enabled, body) = match content.strip_prefix('!') {
+            Some(rest) => (false, rest.trim()),
+            None => (true, content),
+        };
+        let mut parts = body
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|p| !p.is_empty());
+        let Some(raw_pat) = parts.next() else {
+            continue;
+        };
+        let Some(pattern) = CustomRule::normalize_pattern(raw_pat) else {
+            return Err(format!("第 {line_no} 行规则格式无效：「{raw_pat}」"));
+        };
+        let action = match parts.next() {
+            Some(tok) => CustomRuleAction::parse_token(tok).ok_or_else(|| {
+                format!("第 {line_no} 行出口动作无效：「{tok}」（支持 direct / domestic / primary）")
+            })?,
+            None => CustomRuleAction::Direct,
+        };
+        out.push(CustomRule {
+            pattern,
+            action,
+            enabled,
+        });
+    }
+    Ok(out)
+}
+
+/// Lenient bulk parser (skips invalid lines); kept for non-interactive callers.
+pub fn parse_bulk_custom_rules(text: &str) -> Vec<CustomRule> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Ok(mut parsed) = parse_bulk_custom_rules_checked(line) {
+            out.append(&mut parsed);
+        }
+    }
+    out
+}
+
+/// Format rules into editable bulk text (paused rules are prefixed with `!` to preserve state).
+pub fn format_bulk_custom_rules(rules: &[CustomRule]) -> String {
+    let mut lines = Vec::with_capacity(rules.len() + 2);
+    lines.push("# 格式: 域名或IP/CIDR, direct | domestic | primary（行首加 ! 表示暂停）".to_string());
+    lines.push("# 示例: steampowered.com, direct   或   45.67.89.10/32, domestic".to_string());
+    for r in rules {
+        let prefix = if r.enabled { "" } else { "!" };
+        lines.push(format!("{prefix}{}, {}", r.pattern, r.action.token()));
+    }
+    lines.join("\n")
+}
+
+#[derive(Debug, Clone)]
+enum CompiledMatcher {
+    DomainFull(String),
+    DomainSuffix(String),
+    Ipv4Range(u32, u32),
+    Ipv6Range(u128, u128),
+}
+
+#[derive(Debug, Clone)]
+struct CompiledCustomEntry {
+    pattern: String,
+    matcher: CompiledMatcher,
+    action: CustomRuleAction,
+}
+
+#[derive(Debug, Default)]
+pub struct CompiledCustomRules {
+    entries: Vec<CompiledCustomEntry>,
+}
+
+impl CompiledCustomRules {
+    pub fn compile(rules: &[CustomRule]) -> Self {
+        let mut entries = Vec::new();
+        for rule in rules {
+            if !rule.enabled {
+                continue;
+            }
+            let Some(pattern) = CustomRule::normalize_pattern(&rule.pattern) else {
+                continue;
+            };
+            let matcher = if let Some(exact) = pattern.strip_prefix("full:") {
+                CompiledMatcher::DomainFull(exact.to_string())
+            } else if let Some((ip_s, len_s)) = pattern.split_once('/') {
+                let Ok(ip) = ip_s.parse::<IpAddr>() else {
+                    continue;
+                };
+                let Ok(len) = len_s.parse::<u32>() else {
+                    continue;
+                };
+                match ip {
+                    IpAddr::V4(a) if len <= 32 => {
+                        let start = u32::from(a) & mask32(len);
+                        CompiledMatcher::Ipv4Range(start, start | !mask32(len))
+                    }
+                    IpAddr::V6(a) if len <= 128 => {
+                        let start = u128::from(a) & mask128(len);
+                        CompiledMatcher::Ipv6Range(start, start | !mask128(len))
+                    }
+                    _ => continue,
+                }
+            } else {
+                CompiledMatcher::DomainSuffix(pattern.clone())
+            };
+            entries.push(CompiledCustomEntry {
+                pattern,
+                matcher,
+                action: rule.action,
+            });
+        }
+        Self { entries }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// First matching enabled custom domain rule (top-to-bottom precedence).
+    pub fn match_domain(&self, host: &str) -> Option<(CustomRuleAction, &str)> {
+        for e in &self.entries {
+            let matched = match &e.matcher {
+                CompiledMatcher::DomainFull(exact) => host == exact,
+                CompiledMatcher::DomainSuffix(suf) => {
+                    host == suf
+                        || (host.len() > suf.len()
+                            && host.ends_with(suf.as_str())
+                            && host.as_bytes()[host.len() - suf.len() - 1] == b'.')
+                }
+                _ => false,
+            };
+            if matched {
+                return Some((e.action, e.pattern.as_str()));
+            }
+        }
+        None
+    }
+
+    /// First matching enabled custom IP / CIDR rule (top-to-bottom precedence).
+    pub fn match_ip(&self, ip: IpAddr) -> Option<(CustomRuleAction, &str)> {
+        for e in &self.entries {
+            let matched = match (&e.matcher, ip) {
+                (CompiledMatcher::Ipv4Range(s, end), IpAddr::V4(v4)) => {
+                    let v = u32::from(v4);
+                    v >= *s && v <= *end
+                }
+                (CompiledMatcher::Ipv4Range(s, end), IpAddr::V6(v6)) => v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| {
+                        let v = u32::from(v4);
+                        v >= *s && v <= *end
+                    }),
+                (CompiledMatcher::Ipv6Range(s, end), IpAddr::V6(v6)) => {
+                    let v = u128::from(v6);
+                    v >= *s && v <= *end
+                }
+                _ => false,
+            };
+            if matched {
+                return Some((e.action, e.pattern.as_str()));
+            }
+        }
+        None
+    }
+}
+
+/// Live, hot-reloadable custom split-routing rules shared between the UI and running `Router`.
+#[derive(Debug)]
+pub struct CustomRulesCell(RwLock<Arc<CompiledCustomRules>>);
+
+impl CustomRulesCell {
+    pub fn new(rules: &[CustomRule]) -> Arc<Self> {
+        Arc::new(Self(RwLock::new(Arc::new(CompiledCustomRules::compile(
+            rules,
+        )))))
+    }
+
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self(RwLock::new(Arc::new(CompiledCustomRules::default()))))
+    }
+
+    pub fn replace(&self, rules: &[CustomRule]) {
+        let compiled = Arc::new(CompiledCustomRules::compile(rules));
+        if let Ok(mut guard) = self.0.write() {
+            *guard = compiled;
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<CompiledCustomRules> {
+        self.0
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| Arc::new(CompiledCustomRules::default()))
+    }
+}
+
+/// Result of a synchronous route preview for the GUI live hit-tester.
+#[derive(Debug, Clone)]
+pub struct RoutePreview {
+    /// Human-readable description of which rule matched (e.g. `自定义 steampowered.com` or `内置代理表`).
+    pub source: String,
+    pub action: CustomRuleAction,
+    /// True when action is `Domestic` while current route mode is not `Dual` (falls back to Direct).
+    pub domestic_fallback_to_direct: bool,
+}
+
+/// Synchronous preview of how `raw_input` (domain or IP) will be routed under `mode` and `rules`.
+pub fn preview_route_match(
+    raw_input: &str,
+    mode: RouteMode,
+    rules: &[CustomRule],
+    data: &RuleData,
+) -> Option<RoutePreview> {
+    let mut cleaned = raw_input.trim().to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if let Some(rest) = cleaned
+        .strip_prefix("https://")
+        .or_else(|| cleaned.strip_prefix("http://"))
+    {
+        cleaned = rest.split('/').next().unwrap_or("").to_string();
+    }
+    let host_only = cleaned.split('/').next().unwrap_or("");
+    let ip_opt = host_only
+        .trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| host_only.parse::<std::net::SocketAddr>().ok().map(|s| s.ip()));
+
+    let mk = |source: String, action: CustomRuleAction| RoutePreview {
+        source,
+        action,
+        domestic_fallback_to_direct: action == CustomRuleAction::Domestic && mode != RouteMode::Dual,
+    };
+
+    if mode == RouteMode::Direct {
+        return Some(mk("纯直连模式".to_string(), CustomRuleAction::Direct));
+    }
+
+    if let Some(ip) = ip_opt {
+        if is_local_ip(ip) {
+            return Some(mk("局域网 / 本机地址".to_string(), CustomRuleAction::Direct));
+        }
+        if mode == RouteMode::Global {
+            return Some(mk("全局代理模式".to_string(), CustomRuleAction::Primary));
+        }
+        let compiled = CompiledCustomRules::compile(rules);
+        if let Some((act, pat)) = compiled.match_ip(ip) {
+            return Some(mk(format!("命中自定义 {pat}"), act));
+        }
+        if data.cn_ip.contains(ip) {
+            return Some(mk(
+                "内置规则（国内 IP 段）".to_string(),
+                if mode == RouteMode::Dual {
+                    CustomRuleAction::Domestic
+                } else {
+                    CustomRuleAction::Direct
+                },
+            ));
+        }
+        return Some(mk("内置规则（海外默认）".to_string(), CustomRuleAction::Primary));
+    }
+
+    let host = normalize_host(host_only.split(':').next().unwrap_or(""));
+    if host.is_empty() {
+        return None;
+    }
+    if host == "localhost" {
+        return Some(mk("本机地址".to_string(), CustomRuleAction::Direct));
+    }
+    if host.ends_with(".local") {
+        return Some(mk("隧道内域名 (.local)".to_string(), CustomRuleAction::Primary));
+    }
+    if mode == RouteMode::Global {
+        return Some(mk("全局代理模式".to_string(), CustomRuleAction::Primary));
+    }
+
+    let compiled = CompiledCustomRules::compile(rules);
+    if let Some((act, pat)) = compiled.match_domain(&host) {
+        return Some(mk(format!("命中自定义 {pat}"), act));
+    }
+    if data.proxy.matches(&host) {
+        return Some(mk("内置规则（海外代理表）".to_string(), CustomRuleAction::Primary));
+    }
+    if data.direct.matches(&host) {
+        return Some(mk(
+            "内置规则（国内域名表）".to_string(),
+            if mode == RouteMode::Dual {
+                CustomRuleAction::Domestic
+            } else {
+                CustomRuleAction::Direct
+            },
+        ));
+    }
+    Some(mk(
+        "未知域名（将按本地解析 IP 归属或默认主节点）".to_string(),
+        CustomRuleAction::Primary,
+    ))
 }
 
 /// Sorted domain list supporting exact (`full:`) and suffix matches via binary search.
@@ -365,6 +854,7 @@ impl RuleData {
 pub struct Router {
     mode: Arc<RouteModeCell>,
     domestic: Arc<DomesticEgressCell>,
+    custom: Arc<CustomRulesCell>,
     data: Arc<RuleData>,
     /// host -> first resolved IP (None = resolution failed), for the GEOIP fallback.
     dns_cache: DashMap<String, (Option<IpAddr>, Instant)>,
@@ -405,11 +895,13 @@ impl Router {
     pub fn new(
         mode: Arc<RouteModeCell>,
         domestic: Arc<DomesticEgressCell>,
+        custom: Arc<CustomRulesCell>,
         data: Arc<RuleData>,
     ) -> Self {
         Self {
             mode,
             domestic,
+            custom,
             data,
             dns_cache: DashMap::new(),
             dns_hints: DashMap::new(),
@@ -429,22 +921,42 @@ impl Router {
         }
     }
 
+    fn resolve_custom_action(&self, action: CustomRuleAction) -> Route {
+        match action {
+            CustomRuleAction::Direct => Route::Direct,
+            CustomRuleAction::Domestic => self.domestic_route(),
+            CustomRuleAction::Primary => Route::Primary,
+        }
+    }
+
     /// Route for a DNS query payload (TUN UDP to port 53).
     pub fn decide_dns_query(&self, query: &[u8]) -> DnsRoute {
         match self.mode.get() {
             RouteMode::Global => DnsRoute::Proxy,
             RouteMode::Direct => DnsRoute::Direct,
-            RouteMode::Rule | RouteMode::Dual => match crate::dns_msg::question_name(query) {
-                Some(name)
-                    if matches!(
-                        self.domain_bucket(&name),
-                        Some(DomainBucket::Domestic | DomainBucket::Local)
-                    ) =>
-                {
-                    DnsRoute::Domestic
+            RouteMode::Rule | RouteMode::Dual => {
+                let Some(name) = crate::dns_msg::question_name(query) else {
+                    return DnsRoute::Proxy;
+                };
+                let norm = normalize_host(&name);
+                if norm == "localhost" {
+                    return DnsRoute::Domestic;
                 }
-                _ => DnsRoute::Proxy,
-            },
+                if norm.ends_with(".local") {
+                    return DnsRoute::Proxy;
+                }
+                let custom = self.custom.snapshot();
+                if let Some((act, _)) = custom.match_domain(&norm) {
+                    return match act {
+                        CustomRuleAction::Direct | CustomRuleAction::Domestic => DnsRoute::Domestic,
+                        CustomRuleAction::Primary => DnsRoute::Proxy,
+                    };
+                }
+                match self.domain_bucket(&norm) {
+                    Some(DomainBucket::Domestic | DomainBucket::Local) => DnsRoute::Domestic,
+                    _ => DnsRoute::Proxy,
+                }
+            }
         }
     }
 
@@ -512,8 +1024,17 @@ impl Router {
                 }
                 match self.resolve_cached(&host).await {
                     Some(ip) if is_local_ip(ip) => Route::Direct,
-                    Some(ip) if self.data.cn_ip.contains(ip) => self.domestic_route(),
-                    _ => Route::Primary,
+                    Some(ip) => {
+                        if let Some((act, _)) = self.custom.snapshot().match_ip(ip) {
+                            return self.resolve_custom_action(act);
+                        }
+                        if self.data.cn_ip.contains(ip) {
+                            self.domestic_route()
+                        } else {
+                            Route::Primary
+                        }
+                    }
+                    None => Route::Primary,
                 }
             }
         }
@@ -539,10 +1060,21 @@ impl Router {
         if is_local_ip(ip) {
             return Route::Direct;
         }
-        // A domain learned from DNS beats GEOIP (e.g. a domestic site on a foreign CDN IP,
-        // or a foreign site served from an in-China IP).
-        if let Some(name) = self.dns_hints.get(&ip).map(|h| h.clone())
-            && let Some(route) = self.decide_domain_static(&name)
+        let custom = self.custom.snapshot();
+        let hint = self.dns_hints.get(&ip).map(|h| h.clone());
+        // Highest priority: user custom domain rules (via DNS hint), then user custom IP/CIDR rules.
+        if let Some(ref name) = hint {
+            let norm = normalize_host(name);
+            if let Some((act, _)) = custom.match_domain(&norm) {
+                return self.resolve_custom_action(act);
+            }
+        }
+        if let Some((act, _)) = custom.match_ip(ip) {
+            return self.resolve_custom_action(act);
+        }
+        // Built-in domain lists (via DNS hint) beat GeoIP.
+        if let Some(ref name) = hint
+            && let Some(route) = self.decide_domain_builtin(&normalize_host(name))
         {
             return route;
         }
@@ -555,6 +1087,19 @@ impl Router {
 
     /// List-based verdict without any DNS; `None` means "unknown domain".
     fn decide_domain_static(&self, host: &str) -> Option<Route> {
+        if host == "localhost" {
+            return Some(Route::Direct);
+        }
+        if host.ends_with(".local") {
+            return Some(Route::Primary);
+        }
+        if let Some((act, _)) = self.custom.snapshot().match_domain(host) {
+            return Some(self.resolve_custom_action(act));
+        }
+        self.decide_domain_builtin(host)
+    }
+
+    fn decide_domain_builtin(&self, host: &str) -> Option<Route> {
         Some(match self.domain_bucket(host)? {
             DomainBucket::Local => Route::Direct,
             DomainBucket::Foreign => Route::Primary,
@@ -624,6 +1169,7 @@ mod tests {
         Router::new(
             RouteModeCell::new(mode),
             DomesticEgressCell::new(domestic),
+            CustomRulesCell::empty(),
             RuleData::shared(None),
         )
     }
@@ -693,6 +1239,7 @@ mod tests {
         let r = Router::new(
             RouteModeCell::new(RouteMode::Dual),
             cell.clone(),
+            CustomRulesCell::empty(),
             RuleData::shared(None),
         );
         assert_eq!(r.decide(&dom("www.baidu.com")).await, Route::Secondary);
@@ -728,6 +1275,7 @@ mod tests {
         let r = Router::new(
             cell.clone(),
             DomesticEgressCell::new(DomesticEgress::Direct),
+            CustomRulesCell::empty(),
             RuleData::shared(None),
         );
         assert_eq!(r.decide(&dom("www.baidu.com")).await, Route::Primary);
@@ -784,5 +1332,111 @@ mod tests {
         assert!(!r.contains("12.0.0.0".parse().unwrap()));
         assert!(r.contains("2400:da00::1".parse().unwrap()));
         assert!(r.contains("::ffff:10.0.0.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn custom_rules_override_builtin_lists_and_hot_reload() {
+        use crate::dns_msg::tests::build_query;
+        let mode_cell = RouteModeCell::new(RouteMode::Dual);
+        let custom_cell = CustomRulesCell::new(&[
+            CustomRule {
+                pattern: "github.com".to_string(),
+                action: CustomRuleAction::Direct,
+                enabled: true,
+            },
+            CustomRule {
+                pattern: "45.67.89.10".to_string(),
+                action: CustomRuleAction::Domestic,
+                enabled: true,
+            },
+            CustomRule {
+                pattern: "full:www.baidu.com".to_string(),
+                action: CustomRuleAction::Primary,
+                enabled: true,
+            },
+        ]);
+        let r = Router::new(
+            mode_cell.clone(),
+            DomesticEgressCell::new(DomesticEgress::Secondary),
+            custom_cell.clone(),
+            RuleData::shared(None),
+        );
+
+        // Foreign proxy-list domain overridden to Direct stays Direct even in Dual mode
+        assert_eq!(r.decide(&dom("api.github.com")).await, Route::Direct);
+        assert_eq!(
+            r.decide_dns_query(&build_query(1, "api.github.com")),
+            DnsRoute::Domestic
+        );
+        // Foreign IP overridden to Domestic uses Secondary in Dual, falls back to Direct in Rule
+        assert_eq!(r.decide(&ip("45.67.89.10:443")).await, Route::Secondary);
+        // Exact CN domain overridden to Primary beats direct-list & uses foreign DNS
+        assert_eq!(r.decide(&dom("www.baidu.com")).await, Route::Primary);
+        assert_eq!(r.decide(&dom("tieba.baidu.com")).await, Route::Secondary);
+        assert_eq!(
+            r.decide_dns_query(&build_query(2, "www.baidu.com")),
+            DnsRoute::Proxy
+        );
+
+        // Switching to Rule mode makes Domestic custom rule fall back to Direct
+        mode_cell.set(RouteMode::Rule);
+        assert_eq!(r.decide(&ip("45.67.89.10:443")).await, Route::Direct);
+
+        // Hot-reload custom rules live without recreating Router
+        custom_cell.replace(&[]);
+        assert_eq!(r.decide(&dom("api.github.com")).await, Route::Primary);
+        assert_eq!(r.decide(&ip("45.67.89.10:443")).await, Route::Primary);
+    }
+
+    #[test]
+    fn custom_rule_normalize_and_bulk_roundtrip() {
+        assert_eq!(
+            CustomRule::normalize_pattern("https://cdn.steampowered.com/foo").as_deref(),
+            Some("cdn.steampowered.com")
+        );
+        assert_eq!(
+            CustomRule::normalize_pattern("*.steampowered.com").as_deref(),
+            Some("steampowered.com")
+        );
+        assert_eq!(
+            CustomRule::normalize_pattern("full:https://dl.google.com/a").as_deref(),
+            Some("full:dl.google.com")
+        );
+        assert_eq!(
+            CustomRule::normalize_pattern("45.67.89.10").as_deref(),
+            Some("45.67.89.10/32")
+        );
+        assert_eq!(
+            CustomRule::normalize_pattern("45.67.89.10:443").as_deref(),
+            Some("45.67.89.10/32")
+        );
+        assert_eq!(
+            CustomRule::normalize_pattern("104.16.0.0/16").as_deref(),
+            Some("104.16.0.0/16")
+        );
+        assert_eq!(CustomRule::normalize_pattern("104.16.0.0/99"), None);
+        assert_eq!(CustomRule::normalize_pattern("123.456.789.0"), None);
+
+        let parsed = parse_bulk_custom_rules_checked(
+            "# comment\nsteampowered.com, direct\n!45.67.89.10 domestic # paused\nfull:a.b.com, primary\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].action, CustomRuleAction::Direct);
+        assert!(parsed[0].enabled);
+        assert_eq!(parsed[1].pattern, "45.67.89.10/32");
+        assert_eq!(parsed[1].action, CustomRuleAction::Domestic);
+        assert!(!parsed[1].enabled);
+        assert_eq!(parsed[2].pattern, "full:a.b.com");
+        assert_eq!(parsed[2].action, CustomRuleAction::Primary);
+
+        // Paused rules survive format -> parse round-trip intact
+        let roundtrip =
+            parse_bulk_custom_rules_checked(&format_bulk_custom_rules(&parsed)).unwrap();
+        assert_eq!(roundtrip, parsed);
+
+        // Malformed lines return a clear line-numbered error
+        assert!(parse_bulk_custom_rules_checked("steampowered.com, bogus").is_err());
+        assert!(parse_bulk_custom_rules_checked("1.2.3.4/99, direct").is_err());
     }
 }

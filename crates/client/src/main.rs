@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use client::rules::{DomesticEgress, RouteMode, RouteModeCell};
+use client::rules::{CustomRulesCell, DomesticEgress, RouteMode, RouteModeCell};
 use client::socks5::ClientStats;
 use client::{ClientOptions, UpstreamOptions, run_client_with_shutdown};
 use protocol::share::NodeProtocol;
@@ -152,6 +152,7 @@ async fn main() -> Result<()> {
             listen: args.listen,
             enable_tun: args.tun,
             route_mode: RouteModeCell::new(args.route),
+            custom_rules: CustomRulesCell::empty(),
             rules_dir: args.rules_dir,
         },
         stats,

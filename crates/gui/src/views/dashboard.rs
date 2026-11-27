@@ -1,11 +1,12 @@
 //! Asymmetric Bento Desktop Studio Dashboard (`840 × 548`), matching `v03_cockpit_preview.html`
 //! pixel-for-pixel via `bento_card_exact` deterministic geometry locks.
 
+use crate::icons;
 use crate::storage::{ProxyMode, RouteMode, format_bytes, format_speed};
 use crate::theme::{FONT_SM, FONT_TITLE, FONT_XS, ThemePalette, font_bold, font_mono_bold};
 use crate::widgets::{
     aligned_row, bento_card_exact, chip_btn, draw_hero_action_button, draw_rtt_sparkline,
-    draw_traffic_sparkline, elide_text, hairline_divider, segmented_control,
+    draw_traffic_sparkline, elide_text, galley_center_y, hairline_divider, segmented_control,
 };
 use crate::{ChartMode, ConnState, GameAccelApp, NavTab, ProbeState};
 use eframe::egui::{
@@ -69,6 +70,7 @@ impl GameAccelApp {
 
         let mut toggle_clicked = false;
         let mut jump_to_nodes = false;
+        let mut open_rules_modal = false;
 
         bento_card_exact(
             ui,
@@ -147,6 +149,64 @@ impl GameAccelApp {
                                     };
                                     draw_mono_tag(ui, proto_lbl, p);
                                 }
+
+                                let custom_cnt =
+                                    self.cfg.custom_rules.iter().filter(|r| r.enabled).count();
+                                let rule_lbl = if custom_cnt > 0 {
+                                    format!("规则 {custom_cnt}")
+                                } else {
+                                    "自定义规则".to_string()
+                                };
+                                let rule_fg = if custom_cnt > 0 {
+                                    p.accent_text
+                                } else {
+                                    p.text_muted
+                                };
+                                let rule_galley = ui.fonts(|f| {
+                                    f.layout_no_wrap(rule_lbl, FontId::proportional(FONT_XS), rule_fg)
+                                });
+                                let rule_w = rule_galley.size().x + 16.0;
+                                let (rule_rect, rule_resp) = ui.allocate_exact_size(
+                                    Vec2::new(rule_w, 20.0),
+                                    Sense::click(),
+                                );
+                                if rule_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    let hover_fill = if custom_cnt > 0 {
+                                        p.accent_soft
+                                    } else {
+                                        p.bg_nav_hover
+                                    };
+                                    ui.painter().rect_filled(
+                                        rule_rect,
+                                        CornerRadius::same(5),
+                                        hover_fill,
+                                    );
+                                }
+                                let r_ty = galley_center_y(rule_rect, &rule_galley);
+                                ui.painter().galley(
+                                    Pos2::new(rule_rect.left() + 5.0, r_ty),
+                                    rule_galley,
+                                    rule_fg,
+                                );
+                                // Crisp tiny vector `>` chevron vertically dead-center
+                                let cx = rule_rect.right() - 6.0;
+                                let cy = rule_rect.center().y;
+                                let cs = Stroke::new(1.25_f32, rule_fg);
+                                ui.painter().line_segment(
+                                    [Pos2::new(cx - 1.5, cy - 2.6), Pos2::new(cx + 1.5, cy)],
+                                    cs,
+                                );
+                                ui.painter().line_segment(
+                                    [Pos2::new(cx + 1.5, cy), Pos2::new(cx - 1.5, cy + 2.6)],
+                                    cs,
+                                );
+                                if rule_resp
+                                    .on_hover_text("管理自定义域名 / IP 分流规则（优先级高于内置规则，热生效）")
+                                    .clicked()
+                                {
+                                    open_rules_modal = true;
+                                }
                             });
 
                             // Row 2 (28px): Active Node Headline (18px Native Bold, single-line elided)
@@ -220,6 +280,9 @@ impl GameAccelApp {
         if jump_to_nodes {
             self.active_tab = NavTab::Nodes;
             self.import_panel_open = true;
+        }
+        if open_rules_modal {
+            self.open_custom_rules_modal();
         }
         if toggle_clicked {
             if !has_nodes && self.state == ConnState::Disconnected {
@@ -432,26 +495,56 @@ impl GameAccelApp {
                             ChartMode::Traffic => {
                                 let (rx_txt, tx_txt) = if is_live {
                                     (
-                                        format!("↓ {}", format_speed(self.telemetry.rx_speed_bps)),
-                                        format!("↑ {}", format_speed(self.telemetry.tx_speed_bps)),
+                                        format_speed(self.telemetry.rx_speed_bps),
+                                        format_speed(self.telemetry.tx_speed_bps),
                                     )
                                 } else {
-                                    ("↓ 0 B/s".to_string(), "↑ 0 B/s".to_string())
+                                    ("0 B/s".to_string(), "0 B/s".to_string())
                                 };
-                                ui.label(
-                                    RichText::new(tx_txt)
-                                        .size(11.5)
-                                        .monospace()
-                                        .color(p.text_muted),
-                                )
-                                .on_hover_text(format!("累计上传 {}", format_bytes(tx)));
-                                ui.label(
-                                    RichText::new(rx_txt)
-                                        .size(11.5)
-                                        .monospace()
-                                        .color(p.text_secondary),
-                                )
-                                .on_hover_text(format!("累计下载 {}", format_bytes(rx)));
+                                let paint_speed_item =
+                                    |ui: &mut egui::Ui,
+                                     up: bool,
+                                     arrow_col: Color32,
+                                     txt_col: Color32,
+                                     text: String,
+                                     tip: String| {
+                                        let galley = ui.fonts(|f| {
+                                            f.layout_no_wrap(text, FontId::monospace(11.5), txt_col)
+                                        });
+                                        let w = 9.0 + 4.0 + galley.size().x;
+                                        let (r, resp) = ui
+                                            .allocate_exact_size(Vec2::new(w, 18.0), Sense::hover());
+                                        icons::draw_flow_arrow(
+                                            ui.painter(),
+                                            Pos2::new(r.left() + 4.5, r.center().y),
+                                            up,
+                                            arrow_col,
+                                        );
+                                        let ty = galley_center_y(r, &galley);
+                                        ui.painter().galley(
+                                            Pos2::new(r.left() + 13.0, ty),
+                                            galley,
+                                            txt_col,
+                                        );
+                                        resp.on_hover_text(tip);
+                                    };
+                                paint_speed_item(
+                                    ui,
+                                    true,
+                                    p.data_secondary,
+                                    p.text_muted,
+                                    tx_txt,
+                                    format!("累计上传 {}", format_bytes(tx)),
+                                );
+                                ui.add_space(2.0);
+                                paint_speed_item(
+                                    ui,
+                                    false,
+                                    p.data_primary,
+                                    p.text_secondary,
+                                    rx_txt,
+                                    format!("累计下载 {}", format_bytes(rx)),
+                                );
                             }
                             ChartMode::Rtt => {
                                 let sec_live = is_live
@@ -462,30 +555,49 @@ impl GameAccelApp {
                                     && sec_rtt > 0
                                     && let Some(&last) = self.telemetry.rtt_history.back()
                                 {
-                                    // Right-to-left layout: render domestic legend first, then primary legend
-                                    ui.label(
-                                        RichText::new(format!("国内 {sec_rtt} ms"))
-                                            .size(11.5)
-                                            .monospace()
-                                            .color(p.text_secondary),
+                                    // Right-to-left layout: tight 5px dot-to-label pairing, 12px between pairs
+                                    let paint_legend_item =
+                                        |ui: &mut egui::Ui, dot_col: Color32, text: String| {
+                                            let galley = ui.fonts(|f| {
+                                                f.layout_no_wrap(
+                                                    text,
+                                                    FontId::monospace(11.5),
+                                                    p.text_secondary,
+                                                )
+                                            });
+                                            let w = 6.0 + 5.0 + galley.size().x;
+                                            let (r, _) = ui.allocate_exact_size(
+                                                Vec2::new(w, 18.0),
+                                                Sense::hover(),
+                                            );
+                                            let cy = r.center().y;
+                                            ui.painter().circle_filled(
+                                                Pos2::new(r.left() + 3.0, cy),
+                                                3.0,
+                                                dot_col,
+                                            );
+                                            let ty = if galley.mesh_bounds.is_positive() {
+                                                cy - galley.mesh_bounds.center().y
+                                            } else {
+                                                cy - galley.size().y * 0.5
+                                            };
+                                            ui.painter().galley(
+                                                Pos2::new(r.left() + 11.0, ty),
+                                                galley,
+                                                p.text_secondary,
+                                            );
+                                        };
+                                    paint_legend_item(
+                                        ui,
+                                        p.success_text,
+                                        format!("国内 {sec_rtt} ms"),
                                     );
-                                    let (d2, _) = ui.allocate_exact_size(
-                                        Vec2::splat(7.0),
-                                        Sense::hover(),
+                                    ui.add_space(2.0);
+                                    paint_legend_item(
+                                        ui,
+                                        p.data_primary,
+                                        format!("主 {last} ms"),
                                     );
-                                    ui.painter().circle_filled(d2.center(), 3.0, p.success_text);
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new(format!("主 {last} ms"))
-                                            .size(11.5)
-                                            .monospace()
-                                            .color(p.text_secondary),
-                                    );
-                                    let (d1, _) = ui.allocate_exact_size(
-                                        Vec2::splat(7.0),
-                                        Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(d1.center(), 3.0, p.data_primary);
                                 } else {
                                     let summary = if is_live
                                         && let Some(&last) = self.telemetry.rtt_history.back()
@@ -710,11 +822,8 @@ impl GameAccelApp {
                         let galley = ui.fonts(|f| {
                             f.layout_no_wrap(shown, FontId::proportional(FONT_SM), lbl_col)
                         });
-                        painter.galley(
-                            Pos2::new(rect.left() + 20.0, rect.center().y - galley.size().y * 0.5),
-                            galley,
-                            lbl_col,
-                        );
+                        let ty = galley_center_y(rect, &galley);
+                        painter.galley(Pos2::new(rect.left() + 20.0, ty), galley, lbl_col);
 
                         crate::icons::draw_chevron(
                             painter,
@@ -834,19 +943,15 @@ impl GameAccelApp {
                                                     p.text_primary,
                                                 )
                                             });
+                                            let name_y = galley_center_y(r, &name_galley);
+                                            let rtt_y = galley_center_y(r, &rtt_galley);
                                             ui.painter().galley(
-                                                Pos2::new(
-                                                    r.left() + 20.0,
-                                                    r.center().y - name_galley.size().y * 0.5,
-                                                ),
+                                                Pos2::new(r.left() + 20.0, name_y),
                                                 name_galley,
                                                 p.text_primary,
                                             );
                                             ui.painter().galley(
-                                                Pos2::new(
-                                                    r.right() - 8.0 - rtt_w,
-                                                    r.center().y - rtt_galley.size().y * 0.5,
-                                                ),
+                                                Pos2::new(r.right() - 8.0 - rtt_w, rtt_y),
                                                 rtt_galley,
                                                 rtt_col,
                                             );
@@ -1053,11 +1158,9 @@ impl GameAccelApp {
                                 let rtt_galley = ui.fonts(|f| {
                                     f.layout_no_wrap(rtt_txt, FontId::monospace(11.5), rtt_col)
                                 });
+                                let rtt_y = galley_center_y(rect, &rtt_galley);
                                 painter.galley(
-                                    Pos2::new(
-                                        rect.right() - 10.0 - rtt_galley.size().x,
-                                        rect.center().y - rtt_galley.size().y * 0.5,
-                                    ),
+                                    Pos2::new(rect.right() - 10.0 - rtt_galley.size().x, rtt_y),
                                     rtt_galley,
                                     rtt_col,
                                 );
@@ -1073,11 +1176,9 @@ impl GameAccelApp {
                                 let name_galley = ui.fonts(|f| {
                                     f.layout_no_wrap(shown_name, name_font, p.text_primary)
                                 });
+                                let name_y = galley_center_y(rect, &name_galley);
                                 painter.galley(
-                                    Pos2::new(
-                                        rect.left() + 24.0,
-                                        rect.center().y - name_galley.size().y * 0.5,
-                                    ),
+                                    Pos2::new(rect.left() + 24.0, name_y),
                                     name_galley,
                                     p.text_primary,
                                 );
@@ -1121,11 +1222,8 @@ fn draw_state_capsule(
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(11), bg);
     painter.circle_filled(Pos2::new(rect.left() + 10.0, rect.center().y), 3.25, dot_col);
-    painter.galley(
-        Pos2::new(rect.left() + 17.5, rect.center().y - galley.size().y * 0.5),
-        galley,
-        fg,
-    );
+    let ty = galley_center_y(rect, &galley);
+    painter.galley(Pos2::new(rect.left() + 17.5, ty), galley, fg);
 }
 
 fn draw_mono_tag(ui: &mut egui::Ui, text: &str, p: ThemePalette) {
@@ -1137,11 +1235,9 @@ fn draw_mono_tag(ui: &mut egui::Ui, text: &str, p: ThemePalette) {
     );
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(4), p.tag_bg);
+    let ty = galley_center_y(rect, &galley);
     painter.galley(
-        Pos2::new(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
+        Pos2::new(rect.center().x - galley.size().x * 0.5, ty),
         galley,
         p.tag_text,
     );

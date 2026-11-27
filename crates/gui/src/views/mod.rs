@@ -1,3 +1,4 @@
+pub(crate) mod custom_rules;
 mod dashboard;
 pub(crate) mod floating_pill;
 mod logs;
@@ -8,7 +9,7 @@ pub(crate) mod tray_popover;
 use crate::icons;
 use crate::storage::save_config;
 use crate::theme::{FONT_XS, ThemeMode, ThemePalette, apply_theme, font_bold};
-use crate::widgets::{aligned_row, draw_status_pill};
+use crate::widgets::{aligned_row, draw_status_pill, galley_center_y};
 use crate::{APP_VERSION, ConnState, GameAccelApp, NavTab};
 use eframe::egui::{
     self, Align, CornerRadius, FontId, Layout, PointerButton, Pos2, RichText, Sense, Stroke, Vec2,
@@ -134,11 +135,14 @@ impl GameAccelApp {
             FontId::proportional(FONT_XS)
         };
         let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, fg));
+        let label_cy = rect.bottom() - 10.5;
+        let label_y = if galley.mesh_bounds.is_positive() {
+            label_cy - galley.mesh_bounds.center().y
+        } else {
+            label_cy - galley.size().y * 0.5
+        };
         painter.galley(
-            Pos2::new(
-                rect.center().x - galley.size().x * 0.5,
-                rect.bottom() - 10.5 - galley.size().y * 0.5,
-            ),
+            Pos2::new(rect.center().x - galley.size().x * 0.5, label_y),
             galley,
             fg,
         );
@@ -203,11 +207,9 @@ impl GameAccelApp {
                     p.bg_card_alt
                 },
             );
+            let port_y = galley_center_y(p_rect, &port_galley);
             ui.painter().galley(
-                Pos2::new(
-                    p_rect.center().x - port_galley.size().x * 0.5,
-                    p_rect.center().y - port_galley.size().y * 0.5,
-                ),
+                Pos2::new(p_rect.center().x - port_galley.size().x * 0.5, port_y),
                 port_galley,
                 p.text_muted,
             );

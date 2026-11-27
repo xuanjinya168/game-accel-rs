@@ -196,11 +196,9 @@ pub fn segmented_control<T: Copy + PartialEq>(
             FontId::proportional(font_size)
         };
         let galley = ui.fonts(|f| f.layout_no_wrap(lbl.to_string(), font, fg));
+        let ty = galley_center_y(seg_rect, &galley);
         painter.galley(
-            Pos2::new(
-                seg_rect.center().x - galley.size().x * 0.5,
-                seg_rect.center().y - galley.size().y * 0.5,
-            ),
+            Pos2::new(seg_rect.center().x - galley.size().x * 0.5, ty),
             galley,
             fg,
         );
@@ -209,6 +207,17 @@ pub fn segmented_control<T: Copy + PartialEq>(
         }
     }
     picked
+}
+
+/// Optical vertical centering for single-line text using actual glyph ink bounds (`mesh_bounds`)
+/// rather than font line-box height, preventing CJK text from sitting 1.5-2px too high in buttons/pills.
+#[inline]
+pub(crate) fn galley_center_y(rect: egui::Rect, galley: &egui::Galley) -> f32 {
+    if galley.mesh_bounds.is_positive() {
+        rect.center().y - galley.mesh_bounds.center().y
+    } else {
+        rect.center().y - galley.size().y * 0.5
+    }
 }
 
 /// Unified primary Terracotta button (consistent hover & press feedback everywhere).
@@ -232,11 +241,9 @@ pub fn primary_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette) -> egui::Resp
 
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(8), fill);
+    let ty = galley_center_y(rect, &galley);
     painter.galley(
-        Pos2::new(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
+        Pos2::new(rect.center().x - galley.size().x * 0.5, ty),
         galley,
         Color32::WHITE,
     );
@@ -274,11 +281,9 @@ pub fn soft_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette) -> egui::Respons
         Stroke::new(1.0_f32, border),
         StrokeKind::Inside,
     );
+    let ty = galley_center_y(rect, &galley);
     painter.galley(
-        Pos2::new(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
+        Pos2::new(rect.center().x - galley.size().x * 0.5, ty),
         galley,
         fg,
     );
@@ -321,11 +326,9 @@ pub fn chip_btn(ui: &mut egui::Ui, text: &str, p: ThemePalette, is_danger: bool)
         Stroke::new(1.0_f32, border),
         StrokeKind::Inside,
     );
+    let ty = galley_center_y(rect, &galley);
     painter.galley(
-        Pos2::new(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
+        Pos2::new(rect.center().x - galley.size().x * 0.5, ty),
         galley,
         fg,
     );
@@ -366,14 +369,11 @@ pub fn dropdown_chip_btn(
         Stroke::new(1.0_f32, border),
         StrokeKind::Inside,
     );
-    painter.galley(
-        Pos2::new(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
-        galley,
-        fg,
-    );
+    let ty = galley_center_y(rect, &galley);
+    painter.galley(Pos2::new(rect.left() + 10.0, ty), galley, fg);
     icons::draw_chevron(
         painter,
-        Pos2::new(rect.right() - 11.0, rect.center().y + 0.5),
+        Pos2::new(rect.right() - 11.0, rect.center().y),
         is_open,
         fg,
     );
@@ -423,11 +423,9 @@ pub fn accent_chip_btn(
         Stroke::new(1.0_f32, border),
         StrokeKind::Inside,
     );
+    let ty = galley_center_y(rect, &galley);
     painter.galley(
-        Pos2::new(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
+        Pos2::new(rect.center().x - galley.size().x * 0.5, ty),
         galley,
         fg,
     );
@@ -438,16 +436,14 @@ pub fn pill(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
     let font = FontId::proportional(FONT_XS);
     let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font, fg));
     let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(galley.size().x + 14.0, galley.size().y + 5.0),
+        Vec2::new(galley.size().x + 14.0, 20.0),
         Sense::hover(),
     );
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(6), bg);
+    let ty = galley_center_y(rect, &galley);
     painter.galley(
-        Pos2::new(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
+        Pos2::new(rect.center().x - galley.size().x * 0.5, ty),
         galley,
         fg,
     );
@@ -474,11 +470,8 @@ pub fn draw_status_pill(
         StrokeKind::Inside,
     );
     painter.circle_filled(Pos2::new(rect.left() + 10.5, rect.center().y), 3.1, dot_col);
-    painter.galley(
-        Pos2::new(rect.left() + 18.0, rect.center().y - galley.size().y * 0.5),
-        galley,
-        fg,
-    );
+    let ty = galley_center_y(rect, &galley);
+    painter.galley(Pos2::new(rect.left() + 18.0, ty), galley, fg);
 }
 
 /// Hero Deck Action Button (`138 x 46` locked slot, `CornerRadius::same(12)`), matching
@@ -548,19 +541,16 @@ pub fn draw_hero_action_button(
     let total_w = icon_w + gap + galley.size().x;
     let start_x = rect.center().x - total_w * 0.5;
 
+    // Power icon's stem extends 1.4px above the ring (`[-7.6, +6.2]`), so +0.7 centers its ink box.
     icons::draw_power_icon(
         painter,
-        Pos2::new(start_x + icon_w * 0.5, rect.center().y),
+        Pos2::new(start_x + icon_w * 0.5, rect.center().y + 0.7),
         fg_col,
     );
-    painter.galley(
-        Pos2::new(
-            start_x + icon_w + gap,
-            rect.center().y - galley.size().y * 0.5,
-        ),
-        galley,
-        fg_col,
-    );
+    // Align by actual rendered ink bounds (`mesh_bounds`) rather than line-box height so CJK
+    // glyphs sit dead-center inside the 46px button and level with the power icon.
+    let text_y = galley_center_y(rect, &galley);
+    painter.galley(Pos2::new(start_x + icon_w + gap, text_y), galley, fg_col);
 
     resp
 }
@@ -573,30 +563,55 @@ pub fn styled_input(
     password: bool,
     p: ThemePalette,
 ) -> egui::Response {
-    let mut inner_resp: Option<egui::Response> = None;
-    let has_focus_id = ui.id().with(hint).with(width.to_bits());
+    styled_input_exact(ui, text, hint, Vec2::new(width, 30.0), FONT_BODY, password, p)
+}
+
+/// Deterministic exact-size single-line text input (`size.x x size.y` outer box, never overflows
+/// parent width or row height, optically centered CJK text via `Align::Center` child box).
+pub fn styled_input_exact(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: &str,
+    size: Vec2,
+    font_size: f32,
+    password: bool,
+    p: ThemePalette,
+) -> egui::Response {
+    let has_focus_id = ui.id().with("styled_input").with(hint);
     let focused = ui.ctx().memory(|m| m.has_focus(has_focus_id));
-    Frame::new()
-        .fill(p.bg_input)
-        .stroke(Stroke::new(
+    let (outer_rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect(
+        outer_rect,
+        CornerRadius::same(8),
+        p.bg_input,
+        Stroke::new(
             if focused { 1.5_f32 } else { 1.0_f32 },
             if focused { p.accent } else { p.border_strong },
-        ))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(text)
-                    .id(has_focus_id)
-                    .frame(false)
-                    .font(FontId::proportional(FONT_BODY))
-                    .password(password)
-                    .hint_text(hint)
-                    .desired_width((width - 20.0).max(60.0)),
-            );
-            inner_resp = Some(r);
-        });
-    inner_resp.expect("styled_input inner response")
+        ),
+        StrokeKind::Inside,
+    );
+
+    let inner_rect = egui::Rect::from_min_max(
+        Pos2::new(outer_rect.left() + 10.0, outer_rect.top()),
+        Pos2::new(outer_rect.right() - 10.0, outer_rect.bottom()),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    child.set_clip_rect(outer_rect.shrink(1.5));
+    child.add(
+        egui::TextEdit::singleline(text)
+            .id(has_focus_id)
+            .frame(false)
+            .margin(Vec2::ZERO)
+            .vertical_align(Align::Center)
+            .font(FontId::proportional(font_size))
+            .password(password)
+            .hint_text(hint)
+            .desired_width(inner_rect.width().max(40.0)),
+    )
 }
 
 pub fn styled_multiline(
@@ -632,6 +647,8 @@ pub fn styled_multiline(
     inner_resp.expect("styled_multiline inner response")
 }
 
+/// Compact toolbar search field (`26px` height matching `chip_btn` / `accent_chip_btn`)
+/// with optically centered search icon and input text.
 pub fn styled_search_input(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -639,31 +656,45 @@ pub fn styled_search_input(
     width: f32,
     p: ThemePalette,
 ) {
-    let id = ui.id().with("search_input");
+    let id = ui.id().with("search_input").with(hint);
     let focused = ui.ctx().memory(|m| m.has_focus(id));
-    Frame::new()
-        .fill(p.bg_input)
-        .stroke(Stroke::new(
+    let (outer_rect, _) = ui.allocate_exact_size(Vec2::new(width.max(100.0), 26.0), Sense::hover());
+    ui.painter().rect(
+        outer_rect,
+        CornerRadius::same(7),
+        p.bg_input,
+        Stroke::new(
             if focused { 1.5_f32 } else { 1.0_f32 },
             if focused { p.accent } else { p.border_subtle },
-        ))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let (ir, _) = ui.allocate_exact_size(Vec2::new(14.0, 18.0), Sense::hover());
-                icons::draw_search_icon(ui.painter(), ir.center(), p.text_muted);
-                ui.add(
-                    egui::TextEdit::singleline(text)
-                        .id(id)
-                        .frame(false)
-                        .font(FontId::proportional(FONT_SM))
-                        .hint_text(hint)
-                        .desired_width((width - 36.0).max(80.0)),
-                );
-            });
-        });
+        ),
+        StrokeKind::Inside,
+    );
+    icons::draw_search_icon(
+        ui.painter(),
+        Pos2::new(outer_rect.left() + 13.5, outer_rect.center().y),
+        p.text_muted,
+    );
+
+    let inner_rect = egui::Rect::from_min_max(
+        Pos2::new(outer_rect.left() + 25.0, outer_rect.top()),
+        Pos2::new(outer_rect.right() - 8.0, outer_rect.bottom()),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    child.set_clip_rect(outer_rect.shrink(1.5));
+    child.add(
+        egui::TextEdit::singleline(text)
+            .id(id)
+            .frame(false)
+            .margin(Vec2::ZERO)
+            .vertical_align(Align::Center)
+            .font(FontId::proportional(FONT_SM))
+            .hint_text(hint)
+            .desired_width(inner_rect.width().max(48.0)),
+    );
 }
 
 fn draw_idle_chart_grid(

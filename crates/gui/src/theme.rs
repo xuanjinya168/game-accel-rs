@@ -310,9 +310,14 @@ pub fn configure_fonts(ctx: &egui::Context) {
     ];
     for path in mono_candidates {
         if let Ok(bytes) = std::fs::read(path) {
+            let mut mono_data = FontData::from_owned(bytes);
+            // Optically center Consolas ASCII/digits inside its line-box and level them with
+            // `cn_font_mono` (Microsoft YaHei, -0.09) so both pure monospace (`127.0.0.1:2080`,
+            // `170 ms`) and mixed monospace (`主 164 ms`, `13.83 GB / 不限`) sit on one baseline.
+            mono_data.tweak.y_offset_factor = 0.08;
             fonts
                 .font_data
-                .insert("win_mono".to_owned(), Arc::new(FontData::from_owned(bytes)));
+                .insert("win_mono".to_owned(), Arc::new(mono_data));
             fonts
                 .families
                 .entry(FontFamily::Monospace)
@@ -331,7 +336,8 @@ pub fn configure_fonts(ctx: &egui::Context) {
     for path in cn_candidates {
         if let Ok(bytes) = std::fs::read(path) {
             let mut prop_data = FontData::from_owned(bytes.clone());
-            prop_data.tweak.y_offset_factor = -0.10;
+            // Compensate msyh.ttc's +0.062em vertical ink offset without over-shifting labels upward.
+            prop_data.tweak.y_offset_factor = -0.06;
             fonts
                 .font_data
                 .insert("cn_font".to_owned(), Arc::new(prop_data));

@@ -6,8 +6,8 @@ use crate::storage::{AdminServerProfile, format_bytes, save_config};
 use crate::theme::{FONT_BODY, FONT_SM, FONT_SUB, FONT_TITLE, FONT_XS, ThemePalette};
 use crate::widgets::{
     accent_chip_btn, aligned_row, card_frame, chip_btn, dropdown_chip_btn, elide_text,
-    hairline_divider, modal_dialog, pill, primary_btn, segmented_control, soft_btn, styled_input,
-    styled_search_input,
+    galley_center_y, hairline_divider, modal_dialog, pill, primary_btn, segmented_control,
+    soft_btn, styled_input, styled_search_input,
 };
 use crate::{ConnState, GameAccelApp};
 use chrono::Local;
@@ -151,7 +151,7 @@ impl GameAccelApp {
                         "累计流量",
                         format_bytes(ov.total_tx_bytes + ov.total_rx_bytes),
                         format!(
-                            "↑{} · ↓{}",
+                            "↑ {} · ↓ {}",
                             format_bytes(ov.total_tx_bytes),
                             format_bytes(ov.total_rx_bytes)
                         ),
@@ -177,7 +177,7 @@ impl GameAccelApp {
                         .show(&mut cols[i], |ui| {
                             ui.set_width(ui.available_width());
                             ui.set_min_height(68.0);
-                            aligned_row(ui, 18.0, |ui| {
+                            aligned_row(ui, 20.0, |ui| {
                                 ui.label(RichText::new(label).size(FONT_XS).color(p.text_muted));
                                 if is_insecure {
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -480,7 +480,7 @@ impl GameAccelApp {
                                             let exp_str = l.expire_at.as_deref().unwrap_or("长期有效");
                                             ui.label(
                                                 RichText::new(format!(
-                                                    "{} / {}  ·  {}",
+                                                    "{} / {} · {}",
                                                     format_bytes(used),
                                                     limit_str,
                                                     exp_str
@@ -1493,11 +1493,9 @@ fn draw_cell_badge(
         Vec2::new(galley.size().x + 12.0, 19.0),
     );
     painter.rect_filled(rect, CornerRadius::same(5), bg);
+    let ty = galley_center_y(rect, &galley);
     painter.galley(
-        Pos2::new(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
+        Pos2::new(rect.center().x - galley.size().x * 0.5, ty),
         galley,
         fg,
     );
@@ -1529,10 +1527,7 @@ fn popover_menu_item(
     };
     let galley =
         ui.fonts(|f| f.layout_no_wrap(label.to_string(), FontId::proportional(FONT_SM), fg));
-    ui.painter().galley(
-        Pos2::new(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
-        galley,
-        fg,
-    );
+    let ty = galley_center_y(rect, &galley);
+    ui.painter().galley(Pos2::new(rect.left() + 10.0, ty), galley, fg);
     resp
 }
