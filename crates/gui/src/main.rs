@@ -351,6 +351,9 @@ impl GameAccelApp {
         self.brand_logo_last_time = now;
 
         if self.state != self.brand_logo_last_state {
+            if let Some(tray) = &self.tray {
+                tray.set_conn_state(self.state);
+            }
             if self.state == ConnState::Connected && visible {
                 self.brand_logo_pulse = 1.0;
             }

@@ -1,6 +1,7 @@
+use crate::ConnState;
 use crate::logger::log_line;
 use crate::storage::TrayStyle;
-use crate::theme::build_app_icon;
+use crate::theme::build_brand_icon;
 use eframe::egui::{self, Pos2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +20,9 @@ pub enum TrayCmd {
 pub struct TrayHandle {
     tray: TrayIcon,
     use_panel: Arc<AtomicBool>,
+    icon_idle: Icon,
+    icon_connecting: Icon,
+    icon_connected: Icon,
 }
 
 impl TrayHandle {
@@ -32,6 +36,18 @@ impl TrayHandle {
         } else {
             self.tray.set_menu(Some(Box::new(build_native_menu())));
         }
+    }
+
+    /// Sync the system tray icon (hollow idle / half connecting / solid connected) and tooltip
+    /// with the active tunnel state.
+    pub fn set_conn_state(&self, state: ConnState) {
+        let (icon, tip) = match state {
+            ConnState::Disconnected => (&self.icon_idle, "GameAccel - 待机就绪"),
+            ConnState::Connecting => (&self.icon_connecting, "GameAccel - 连接协商中"),
+            ConnState::Connected => (&self.icon_connected, "GameAccel - 隧道保护中"),
+        };
+        let _ = self.tray.set_icon(Some(icon.clone()));
+        let _ = self.tray.set_tooltip(Some(tip));
     }
 }
 
@@ -1100,19 +1116,24 @@ where
     F: Fn(TrayCmd) + Send + 'static,
     Q: Fn() + Send + Sync + 'static,
 {
-    let icon_data = build_app_icon();
-    let icon = match Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height) {
-        Ok(i) => i,
-        Err(e) => {
-            log_line("ERROR", &format!("托盘图标创建失败: {e}"));
-            return None;
+    let make_icon = |fill: f32| -> Option<Icon> {
+        let d = build_brand_icon(fill);
+        match Icon::from_rgba(d.rgba, d.width, d.height) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                log_line("ERROR", &format!("托盘图标创建失败: {e}"));
+                None
+            }
         }
     };
+    let icon_idle = make_icon(0.0)?;
+    let icon_connecting = make_icon(0.52)?;
+    let icon_connected = make_icon(1.0)?;
 
     let use_panel = Arc::new(AtomicBool::new(initial_style == TrayStyle::Panel));
     let mut builder = TrayIconBuilder::new()
-        .with_tooltip("GameAccel - QUIC/UDP 游戏加速")
-        .with_icon(icon)
+        .with_tooltip("GameAccel - 待机就绪")
+        .with_icon(icon_idle.clone())
         .with_menu_on_left_click(false);
     if initial_style == TrayStyle::Menu {
         builder = builder.with_menu(Box::new(build_native_menu()));
@@ -1191,5 +1212,11 @@ where
         }
     });
 
-    Some(TrayHandle { tray, use_panel })
+    Some(TrayHandle {
+        tray,
+        use_panel,
+        icon_idle,
+        icon_connecting,
+        icon_connected,
+    })
 }

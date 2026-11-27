@@ -142,24 +142,25 @@ impl ThemePalette {
     }
 }
 
-/// Shared normalized sleek brand lightning geometry in `[-1, 1]` space.
+/// Shared normalized sleek brand lightning geometry in `[-1, 1]` space (~58% vertical ratio
+/// for generous breathing room inside the rounded squircle even during hover/pulse scale).
 /// `BRAND_BOLT_UPPER ∪ BRAND_BOLT_LOWER` has the exact 6-vertex boundary `BRAND_BOLT_OUTLINE`;
 /// `BRAND_BOLT_BRIDGE` covers their interior diagonal seam against AA feathering.
-pub const BRAND_BOLT_UPPER: [(f32, f32); 3] = [(0.14, -0.68), (-0.50, 0.07), (0.00, 0.07)];
-pub const BRAND_BOLT_LOWER: [(f32, f32); 3] = [(-0.14, 0.68), (0.50, -0.07), (0.00, -0.07)];
+pub const BRAND_BOLT_UPPER: [(f32, f32); 3] = [(0.12, -0.58), (-0.43, 0.06), (0.00, 0.06)];
+pub const BRAND_BOLT_LOWER: [(f32, f32); 3] = [(-0.12, 0.58), (0.43, -0.06), (0.00, -0.06)];
 pub const BRAND_BOLT_BRIDGE: [(f32, f32); 4] = [
-    (-0.07, -0.055),
-    (0.07, -0.055),
-    (0.07, 0.055),
-    (-0.07, 0.055),
+    (-0.06, -0.045),
+    (0.06, -0.045),
+    (0.06, 0.045),
+    (-0.06, 0.045),
 ];
 pub const BRAND_BOLT_OUTLINE: [(f32, f32); 6] = [
-    (0.14, -0.68),
-    (-0.50, 0.07),
-    (-0.0261, 0.07),
-    (-0.14, 0.68),
-    (0.50, -0.07),
-    (0.0261, -0.07),
+    (0.12, -0.58),
+    (-0.43, 0.06),
+    (-0.0225, 0.06),
+    (-0.12, 0.58),
+    (0.43, -0.06),
+    (0.0225, -0.06),
 ];
 
 pub(crate) fn point_in_triangle(px: f32, py: f32, tri: [(f32, f32); 3]) -> bool {
@@ -174,14 +175,49 @@ pub(crate) fn point_in_triangle(px: f32, py: f32, tri: [(f32, f32); 3]) -> bool 
     !(has_neg && has_pos)
 }
 
-/// Generate a 32x32 anti-aliased RGBA taskbar/tray icon matching `icons::draw_brand_logo`
-/// (top-lit terracotta gradient `#E38667 -> #CC6848` + crisp inner highlight + sleek solid bolt).
-pub fn build_app_icon() -> egui::IconData {
+fn point_to_segment_dist(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+    let abx = b.0 - a.0;
+    let aby = b.1 - a.1;
+    let len_sq = abx * abx + aby * aby;
+    if len_sq <= 1e-8 {
+        return (px - a.0).hypot(py - a.1);
+    }
+    let t = (((px - a.0) * abx + (py - a.1) * aby) / len_sq).clamp(0.0, 1.0);
+    let proj_x = a.0 + abx * t;
+    let proj_y = a.1 + aby * t;
+    (px - proj_x).hypot(py - proj_y)
+}
+
+fn dist_to_bolt_outline(px: f32, py: f32) -> f32 {
+    let n = BRAND_BOLT_OUTLINE.len();
+    let mut best = f32::MAX;
+    for i in 0..n {
+        let d = point_to_segment_dist(
+            px,
+            py,
+            BRAND_BOLT_OUTLINE[i],
+            BRAND_BOLT_OUTLINE[(i + 1) % n],
+        );
+        if d < best {
+            best = d;
+        }
+    }
+    best
+}
+
+/// Generate a 32x32 anti-aliased RGBA brand icon matching `icons::draw_brand_logo`
+/// (`fill_ratio`: `0.0` = idle hollow wireframe, `0.5` = connecting charge, `1.0` = solid active).
+pub fn build_brand_icon(fill_ratio: f32) -> egui::IconData {
     let size = 32usize;
     let mut rgba = vec![0u8; size * size * 4];
     let bg_top = [227.0_f32, 134.0, 103.0]; // #E38667
     let bg_bot = [204.0_f32, 104.0, 72.0]; // #CC6848
     let fg = [255.0_f32, 255.0, 255.0];
+
+    let fill_clamped = fill_ratio.clamp(0.0, 1.0);
+    let y_cut = 0.58 - 1.16 * fill_clamped;
+    // Crisp ~1.8px stroke at 32x32 (scales cleanly down to 16x16 Windows tray)
+    let stroke_half = if fill_clamped < 0.99 { 0.056_f32 } else { 0.042_f32 };
 
     let half = size as f32 * 0.5;
     let corner_r = size as f32 * 0.25;
@@ -204,9 +240,12 @@ pub fn build_app_icon() -> egui::IconData {
                     if dist <= corner_r {
                         let nx = (fx - half) / half;
                         let ny = (fy - half) / half;
-                        let in_bolt = point_in_triangle(nx, ny, BRAND_BOLT_UPPER)
-                            || point_in_triangle(nx, ny, BRAND_BOLT_LOWER);
-                        let col = if in_bolt {
+                        let on_outline = dist_to_bolt_outline(nx, ny) <= stroke_half;
+                        let in_fill = fill_clamped > 0.01
+                            && ny >= y_cut
+                            && (point_in_triangle(nx, ny, BRAND_BOLT_UPPER)
+                                || point_in_triangle(nx, ny, BRAND_BOLT_LOWER));
+                        let col = if on_outline || in_fill {
                             fg
                         } else {
                             let ty = (fy / size as f32).clamp(0.0, 1.0);
@@ -215,17 +254,17 @@ pub fn build_app_icon() -> egui::IconData {
                                 bg_top[1] + (bg_bot[1] - bg_top[1]) * ty,
                                 bg_top[2] + (bg_bot[2] - bg_top[2]) * ty,
                             ];
-                            // Subtle 1px inner rim highlight matching `draw_brand_logo`
+                            // Subtle symmetric outer contour matching `draw_brand_logo`
                             let edge_dist = if dx > 0.0 && dy > 0.0 {
                                 corner_r - dist
                             } else {
                                 (half - (fx - half).abs()).min(half - (fy - half).abs())
                             };
-                            if edge_dist <= 1.05 {
-                                let rim = 0.20 * (1.0 - 0.35 * ty);
-                                c[0] += (255.0 - c[0]) * rim;
-                                c[1] += (255.0 - c[1]) * rim;
-                                c[2] += (255.0 - c[2]) * rim;
+                            if edge_dist <= 0.9 {
+                                let shade = 0.93_f32;
+                                c[0] *= shade;
+                                c[1] *= shade;
+                                c[2] *= shade;
                             }
                             c
                         };
@@ -253,6 +292,11 @@ pub fn build_app_icon() -> egui::IconData {
         width: size as u32,
         height: size as u32,
     }
+}
+
+/// Generate the solid 32x32 window/taskbar RGBA icon matching `assets/app.ico`.
+pub fn build_app_icon() -> egui::IconData {
+    build_brand_icon(1.0)
 }
 
 pub fn configure_fonts(ctx: &egui::Context) {

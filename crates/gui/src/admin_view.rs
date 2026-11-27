@@ -323,7 +323,7 @@ impl GameAccelApp {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(
-                            RichText::new("经隧道访问需先在「加速驾驶舱」开启加速")
+                            RichText::new("经隧道访问需先在「连接总览」开启加速")
                                 .size(FONT_SM)
                                 .color(p.warn_text),
                         );

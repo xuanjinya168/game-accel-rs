@@ -62,18 +62,29 @@ fn draw_terracotta_squircle(
     painter: &Painter,
     rect: Rect,
     radius: f32,
-    highlight_alpha: u8,
+    boost: f32,
     p: ThemePalette,
 ) {
     let r_u8 = radius.round() as u8;
     // Anti-aliased solid base keeps outer rounded edges butter-smooth.
     painter.rect_filled(rect, CornerRadius::same(r_u8), p.accent);
 
-    // Subtle top-lit terracotta gradient (#E38667 -> #CC6848) inset 0.5px inside the AA rim.
+    // Subtle top-lit terracotta gradient (#E38667 -> #CC6848) inset 0.5px inside the AA rim,
+    // gently lifted on hover/pulse without washing out the outer corners.
     let inner = rect.shrink(0.5);
     let r_in = (radius - 0.5).max(1.0).min(inner.width() * 0.5);
-    let top_col = Color32::from_rgb(227, 134, 103);
-    let bot_col = Color32::from_rgb(204, 104, 72);
+    let lift = boost.clamp(0.0, 1.0) * 14.0;
+    let clamp_u8 = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    let top_col = Color32::from_rgb(
+        clamp_u8(227.0 + lift),
+        clamp_u8(134.0 + lift * 0.85),
+        clamp_u8(103.0 + lift * 0.75),
+    );
+    let bot_col = Color32::from_rgb(
+        clamp_u8(204.0 + lift * 0.85),
+        clamp_u8(104.0 + lift * 0.75),
+        clamp_u8(72.0 + lift * 0.65),
+    );
     let lerp_col = |y: f32| -> Color32 {
         let t = ((y - inner.top()) / inner.height().max(1.0)).clamp(0.0, 1.0);
         Color32::from_rgb(
@@ -110,11 +121,18 @@ fn draw_terracotta_squircle(
     }
     painter.add(Shape::mesh(mesh));
 
-    // Crisp 1px inner top-lit rim highlight.
+    // Symmetric 1px contour anchored directly on `rect` with `StrokeKind::Inside`
+    // (centers at `.5` pixel coordinates on all 4 edges; uses premultiplied sRGB alpha
+    // to avoid `from_white_alpha`'s gamma amplification and keep all 4 corners razor-crisp).
+    let edge_col = if p.is_dark {
+        Color32::from_rgba_premultiplied(28, 28, 28, 28)
+    } else {
+        Color32::from_rgba_premultiplied(0, 0, 0, 18)
+    };
     painter.rect_stroke(
-        inner,
-        CornerRadius::same(r_in.round() as u8),
-        Stroke::new(1.0_f32, Color32::from_white_alpha(highlight_alpha)),
+        rect,
+        CornerRadius::same(r_u8),
+        Stroke::new(1.0_f32, edge_col),
         eframe::egui::StrokeKind::Inside,
     );
 }
@@ -146,10 +164,7 @@ pub fn draw_brand_logo(painter: &Painter, rect: Rect, p: ThemePalette, visual: B
         );
     }
 
-    let highlight_alpha = ((0.22 + hover * 0.16 + pulse * 0.22) * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    draw_terracotta_squircle(painter, rect, radius, highlight_alpha, p);
+    draw_terracotta_squircle(painter, rect, radius, (hover * 0.6 + pulse * 0.8).min(1.0), p);
 
     let c = rect.center();
     let half = sz * 0.5;
@@ -162,8 +177,8 @@ pub fn draw_brand_logo(painter: &Painter, rect: Rect, p: ThemePalette, visual: B
 
     // Bottom-up rising solid white fill controlled by `fill_t`
     if fill_t > 0.02 {
-        let y_top = c.y - 0.68 * half * scale;
-        let y_bot = c.y + 0.68 * half * scale;
+        let y_top = c.y - 0.58 * half * scale;
+        let y_bot = c.y + 0.58 * half * scale;
         let y_cut = y_bot - (y_bot - y_top) * fill_t;
 
         for piece in [
@@ -179,7 +194,7 @@ pub fn draw_brand_logo(painter: &Painter, rect: Rect, p: ThemePalette, visual: B
     }
 
     // Always-crisp white wireframe outline (defines idle silhouette & keeps active stroke sharp)
-    let stroke_w = (sz * 0.044).clamp(1.15, 2.2);
+    let stroke_w = (sz * 0.040).clamp(1.1, 2.0);
     painter.add(Shape::closed_line(
         map_pts(&BRAND_BOLT_OUTLINE),
         Stroke::new(stroke_w, Color32::from_white_alpha(238)),

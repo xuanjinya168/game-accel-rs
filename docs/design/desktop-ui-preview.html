@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GameAccel v0.3.5 桌面端交互式设计规范（自包含离线预览）</title>
+  <title>GameAccel v0.3.6 桌面端交互式设计规范（自包含离线预览）</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; }
@@ -957,7 +957,7 @@
         <!-- 28px Topbar (with Minimize / Maximize / Close) -->
         <header class="topbar">
           <div class="topbar-left">
-            <span id="viewTitle" class="view-title">加速驾驶舱</span>
+            <span id="viewTitle" class="view-title">连接总览</span>
             <span id="portBadge" class="port-badge mono slot-lock" onclick="toast('已复制代理地址 127.0.0.1:2080')">127.0.0.1:2080</span>
           </div>
           <div class="topbar-right">
@@ -1176,7 +1176,7 @@
             <div class="bento-card set-card">
               <div class="set-row">
                 <div style="display:flex;align-items:center;gap:10px;">
-                  <span style="font-size:13px;">当前版本 v0.3.5</span>
+                  <span style="font-size:13px;">当前版本 v0.3.6</span>
                   <span style="font-size:12px;color:var(--c-muted);">已是最新</span>
                 </div>
                 <div style="display:flex;gap:6px;">
@@ -1350,7 +1350,7 @@
             </button>
             <div class="hairline" style="margin:3px 0;"></div>
             <button class="pill-menu-row" id="pillMenuConn" onclick="toggleConnect()">断开加速</button>
-            <button class="pill-menu-row" onclick="setNav('cockpit'); toast('已唤醒主窗口加速驾驶舱')">查看流量详情</button>
+            <button class="pill-menu-row" onclick="setNav('cockpit'); toast('已唤醒主窗口连接总览')">查看流量详情</button>
             <button class="pill-menu-row danger" onclick="toast('已隐藏桌面网速悬浮窗')">关闭流量悬浮窗</button>
           </div>
 
@@ -1531,7 +1531,7 @@
 
     function setNav(n) {
       st.nav = n;
-      const titles = { cockpit: '加速驾驶舱', nodes: '线路与订阅', logs: '诊断日志', settings: '偏好设置', ops: '服务端运维' };
+      const titles = { cockpit: '连接总览', nodes: '线路与订阅', logs: '诊断日志', settings: '偏好设置', ops: '服务端运维' };
       document.getElementById('viewTitle').textContent = titles[n];
       ['cockpit', 'nodes', 'logs', 'settings', 'ops'].forEach(k => {
         document.getElementById('page-' + k).classList.toggle('hidden', k !== n);
@@ -1978,8 +1978,8 @@
 
     // Hollow-to-Solid Terracotta Brand Logo Animation (exact 1:1 mirror of crates/gui/src/icons.rs)
     const BRAND_BOLT_OUTLINE = [
-      [0.14, -0.68], [-0.50, 0.07], [-0.0261, 0.07],
-      [-0.14, 0.68], [0.50, -0.07], [0.0261, -0.07],
+      [0.12, -0.58], [-0.43, 0.06], [-0.0225, 0.06],
+      [-0.12, 0.58], [0.43, -0.06], [0.0225, -0.06],
     ];
     const brandAnim = {
       fillT: 1,
@@ -2024,15 +2024,16 @@
         ctx.stroke();
       }
 
+      const lift = Math.min(1, hover * 0.6 + p * 0.8) * 14;
       const g = ctx.createLinearGradient(x, y, x, y + sz);
-      g.addColorStop(0, '#E38667');
-      g.addColorStop(1, '#CC6848');
+      g.addColorStop(0, `rgb(${Math.min(255, Math.round(227 + lift))},${Math.min(255, Math.round(134 + lift * 0.85))},${Math.min(255, Math.round(103 + lift * 0.75))})`);
+      g.addColorStop(1, `rgb(${Math.min(255, Math.round(204 + lift * 0.85))},${Math.min(255, Math.round(104 + lift * 0.75))},${Math.min(255, Math.round(72 + lift * 0.65))})`);
       drawRoundRectPath(ctx, x, y, sz, sz, r);
       ctx.fillStyle = g;
       ctx.fill();
 
       drawRoundRectPath(ctx, x + 0.5, y + 0.5, sz - 1, sz - 1, Math.max(1, r - 0.5));
-      ctx.strokeStyle = `rgba(255,255,255,${0.22 + hover * 0.16 + p * 0.22})`;
+      ctx.strokeStyle = st.theme === 'dark' ? 'rgba(255,255,255,0.11)' : 'rgba(0,0,0,0.07)';
       ctx.lineWidth = 1;
       ctx.stroke();
 
@@ -2051,8 +2052,8 @@
         ctx.save();
         traceBolt();
         ctx.clip();
-        const yTop = cy - 0.68 * half * scale;
-        const yBot = cy + 0.68 * half * scale;
+        const yTop = cy - 0.58 * half * scale;
+        const yBot = cy + 0.58 * half * scale;
         const fillH = (yBot - yTop) * brandAnim.fillT;
         ctx.fillStyle = '#FFFFFF';
         ctx.fillRect(x, yBot - fillH, sz, fillH + 2);
@@ -2061,7 +2062,7 @@
 
       traceBolt();
       ctx.strokeStyle = 'rgba(255,255,255,0.93)';
-      ctx.lineWidth = Math.max(1.15, Math.min(2.2, sz * 0.044));
+      ctx.lineWidth = Math.max(1.1, Math.min(2.0, sz * 0.040));
       ctx.lineJoin = 'round';
       ctx.stroke();
       ctx.restore();

@@ -159,7 +159,7 @@ impl GameAccelApp {
         aligned_row(ui, 28.0, |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let page_title = match self.active_tab {
-                NavTab::Dashboard => "加速驾驶舱",
+                NavTab::Dashboard => "连接总览",
                 NavTab::Nodes => "线路与订阅",
                 NavTab::Logs => "诊断日志",
                 NavTab::Admin => "服务端运维",
