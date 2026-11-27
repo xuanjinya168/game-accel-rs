@@ -706,30 +706,34 @@
     /* Simulated Windows 11 Taskbar stage for Floating Pill + Anchored Context Menu */
     .taskbar-stage {
       flex: 1;
-      min-height: 310px;
+      min-height: 360px;
       border-radius: 10px;
-      background: linear-gradient(180deg, var(--c-canvas) 0%, var(--c-well) 82%, rgba(28,27,25,0.12) 82%, rgba(28,27,25,0.18) 100%);
+      background: linear-gradient(180deg, var(--c-canvas) 0%, var(--c-well) calc(100% - 60px), rgba(28,27,25,0.11) calc(100% - 60px), rgba(28,27,25,0.17) 100%);
       border: 1px solid var(--c-border);
       position: relative;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: flex-end;
-      padding-bottom: 10px;
+      padding: 40px 12px 8px;
       overflow: hidden;
     }
     .studio-scope[data-theme="dark"] .taskbar-stage {
-      background: linear-gradient(180deg, #161615 0%, #1D1D1B 82%, #111110 82%, #0C0C0B 100%);
+      background: linear-gradient(180deg, #161615 0%, #1D1D1B calc(100% - 60px), #111110 calc(100% - 60px), #0C0C0B 100%);
     }
     .taskbar-hint {
       position: absolute;
-      top: 10px;
+      top: 11px;
       left: 12px;
+      right: 12px;
       font-size: 11px;
       color: var(--c-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    /* 166x236 Floating Card Context Menu (Win11 8px corners, anchored 8px strictly above card) */
+    /* 166x236 Floating Card Context Menu (Win11 8px corners, anchored 8px strictly above taskbar/card) */
     .pill-menu {
       width: 166px;
       padding: 7px 6px;
@@ -737,7 +741,7 @@
       background: var(--c-surface);
       border: 1px solid var(--c-border-strong);
       box-shadow: var(--c-pop-shadow);
-      margin-bottom: 8px; /* exact 8pt gap above floating card */
+      margin-bottom: 16px; /* sits cleanly 8pt above the 60px simulated taskbar top */
       display: flex;
       flex-direction: column;
       gap: 2px;
@@ -760,13 +764,16 @@
     .pill-menu-row.danger:hover { background: var(--c-err-soft); color: var(--c-err); }
     .pill-check {
       position: absolute;
-      left: 9px;
+      left: 8px;
       top: 50%;
       transform: translateY(-50%);
       color: var(--c-pill-up);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
 
-    /* 98x44 Desktop Floating Speed Pill (Win11 8px corners) */
+    /* 98x44 Desktop Floating Speed Pill (Win11 8px corners, proportional font matching floating_pill.rs) */
     .speed-pill {
       width: 98px;
       height: 44px;
@@ -776,14 +783,25 @@
       box-shadow: var(--c-pop-shadow);
       display: flex;
       align-items: center;
-      padding: 0 8px 0 10px;
-      gap: 7px;
+      padding: 0 6px 0 8px;
+      gap: 5px;
       cursor: context-menu;
+      overflow: hidden;
     }
-    .pill-led-box { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-    .pill-speeds { display: flex; flex-direction: column; gap: 2px; font-size: 11.5px; line-height: 1.1; }
-    .pill-up { color: var(--c-pill-up); display: flex; align-items: center; gap: 3px; }
-    .pill-down { color: var(--c-pill-down); display: flex; align-items: center; gap: 3px; }
+    .pill-led-box { width: 12px; height: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .pill-speeds {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 3px;
+      font-size: 11.5px;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .pill-up { color: var(--c-pill-up); display: flex; align-items: center; gap: 3px; white-space: nowrap; }
+    .pill-down { color: var(--c-pill-down); display: flex; align-items: center; gap: 3px; white-space: nowrap; }
 
     /* 328px System Tray Popover (Win11 8px corners) */
     .tray-popover {
@@ -1307,26 +1325,26 @@
       <!-- Left: 98x44 Desktop Speed Pill + 166x236 Anchored Context Menu -->
       <div class="showcase-panel">
         <div class="showcase-head">
-          <span>桌面网速悬浮窗（98×44）与外框锚定右键菜单（166×236）</span>
-          <button class="chip-btn" style="height:24px;font-size:11px;" onclick="togglePillMenu()">显示 / 隐藏右键菜单</button>
+          <span>网速悬浮窗（98×44）与右键菜单（166×236）</span>
+          <button class="chip-btn" style="height:24px;font-size:11px;" onclick="togglePillMenu()">显示 / 隐藏菜单</button>
         </div>
 
         <div class="taskbar-stage" oncontextmenu="event.preventDefault(); togglePillMenu();">
-          <span class="taskbar-hint">Win11 8px 原生圆角 · 右键下方悬浮窗切换菜单（严格避开悬浮窗 + 任务栏 8pt 间距）</span>
+          <span class="taskbar-hint">Win11 8px 原生圆角 · 右键或点击悬浮窗切换菜单（任务栏上方 8pt）</span>
 
           <!-- 166x236 Context Menu -->
           <div id="pillContextMenu" class="pill-menu">
             <button class="pill-menu-row" onclick="togglePillOpt('topmost')">
-              <span class="pill-check" id="chk-topmost">✓</span>窗口置顶显示
+              <span class="pill-check" id="chk-topmost"><svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="2.2,6.2 4.8,8.8 9.8,3.2"/></svg></span>窗口置顶显示
             </button>
             <button class="pill-menu-row" onclick="togglePillOpt('edgeHide')">
-              <span class="pill-check" id="chk-edgeHide" style="visibility:hidden;">✓</span>贴边自动隐藏
+              <span class="pill-check" id="chk-edgeHide" style="visibility:hidden;"><svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="2.2,6.2 4.8,8.8 9.8,3.2"/></svg></span>贴边自动隐藏
             </button>
             <button class="pill-menu-row" onclick="togglePillOpt('fsHide')">
-              <span class="pill-check" id="chk-fsHide">✓</span>全屏时自动隐藏
+              <span class="pill-check" id="chk-fsHide"><svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="2.2,6.2 4.8,8.8 9.8,3.2"/></svg></span>全屏时自动隐藏
             </button>
             <button class="pill-menu-row" onclick="togglePillOpt('locked')">
-              <span class="pill-check" id="chk-locked" style="visibility:hidden;">✓</span>锁定悬浮窗位置
+              <span class="pill-check" id="chk-locked" style="visibility:hidden;"><svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="2.2,6.2 4.8,8.8 9.8,3.2"/></svg></span>锁定悬浮窗位置
             </button>
             <div class="hairline" style="margin:3px 0;"></div>
             <button class="pill-menu-row" id="pillMenuConn" onclick="toggleConnect()">断开加速</button>
@@ -1337,11 +1355,17 @@
           <!-- 98x44 Floating Speed Card -->
           <div class="speed-pill" title="右键弹出菜单 · 左键拖拽 · 双击唤起主窗口" onclick="togglePillMenu()">
             <div class="pill-led-box">
-              <canvas id="pillLedCanvas" width="28" height="28" style="width:14px;height:14px;"></canvas>
+              <canvas id="pillLedCanvas" width="24" height="24" style="width:12px;height:12px;"></canvas>
             </div>
-            <div class="pill-speeds mono">
-              <div class="pill-up"><span>↑</span><span id="pillUpTxt">1.2 MB/s</span></div>
-              <div class="pill-down"><span>↓</span><span id="pillDownTxt">14.8 MB/s</span></div>
+            <div class="pill-speeds">
+              <div class="pill-up">
+                <svg width="7" height="9" viewBox="0 0 8 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="9" x2="4" y2="1.2"/><polyline points="1.4,3.8 4,1.2 6.6,3.8"/></svg>
+                <span id="pillUpTxt">1.24 MB/s</span>
+              </div>
+              <div class="pill-down">
+                <svg width="7" height="9" viewBox="0 0 8 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="1" x2="4" y2="8.8"/><polyline points="1.4,6.2 4,8.8 6.6,6.2"/></svg>
+                <span id="pillDownTxt">14.8 MB/s</span>
+              </div>
             </div>
           </div>
         </div>
@@ -1382,16 +1406,29 @@
             </div>
           </div>
 
-          <div id="trayTakeSeg" class="seg" style="height:26px;grid-template-columns:repeat(3,1fr);">
-            <button onclick="setTakeover('tun')" data-v="tun" class="active">游戏 TUN</button>
-            <button onclick="setTakeover('sys')" data-v="sys">系统代理</button>
-            <button onclick="setTakeover('port')" data-v="port">仅端口</button>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+            <span style="font-size:12px;color:var(--c-ink-2);flex-shrink:0;">代理模式</span>
+            <div id="trayTakeSeg" class="seg" style="width:214px;height:26px;grid-template-columns:repeat(3,1fr);">
+              <button onclick="setTakeover('tun')" data-v="tun" class="active">TUN</button>
+              <button onclick="setTakeover('sys')" data-v="sys">系统代理</button>
+              <button onclick="setTakeover('port')" data-v="port">仅端口</button>
+            </div>
           </div>
-          <div id="trayRouteSeg" class="seg" style="height:26px;grid-template-columns:repeat(3,1fr);">
-            <button onclick="setRoute('rule')" data-v="rule" class="active">大陆直连</button>
-            <button onclick="setRoute('global')" data-v="global">全局代理</button>
-            <button onclick="setRoute('direct')" data-v="direct">纯直连</button>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+            <span style="font-size:12px;color:var(--c-ink-2);flex-shrink:0;">分流策略</span>
+            <div id="trayRouteSeg" class="seg" style="width:214px;height:26px;grid-template-columns:repeat(3,1fr);">
+              <button onclick="setRoute('rule')" data-v="rule" class="active">规则</button>
+              <button onclick="setRoute('global')" data-v="global">全局</button>
+              <button onclick="setRoute('direct')" data-v="direct">直连</button>
+            </div>
           </div>
+
+          <div class="hairline"></div>
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <span id="trayNodesTitle" style="font-size:12px;color:var(--c-ink-2);">快捷节点 (4)</span>
+            <button class="chip-btn" style="height:23px;font-size:11px;" onclick="toast('正在探测全部节点延迟…')">全部测速</button>
+          </div>
+          <div id="trayNodesBox" style="display:flex;flex-direction:column;gap:3px;"></div>
 
           <div class="hairline"></div>
           <div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--c-muted);">
@@ -1801,8 +1838,8 @@
       paintSeg('setTraySeg', st.trayStyle);
       paintSeg('setLightSeg', st.pillLight);
 
-      // Quick Nodes
-      document.getElementById('quickNodesBox').innerHTML = nodes.map(n => {
+      // Quick Nodes (Dashboard + Tray Popover)
+      const quickHtml = nodes.map(n => {
         const sel = n.id === st.activeId;
         const rttCol = n.rtt === '超时' ? 'var(--c-err)' : (n.fast ? 'var(--c-ok)' : 'var(--c-warn)');
         return `
@@ -1812,6 +1849,20 @@
               <span class="truncate" style="font-size:12.5px;">${n.name}</span>
             </div>
             <span class="quick-rtt mono slot-lock" style="color:${rttCol};">${n.rtt}</span>
+          </div>`;
+      }).join('');
+      document.getElementById('quickNodesBox').innerHTML = quickHtml;
+      document.getElementById('trayNodesTitle').textContent = `快捷节点 (${nodes.length})`;
+      document.getElementById('trayNodesBox').innerHTML = nodes.slice(0, 4).map(n => {
+        const sel = n.id === st.activeId;
+        const rttCol = n.rtt === '超时' ? 'var(--c-err)' : (n.fast ? 'var(--c-ok)' : 'var(--c-warn)');
+        return `
+          <div onclick="pickNode('${n.id}')" class="quick-row ${sel ? 'selected' : ''}" style="height:28px;padding:0 8px;">
+            <div style="display:flex;align-items:center;gap:7px;min-width:0;flex:1;">
+              <span class="state-dot" style="background:${sel ? (st.phase === 'connected' ? 'var(--c-ok)' : 'var(--c-cta)') : 'var(--c-border-strong)'};"></span>
+              <span class="truncate" style="font-size:12px;">${n.name}</span>
+            </div>
+            <span class="mono" style="font-size:11px;color:${rttCol};flex-shrink:0;">${n.rtt}</span>
           </div>`;
       }).join('');
 
@@ -1930,8 +1981,8 @@
       const c = document.getElementById('pillLedCanvas');
       if (c) {
         const ctx = c.getContext('2d');
-        ctx.clearRect(0, 0, 28, 28);
-        const cx = 14, cy = 14;
+        ctx.clearRect(0, 0, 24, 24);
+        const cx = 12, cy = 12;
         const cs = getComputedStyle(document.getElementById('studioRoot'));
         const col = st.phase === 'disconnected'
           ? cs.getPropertyValue('--c-border-strong').trim()
@@ -1940,39 +1991,39 @@
 
         if (st.phase === 'disconnected') {
           ctx.fillStyle = col;
-          ctx.beginPath(); ctx.arc(cx, cy, 5.2, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx, cy, 4.4, 0, Math.PI * 2); ctx.fill();
         } else if (st.pillLight === 'glow') {
-          const r = 9.5 + 3.0 * (1 - Math.cos(phase * Math.PI * 2));
+          const r = 7.4 + 1.8 * (1 - Math.cos(phase * Math.PI * 2));
           ctx.fillStyle = col;
           ctx.globalAlpha = 0.22;
           ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
           ctx.globalAlpha = 1;
-          ctx.beginPath(); ctx.arc(cx, cy, 5.2, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx, cy, 4.4, 0, Math.PI * 2); ctx.fill();
         } else if (st.pillLight === 'ripple') {
           ctx.strokeStyle = col;
-          ctx.lineWidth = 1.8;
+          ctx.lineWidth = 1.6;
           ctx.globalAlpha = 0.72 * Math.sin(Math.PI * phase);
-          ctx.beginPath(); ctx.arc(cx, cy, 6 + 7.5 * phase, 0, Math.PI * 2); ctx.stroke();
+          ctx.beginPath(); ctx.arc(cx, cy, 5.2 + 5.6 * phase, 0, Math.PI * 2); ctx.stroke();
           ctx.globalAlpha = 1;
           ctx.fillStyle = col;
-          ctx.beginPath(); ctx.arc(cx, cy, 5.2, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx, cy, 4.4, 0, Math.PI * 2); ctx.fill();
         } else if (st.pillLight === 'orbit') {
           ctx.strokeStyle = col;
           ctx.globalAlpha = 0.22;
-          ctx.lineWidth = 2;
-          ctx.beginPath(); ctx.arc(cx, cy, 10.5, 0, Math.PI * 2); ctx.stroke();
+          ctx.lineWidth = 1.8;
+          ctx.beginPath(); ctx.arc(cx, cy, 9.2, 0, Math.PI * 2); ctx.stroke();
           ctx.globalAlpha = 1;
           const a = phase * Math.PI * 2;
-          ctx.lineWidth = 3;
-          ctx.beginPath(); ctx.arc(cx, cy, 10.5, a, a + 1.6); ctx.stroke();
+          ctx.lineWidth = 2.6;
+          ctx.beginPath(); ctx.arc(cx, cy, 9.2, a, a + 1.6); ctx.stroke();
           ctx.fillStyle = col;
-          ctx.beginPath(); ctx.arc(cx, cy, 3.4, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx, cy, 3.0, 0, Math.PI * 2); ctx.fill();
         } else {
           ctx.fillStyle = col;
           for (let i = 0; i < 3; i++) {
             const wave = 0.5 * (1 + Math.sin(phase * Math.PI * 2 + i * 1.4));
-            const h = 6 + 12 * wave;
-            ctx.fillRect(cx + (i - 1) * 7.5 - 2.2, cy - h / 2, 4.4, h);
+            const h = 5 + 10 * wave;
+            ctx.fillRect(cx + (i - 1) * 6.4 - 2.0, cy - h / 2, 4.0, h);
           }
         }
       }
