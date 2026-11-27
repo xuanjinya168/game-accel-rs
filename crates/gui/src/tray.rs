@@ -139,7 +139,10 @@ pub(crate) fn strip_native_chrome(hwnd: isize) {
         const GWL_STYLE: i32 = -16;
         const GWL_EXSTYLE: i32 = -20;
 
-        const WS_POPUP: isize = 0x8000_0000u32 as i32 as isize;
+        // `u32 as isize` zero-extends on 64-bit, matching what `GetWindowLongPtrW` returns
+        // (0x9600_0000, not 0xFFFF_FFFF_9600_0000). A sign-extended constant made the style
+        // never compare equal, so `SWP_FRAMECHANGED` fired every frame and the window flickered.
+        const WS_POPUP: isize = 0x8000_0000u32 as isize;
         const WS_CLIPCHILDREN: isize = 0x0200_0000;
         const WS_CLIPSIBLINGS: isize = 0x0400_0000;
         const WS_CAPTION: isize = 0x00C0_0000;
@@ -162,34 +165,9 @@ pub(crate) fn strip_native_chrome(hwnd: isize) {
         const SWP_NOACTIVATE: u32 = 0x0010;
         const SWP_FRAMECHANGED: u32 = 0x0020;
 
-        const DWMWA_NCRENDERING_POLICY: u32 = 2;
         const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
-        const DWMNCRP_DISABLED: u32 = 1;
 
         unsafe {
-            // The DWM attributes stick to the HWND, so they only need to be re-applied when the
-            // window handle changes (viewport recreation, monitor change, …). Re-sending them
-            // every frame would make DWM re-evaluate the window on each compositor pass.
-            static DWM_READY: std::sync::atomic::AtomicIsize =
-                std::sync::atomic::AtomicIsize::new(0);
-            if DWM_READY.load(std::sync::atomic::Ordering::Relaxed) != hwnd {
-                let nc_disabled: u32 = DWMNCRP_DISABLED;
-                let _ = DwmSetWindowAttribute(
-                    hwnd as *mut c_void,
-                    DWMWA_NCRENDERING_POLICY,
-                    (&nc_disabled as *const u32).cast::<c_void>(),
-                    std::mem::size_of::<u32>() as u32,
-                );
-                let no_transitions: i32 = 1;
-                let _ = DwmSetWindowAttribute(
-                    hwnd as *mut c_void,
-                    DWMWA_TRANSITIONS_FORCEDISABLED,
-                    (&no_transitions as *const i32).cast::<c_void>(),
-                    std::mem::size_of::<i32>() as u32,
-                );
-                DWM_READY.store(hwnd, std::sync::atomic::Ordering::Relaxed);
-            }
-
             let mut changed = false;
 
             let cur_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
@@ -224,6 +202,16 @@ pub(crate) fn strip_native_chrome(hwnd: isize) {
             }
 
             if changed {
+                // NOTE: do NOT set `DWMWA_NCRENDERING_POLICY = DISABLED` — that makes
+                // `DefWindowProc` fall back to painting a classic caption (title text + — □ ×)
+                // straight over the client area on every activation change.
+                let no_transitions: i32 = 1;
+                let _ = DwmSetWindowAttribute(
+                    hwnd as *mut c_void,
+                    DWMWA_TRANSITIONS_FORCEDISABLED,
+                    (&no_transitions as *const i32).cast::<c_void>(),
+                    std::mem::size_of::<i32>() as u32,
+                );
                 let _ = SetWindowPos(
                     hwnd,
                     0,
@@ -240,6 +228,101 @@ pub(crate) fn strip_native_chrome(hwnd: isize) {
                     ),
                 );
             }
+        }
+        install_chromeless_subclass(hwnd);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
+    }
+}
+
+/// Original window procedures of subclassed chromeless windows, keyed by HWND.
+#[cfg(target_os = "windows")]
+static CHROMELESS_ORIG_PROCS: std::sync::Mutex<Option<std::collections::HashMap<isize, isize>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn CallWindowProcW(prev: isize, hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+}
+
+/// Subclass procedure that stops `DefWindowProc` from drawing a native caption.
+///
+/// Root cause of the `GameAccel 网...` / `— □ ×` flash on right-click: when the context menu
+/// takes focus, the floating card receives `WM_NCACTIVATE`; `DefWindowProc` (and the
+/// undocumented uxtheme `WM_NCUAHDRAWCAPTION` / `WM_NCUAHDRAWFRAME`) then paint the classic
+/// caption bar *directly over the client area* of a custom-frame window, regardless of the
+/// stripped style bits, until the next GL frame covers it. Passing `lParam = -1` for
+/// `WM_NCACTIVATE` keeps winit's focus tracking but tells `DefWindowProc` not to repaint the
+/// non-client area; the UAH and `WM_NCPAINT` messages are swallowed outright (the window has
+/// no non-client area at all).
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn chromeless_wndproc(
+    hwnd: isize,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    const WM_NCDESTROY: u32 = 0x0082;
+    const WM_NCPAINT: u32 = 0x0085;
+    const WM_NCACTIVATE: u32 = 0x0086;
+    const WM_NCUAHDRAWCAPTION: u32 = 0x00AE;
+    const WM_NCUAHDRAWFRAME: u32 = 0x00AF;
+
+    let orig = CHROMELESS_ORIG_PROCS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&hwnd).copied()))
+        .unwrap_or(0);
+    unsafe {
+        if orig == 0 {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        match msg {
+            WM_NCPAINT | WM_NCUAHDRAWCAPTION | WM_NCUAHDRAWFRAME => 0,
+            WM_NCACTIVATE => CallWindowProcW(orig, hwnd, msg, wparam, -1),
+            WM_NCDESTROY => {
+                if let Ok(mut g) = CHROMELESS_ORIG_PROCS.lock()
+                    && let Some(m) = g.as_mut()
+                {
+                    m.remove(&hwnd);
+                }
+                CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+            }
+            _ => CallWindowProcW(orig, hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// Install [`chromeless_wndproc`] on `hwnd` once (idempotent; must run on the owning thread).
+fn install_chromeless_subclass(hwnd: isize) {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+            fn SetWindowLongPtrW(hwnd: isize, index: i32, new_long: isize) -> isize;
+        }
+        const GWLP_WNDPROC: i32 = -4;
+        if hwnd == 0 {
+            return;
+        }
+        let ours = chromeless_wndproc as *const () as isize;
+        unsafe {
+            let cur = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+            if cur == 0 || cur == ours {
+                return;
+            }
+            {
+                let Ok(mut g) = CHROMELESS_ORIG_PROCS.lock() else {
+                    return;
+                };
+                g.get_or_insert_with(Default::default).insert(hwnd, cur);
+            }
+            let _ = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ours);
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -261,6 +344,12 @@ pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
         unsafe extern "system" {
             fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
             fn SetWindowLongPtrW(hwnd: isize, index: i32, new_long: isize) -> isize;
+            fn SetLayeredWindowAttributes(
+                hwnd: isize,
+                cr_key: u32,
+                b_alpha: u8,
+                dw_flags: u32,
+            ) -> i32;
             fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
             fn SetWindowPos(
                 hwnd: isize,
@@ -292,14 +381,16 @@ pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
         }
 
         const GWLP_HWNDPARENT: i32 = -8;
-        const GWL_STYLE: i32 = -16;
+        const GWL_EXSTYLE: i32 = -20;
 
-        const WS_VISIBLE: isize = 0x1000_0000;
+        const WS_EX_TOPMOST: isize = 0x0000_0008;
+        const WS_EX_LAYERED: isize = 0x0008_0000;
+        const LWA_ALPHA: u32 = 0x0000_0002;
 
         const HWND_TOPMOST: isize = -1;
         const SWP_NOACTIVATE: u32 = 0x0010;
         const SWP_FRAMECHANGED: u32 = 0x0020;
-        const SWP_HIDEWINDOW: u32 = 0x0080;
+        const SWP_SHOWWINDOW: u32 = 0x0040;
 
         const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
         const DWMWCP_ROUND: u32 = 2;
@@ -320,10 +411,22 @@ pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
             // Drop `WS_CAPTION`/`WS_SYSMENU` & co. through the shared helper so the popup and
             // the floating card can never drift apart again.
             strip_native_chrome(hwnd);
-            let cur_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-            let new_style = cur_style & !WS_VISIBLE;
-            if new_style != cur_style {
-                let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
+
+            let cur_ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let new_ex = cur_ex | WS_EX_TOPMOST | WS_EX_LAYERED;
+            if new_ex != cur_ex {
+                let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex);
+            }
+
+            // Set alpha = 0 BEFORE showing the window so DWM realizes the WGL redirection
+            // surface and receives the first OpenGL `swap_buffers()` completely invisibly,
+            // eliminating the 1-frame blank/white WGL flash on `ShowWindow`.
+            let _ = SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+
+            let diam = rect.corner_diam.max(8);
+            let hrgn = CreateRoundRectRgn(0, 0, rect.w + 1, rect.h + 1, diam, diam);
+            if hrgn != 0 {
+                let _ = SetWindowRgn(hwnd, hrgn, 0);
             }
 
             let _ = SetWindowPos(
@@ -333,14 +436,8 @@ pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
                 rect.y,
                 rect.w,
                 rect.h,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-
-            let diam = rect.corner_diam.max(8);
-            let hrgn = CreateRoundRectRgn(0, 0, rect.w + 1, rect.h + 1, diam, diam);
-            if hrgn != 0 {
-                let _ = SetWindowRgn(hwnd, hrgn, 0);
-            }
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -349,14 +446,16 @@ pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
     }
 }
 
-/// Reveal an already-painted `WS_POPUP` popup window directly via Win32 and focus it.
+/// Reveal an already-painted `WS_POPUP | WS_EX_LAYERED` popup window atomically via
+/// `LWA_ALPHA = 255` and focus it.
 pub(crate) fn reveal_popup_window(title: &str, rect: PopupRect, vctx: &egui::Context, pos: Pos2) {
     #[cfg(target_os = "windows")]
     {
         let _ = (vctx, pos);
         #[link(name = "user32")]
         unsafe extern "system" {
-            fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+            fn SetLayeredWindowAttributes(hwnd: isize, cr_key: u32, b_alpha: u8, dw_flags: u32)
+                -> i32;
             fn SetWindowPos(
                 hwnd: isize,
                 insert_after: isize,
@@ -366,13 +465,8 @@ pub(crate) fn reveal_popup_window(title: &str, rect: PopupRect, vctx: &egui::Con
                 cy: i32,
                 flags: u32,
             ) -> i32;
-            fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
             fn SetForegroundWindow(hwnd: isize) -> i32;
             fn SetFocus(hwnd: isize) -> isize;
-        }
-        #[link(name = "gdi32")]
-        unsafe extern "system" {
-            fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
         }
 
         let hwnd = find_own_window(title);
@@ -381,15 +475,10 @@ pub(crate) fn reveal_popup_window(title: &str, rect: PopupRect, vctx: &egui::Con
         }
 
         const HWND_TOPMOST: isize = -1;
-        const SWP_SHOWWINDOW: u32 = 0x0040;
-        const SW_SHOWNORMAL: i32 = 1;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const LWA_ALPHA: u32 = 0x0000_0002;
 
         unsafe {
-            let diam = rect.corner_diam.max(8);
-            let hrgn = CreateRoundRectRgn(0, 0, rect.w + 1, rect.h + 1, diam, diam);
-            if hrgn != 0 {
-                let _ = SetWindowRgn(hwnd, hrgn, 1);
-            }
             let _ = SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
@@ -397,9 +486,9 @@ pub(crate) fn reveal_popup_window(title: &str, rect: PopupRect, vctx: &egui::Con
                 rect.y,
                 rect.w,
                 rect.h,
-                SWP_SHOWWINDOW,
+                SWP_NOACTIVATE,
             );
-            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+            let _ = SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
             let _ = SetForegroundWindow(hwnd);
             let _ = SetFocus(hwnd);
         }
@@ -413,18 +502,22 @@ pub(crate) fn reveal_popup_window(title: &str, rect: PopupRect, vctx: &egui::Con
     }
 }
 
-/// Immediately hide a popup window via `SW_HIDE` before eframe drops its viewport.
+/// Immediately hide a popup window via `LWA_ALPHA = 0` + `SW_HIDE` before eframe drops its viewport.
 pub(crate) fn hide_popup_window(title: &str) {
     #[cfg(target_os = "windows")]
     {
         #[link(name = "user32")]
         unsafe extern "system" {
+            fn SetLayeredWindowAttributes(hwnd: isize, cr_key: u32, b_alpha: u8, dw_flags: u32)
+                -> i32;
             fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
         }
         const SW_HIDE: i32 = 0;
+        const LWA_ALPHA: u32 = 0x0000_0002;
         let hwnd = find_own_window(title);
         if hwnd != 0 {
             unsafe {
+                let _ = SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
