@@ -174,14 +174,15 @@ pub(crate) struct GameAccelApp {
     pub(crate) window_hidden_to_tray: bool,
     pub(crate) tray_popover_open: bool,
     pub(crate) tray_popover_pos: Pos2,
-    pub(crate) tray_popover_just_opened: bool,
+    pub(crate) tray_popover_stage: tray::PopupStage,
     pub(crate) tray_popover_ever_focused: bool,
     pub(crate) tray_popover_search: String,
     pub(crate) floating_pill_pos_dirty: Option<Instant>,
     pub(crate) floating_pill_raise_frames: u8,
     pub(crate) floating_menu_open: bool,
     pub(crate) floating_menu_pos: Pos2,
-    pub(crate) floating_menu_just_opened: bool,
+    pub(crate) floating_menu_phys_pos: Option<[i32; 2]>,
+    pub(crate) floating_menu_stage: tray::PopupStage,
     pub(crate) floating_menu_ever_focused: bool,
     pub(crate) floating_pill_fs_hidden: bool,
     pub(crate) floating_pill_last_fs_check: Instant,
@@ -285,14 +286,15 @@ impl GameAccelApp {
             window_hidden_to_tray: false,
             tray_popover_open: false,
             tray_popover_pos: Pos2::new(800.0, 300.0),
-            tray_popover_just_opened: false,
+            tray_popover_stage: tray::PopupStage::Closed,
             tray_popover_ever_focused: false,
             tray_popover_search: String::new(),
             floating_pill_pos_dirty: None,
             floating_pill_raise_frames: 0,
             floating_menu_open: false,
             floating_menu_pos: Pos2::new(600.0, 200.0),
-            floating_menu_just_opened: false,
+            floating_menu_phys_pos: None,
+            floating_menu_stage: tray::PopupStage::Closed,
             floating_menu_ever_focused: false,
             floating_pill_fs_hidden: false,
             floating_pill_last_fs_check: Instant::now(),
@@ -511,6 +513,14 @@ impl eframe::App for GameAccelApp {
                     let total_rect = ui.max_rect();
                     let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     let radius = if is_maximized { 0u8 } else { 14u8 };
+
+                    // Bound the OS window surface to the painted radius, so the area outside
+                    // the arc can never fall back to an opaque white fill during compositing.
+                    tray::ensure_main_window_region(
+                        is_maximized,
+                        radius as f32,
+                        ctx.pixels_per_point(),
+                    );
 
                     // Enable native 8-direction edge & corner drag resizing on frameless window
                     if !is_maximized {

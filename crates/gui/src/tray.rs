@@ -52,56 +52,468 @@ fn build_native_menu() -> Menu {
 static SAVED_WINDOW_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> =
     std::sync::Mutex::new(None);
 
-/// Apply Windows 11 native rounded corners to all top-level windows of this process.
-pub fn apply_win11_rounded_corners() {
+/// Lifecycle stages for borderless popup viewports (floating card context menu & tray panel).
+///
+/// Why this exists: on Windows, `winit 0.30` unconditionally gives every top-level window
+/// `WS_CAPTION | WS_BORDER | WS_SYSMENU` and re-applies those flags whenever
+/// `ViewportCommand::Visible(true)` runs, causing DWM to briefly composite the native
+/// `— □ ×` titlebar buttons. By creating the viewport with `.with_visible(false)` at an
+/// off-screen coordinate, stripping `WS_CAPTION` -> `WS_POPUP` and disabling DWM non-client
+/// rendering/transitions while hidden, letting `eframe` swap a rendered OpenGL frame, and
+/// finally revealing via Win32 `SetWindowPos(..., SWP_SHOWWINDOW)` directly (never touching
+/// `ViewportCommand::Visible`), `winit` never restores `WS_CAPTION` and zero native chrome
+/// can ever flash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PopupStage {
+    #[default]
+    Closed,
+    HiddenSetup,
+    HiddenPaint,
+    Reveal,
+    VisibleWaitRelease,
+    VisibleArmed,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PopupRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub corner_diam: i32,
+}
+
+/// Strip the Win32 native frame from a top-level window so Windows can never composite the
+/// `— □ ×` titlebar buttons over it.
+///
+/// Why this is needed: `winit 0.30` creates *every* top-level window with
+/// `WS_CAPTION | WS_BORDER | WS_SYSMENU` (`window_state.rs::to_window_styles`) and
+/// `with_decorations(false)` never clears those bits — it only expands the client rect in
+/// `WM_NCCALCSIZE`, i.e. the caption is merely *covered* by our GL surface. Any
+/// `WM_NCACTIVATE` (a context menu stealing focus, a `SetForegroundWindow`, …) makes the
+/// compositor repaint that non-client area, so the buttons leak through for a frame or two.
+///
+/// Three layers, because each one alone still leaks in some scenario:
+/// 1. `WS_POPUP` instead of an overlapped style — there is no caption to paint.
+/// 2. `DWMNCRENDERING_POLICY = DISABLED` — DWM never draws a non-client area, even after
+///    `winit` re-applies the styles it still believes in from its internal bookkeeping.
+/// 3. `TRANSITIONS_FORCEDISABLED` — no activate/deactivate fade that would expose a stale
+///    frame during the switch-over.
+///
+/// Idempotent and cheap: `GWL_STYLE`/`GWL_EXSTYLE` are read on every call and
+/// `SetWindowLongPtrW` + `SWP_FRAMECHANGED` are only issued when something actually
+/// differs, so this is safe to run once per frame.
+pub(crate) fn strip_native_chrome(hwnd: isize) {
     #[cfg(target_os = "windows")]
     {
         use std::ffi::c_void;
-        type Hwnd = *mut c_void;
-        type EnumProc = unsafe extern "system" fn(Hwnd, isize) -> i32;
 
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentProcessId() -> u32;
+        if hwnd == 0 {
+            return;
         }
+
         #[link(name = "user32")]
         unsafe extern "system" {
-            fn EnumWindows(cb: EnumProc, lparam: isize) -> i32;
-            fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+            fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+            fn SetWindowLongPtrW(hwnd: isize, index: i32, new_long: isize) -> isize;
+            fn SetWindowPos(
+                hwnd: isize,
+                insert_after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
         }
         #[link(name = "dwmapi")]
         unsafe extern "system" {
             fn DwmSetWindowAttribute(
-                hwnd: Hwnd,
+                hwnd: *mut c_void,
                 dw_attribute: u32,
                 pv_attribute: *const c_void,
                 cb_attribute: u32,
             ) -> i32;
         }
 
-        unsafe extern "system" fn enum_cb(hwnd: Hwnd, target_pid: isize) -> i32 {
-            let mut pid: u32 = 0;
-            unsafe {
-                GetWindowThreadProcessId(hwnd, &mut pid);
-                if pid as isize == target_pid {
-                    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
-                    const DWMWCP_ROUND: u32 = 2;
-                    let pref = DWMWCP_ROUND;
-                    let _ = DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_WINDOW_CORNER_PREFERENCE,
-                        (&pref as *const u32).cast::<c_void>(),
-                        std::mem::size_of::<u32>() as u32,
-                    );
-                }
-            }
-            1
-        }
+        const GWL_STYLE: i32 = -16;
+        const GWL_EXSTYLE: i32 = -20;
+
+        const WS_POPUP: isize = 0x8000_0000u32 as i32 as isize;
+        const WS_CLIPCHILDREN: isize = 0x0200_0000;
+        const WS_CLIPSIBLINGS: isize = 0x0400_0000;
+        const WS_CAPTION: isize = 0x00C0_0000;
+        const WS_BORDER: isize = 0x0080_0000;
+        const WS_SYSMENU: isize = 0x0008_0000;
+        const WS_THICKFRAME: isize = 0x0004_0000;
+        const WS_MINIMIZEBOX: isize = 0x0002_0000;
+        const WS_MAXIMIZEBOX: isize = 0x0001_0000;
+
+        const WS_EX_DLGMODALFRAME: isize = 0x0000_0001;
+        const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+        const WS_EX_WINDOWEDGE: isize = 0x0000_0100;
+        const WS_EX_CLIENTEDGE: isize = 0x0000_0200;
+        const WS_EX_STATICEDGE: isize = 0x0002_0000;
+        const WS_EX_APPWINDOW: isize = 0x0004_0000;
+
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOMOVE: u32 = 0x0002;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_FRAMECHANGED: u32 = 0x0020;
+
+        const DWMWA_NCRENDERING_POLICY: u32 = 2;
+        const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
+        const DWMNCRP_DISABLED: u32 = 1;
 
         unsafe {
-            let my_pid = GetCurrentProcessId() as isize;
-            let _ = EnumWindows(enum_cb, my_pid);
+            // The DWM attributes stick to the HWND, so they only need to be re-applied when the
+            // window handle changes (viewport recreation, monitor change, …). Re-sending them
+            // every frame would make DWM re-evaluate the window on each compositor pass.
+            static DWM_READY: std::sync::atomic::AtomicIsize =
+                std::sync::atomic::AtomicIsize::new(0);
+            if DWM_READY.load(std::sync::atomic::Ordering::Relaxed) != hwnd {
+                let nc_disabled: u32 = DWMNCRP_DISABLED;
+                let _ = DwmSetWindowAttribute(
+                    hwnd as *mut c_void,
+                    DWMWA_NCRENDERING_POLICY,
+                    (&nc_disabled as *const u32).cast::<c_void>(),
+                    std::mem::size_of::<u32>() as u32,
+                );
+                let no_transitions: i32 = 1;
+                let _ = DwmSetWindowAttribute(
+                    hwnd as *mut c_void,
+                    DWMWA_TRANSITIONS_FORCEDISABLED,
+                    (&no_transitions as *const i32).cast::<c_void>(),
+                    std::mem::size_of::<i32>() as u32,
+                );
+                DWM_READY.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            let mut changed = false;
+
+            let cur_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let new_style = (cur_style
+                & !(WS_CAPTION
+                    | WS_BORDER
+                    | WS_SYSMENU
+                    | WS_THICKFRAME
+                    | WS_MINIMIZEBOX
+                    | WS_MAXIMIZEBOX))
+                | WS_POPUP
+                | WS_CLIPCHILDREN
+                | WS_CLIPSIBLINGS;
+            if new_style != cur_style {
+                let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
+                changed = true;
+            }
+
+            // Keep whatever extended bits the caller already relies on (TOPMOST, LAYERED…),
+            // only normalise the frame-ish ones that can draw a border or a taskbar entry.
+            let cur_ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let new_ex = (cur_ex
+                & !(WS_EX_DLGMODALFRAME
+                    | WS_EX_WINDOWEDGE
+                    | WS_EX_CLIENTEDGE
+                    | WS_EX_STATICEDGE
+                    | WS_EX_APPWINDOW))
+                | WS_EX_TOOLWINDOW;
+            if new_ex != cur_ex {
+                let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex);
+                changed = true;
+            }
+
+            if changed {
+                let _ = SetWindowPos(
+                    hwnd,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                crate::logger::log_line(
+                    "INFO",
+                    &format!(
+                        "已剥离窗口原生边框 (hwnd=0x{hwnd:X}, style 0x{cur_style:X} -> 0x{new_style:X})"
+                    ),
+                );
+            }
         }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
+    }
+}
+
+/// Hide the window, strip `WS_CAPTION`/`WS_SYSMENU`, switch to `WS_POPUP`, disable DWM
+/// non-client rendering and window animations, apply a rounded `HRGN`, and position at `rect`
+/// while keeping the window hidden so OpenGL can render and swap cleanly before a single
+/// pixel is shown.
+pub(crate) fn prepare_popup_window(title: &str, rect: PopupRect) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::c_void;
+
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+            fn SetWindowLongPtrW(hwnd: isize, index: i32, new_long: isize) -> isize;
+            fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+            fn SetWindowPos(
+                hwnd: isize,
+                insert_after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
+        }
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
+        }
+        #[link(name = "dwmapi")]
+        unsafe extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: *mut c_void,
+                dw_attribute: u32,
+                pv_attribute: *const c_void,
+                cb_attribute: u32,
+            ) -> i32;
+        }
+
+        let hwnd = find_own_window(title);
+        if hwnd == 0 || rect.w <= 0 || rect.h <= 0 {
+            return;
+        }
+
+        const GWLP_HWNDPARENT: i32 = -8;
+        const GWL_STYLE: i32 = -16;
+
+        const WS_VISIBLE: isize = 0x1000_0000;
+
+        const HWND_TOPMOST: isize = -1;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_FRAMECHANGED: u32 = 0x0020;
+        const SWP_HIDEWINDOW: u32 = 0x0080;
+
+        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+        const DWMWCP_ROUND: u32 = 2;
+
+        unsafe {
+            let corner_pref: u32 = DWMWCP_ROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd as *mut c_void,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                (&corner_pref as *const u32).cast::<c_void>(),
+                std::mem::size_of::<u32>() as u32,
+            );
+
+            if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != 0 {
+                let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+            }
+
+            // Drop `WS_CAPTION`/`WS_SYSMENU` & co. through the shared helper so the popup and
+            // the floating card can never drift apart again.
+            strip_native_chrome(hwnd);
+            let cur_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let new_style = cur_style & !WS_VISIBLE;
+            if new_style != cur_style {
+                let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
+            }
+
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+            );
+
+            let diam = rect.corner_diam.max(8);
+            let hrgn = CreateRoundRectRgn(0, 0, rect.w + 1, rect.h + 1, diam, diam);
+            if hrgn != 0 {
+                let _ = SetWindowRgn(hwnd, hrgn, 0);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (title, rect);
+    }
+}
+
+/// Reveal an already-painted `WS_POPUP` popup window directly via Win32 and focus it.
+pub(crate) fn reveal_popup_window(title: &str, rect: PopupRect, vctx: &egui::Context, pos: Pos2) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (vctx, pos);
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+            fn SetWindowPos(
+                hwnd: isize,
+                insert_after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
+            fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+            fn SetForegroundWindow(hwnd: isize) -> i32;
+            fn SetFocus(hwnd: isize) -> isize;
+        }
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
+        }
+
+        let hwnd = find_own_window(title);
+        if hwnd == 0 || rect.w <= 0 || rect.h <= 0 {
+            return;
+        }
+
+        const HWND_TOPMOST: isize = -1;
+        const SWP_SHOWWINDOW: u32 = 0x0040;
+        const SW_SHOWNORMAL: i32 = 1;
+
+        unsafe {
+            let diam = rect.corner_diam.max(8);
+            let hrgn = CreateRoundRectRgn(0, 0, rect.w + 1, rect.h + 1, diam, diam);
+            if hrgn != 0 {
+                let _ = SetWindowRgn(hwnd, hrgn, 1);
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                SWP_SHOWWINDOW,
+            );
+            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(hwnd);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (title, rect);
+        vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        vctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+}
+
+/// Immediately hide a popup window via `SW_HIDE` before eframe drops its viewport.
+pub(crate) fn hide_popup_window(title: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+        }
+        const SW_HIDE: i32 = 0;
+        let hwnd = find_own_window(title);
+        if hwnd != 0 {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = title;
+    }
+}
+
+pub(crate) fn any_mouse_button_down() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetAsyncKeyState(v_key: i32) -> i16;
+        }
+        const VK_LBUTTON: i32 = 0x01;
+        const VK_RBUTTON: i32 = 0x02;
+        const VK_MBUTTON: i32 = 0x04;
+        unsafe {
+            GetAsyncKeyState(VK_LBUTTON) < 0
+                || GetAsyncKeyState(VK_RBUTTON) < 0
+                || GetAsyncKeyState(VK_MBUTTON) < 0
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Returns `true` when the popup lost foreground focus or the user clicked outside its bounds.
+pub(crate) fn is_popup_dismissed(title: &str, ever_focused: &mut bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        #[repr(C)]
+        struct WinRect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetForegroundWindow() -> *mut std::ffi::c_void;
+            fn GetCursorPos(lp_point: *mut Point) -> i32;
+            fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
+        }
+
+        let hwnd = find_own_window(title);
+        if hwnd == 0 {
+            return false;
+        }
+        unsafe {
+            let fg = GetForegroundWindow() as isize;
+            if fg == hwnd {
+                *ever_focused = true;
+            } else if *ever_focused {
+                return true;
+            }
+
+            if any_mouse_button_down() {
+                let mut pt = Point { x: 0, y: 0 };
+                let mut rc = WinRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if GetCursorPos(&mut pt) != 0
+                    && GetWindowRect(hwnd, &mut rc) != 0
+                    && (pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (title, ever_focused);
+        false
     }
 }
 
@@ -158,6 +570,88 @@ pub(crate) fn find_own_window(title: &str) -> isize {
         };
         let _ = EnumWindows(enum_cb, (&mut ctx as *mut SearchCtx<'_>) as isize);
         ctx.found
+    }
+}
+
+/// Clip the main window to an exact rounded rectangle while floating, and drop the
+/// region again while maximized. Clipping at the OS level bounds the surface itself,
+/// so the corners outside the radius can never composite as the DWM white fallback.
+pub fn ensure_main_window_region(is_maximized: bool, radius_points: f32, ppp: f32) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::atomic::AtomicIsize;
+
+        static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+        static APPLIED: std::sync::Mutex<Option<(i32, i32, i32, bool)>> = std::sync::Mutex::new(None);
+
+        #[repr(C)]
+        struct WinRect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetClientRect(hwnd: isize, rect: *mut WinRect) -> i32;
+            fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+        }
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
+        }
+
+        let mut hwnd = MAIN_HWND.load(Ordering::Relaxed);
+        if hwnd == 0 {
+            hwnd = find_own_window("GameAccel");
+            if hwnd == 0 {
+                return;
+            }
+            MAIN_HWND.store(hwnd, Ordering::Relaxed);
+        }
+
+        let mut rc = WinRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetClientRect(hwnd, &mut rc) } == 0 {
+            return;
+        }
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+
+        let diam = if is_maximized {
+            0
+        } else {
+            (radius_points * 2.0 * ppp).round().max(8.0) as i32
+        };
+
+        let mut applied = APPLIED.lock().unwrap_or_else(|p| p.into_inner());
+        if *applied == Some((w, h, diam, is_maximized)) {
+            return;
+        }
+
+        let ok = unsafe {
+            if is_maximized {
+                // NULL region = plain rectangular window.
+                SetWindowRgn(hwnd, 0, 1) != 0
+            } else {
+                let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diam, diam);
+                hrgn != 0 && SetWindowRgn(hwnd, hrgn, 1) != 0
+            }
+        };
+        if ok {
+            *applied = Some((w, h, diam, is_maximized));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (is_maximized, radius_points, ppp);
     }
 }
 

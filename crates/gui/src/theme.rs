@@ -91,7 +91,7 @@ impl ThemePalette {
                 },
                 text_primary: Color32::from_rgb(27, 26, 24),   // #1B1A18
                 text_secondary: Color32::from_rgb(81, 78, 72), // #514E48
-                text_muted: Color32::from_rgb(134, 130, 121),  // #868279
+                text_muted: Color32::from_rgb(111, 106, 96),   // #6F6A60 (>=4.5:1 on canvas/card/tag)
                 accent: Color32::from_rgb(217, 119, 87),       // #D97757
                 accent_soft: Color32::from_rgb(249, 235, 228), // #F9EBE4
                 accent_text: Color32::from_rgb(173, 72, 40),   // #AD4828
@@ -105,7 +105,7 @@ impl ThemePalette {
                 data_primary: Color32::from_rgb(73, 99, 122),    // #49637A
                 data_secondary: Color32::from_rgb(127, 161, 142), // #7FA18E
                 tag_bg: Color32::from_rgb(239, 236, 228),
-                tag_text: Color32::from_rgb(134, 130, 121),
+                tag_text: Color32::from_rgb(111, 106, 96), // #6F6A60
             },
             // Studio Obsidian (exact match to v03_cockpit_preview.html [data-theme="dark"])
             ThemeMode::Dark => Self {

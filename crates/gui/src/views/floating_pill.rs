@@ -1,6 +1,9 @@
 use crate::storage::{PillLightStyle, save_config};
 use crate::theme::{FONT_SM, ThemePalette};
-use crate::tray::{clamp_popover_position, wake_window};
+use crate::tray::{
+    PopupRect, PopupStage, any_mouse_button_down, hide_popup_window, is_popup_dismissed,
+    prepare_popup_window, reveal_popup_window, wake_window,
+};
 use crate::widgets::hairline_divider;
 use crate::{ConnState, GameAccelApp, NavTab};
 use eframe::egui::{
@@ -52,10 +55,28 @@ enum CardMenuAction {
     CloseCard,
 }
 
+const FLOATING_CARD_TITLE: &str = "GameAccel 网速悬浮窗";
+const FLOATING_MENU_TITLE: &str = "GameAccel 悬浮窗菜单";
+
+/// Win32 window title of the floating card viewport, used to find its `HWND` by name.
+fn card_window_title() -> &'static str {
+    FLOATING_CARD_TITLE
+}
+
 impl GameAccelApp {
+    pub(crate) fn close_floating_menu(&mut self) {
+        if self.floating_menu_open {
+            hide_popup_window(FLOATING_MENU_TITLE);
+        }
+        self.floating_menu_open = false;
+        self.floating_menu_phys_pos = None;
+        self.floating_menu_stage = PopupStage::Closed;
+        self.floating_menu_ever_focused = false;
+    }
+
     pub(crate) fn render_floating_pill(&mut self, ctx: &egui::Context, p: ThemePalette) {
         if !self.cfg.show_floating_pill {
-            self.floating_menu_open = false;
+            self.close_floating_menu();
             self.floating_pill_fs_hidden = false;
             self.floating_pill_edge_tucked = false;
             self.floating_pill_spawn_pos = None;
@@ -71,7 +92,7 @@ impl GameAccelApp {
                 if fs != self.floating_pill_fs_hidden {
                     self.floating_pill_fs_hidden = fs;
                     if fs {
-                        self.floating_menu_open = false;
+                        self.close_floating_menu();
                     } else {
                         self.floating_pill_raise_frames = 6;
                     }
@@ -119,7 +140,7 @@ impl GameAccelApp {
         };
 
         let mut open_main = false;
-        let mut open_menu_at: Option<(f64, f64)> = None;
+        let mut open_menu: Option<(f32, Option<egui::Rect>)> = None;
         let mut latest_outer_pos: Option<[f32; 2]> = None;
         let mut is_hovered = false;
         let mut is_dragging = false;
@@ -131,7 +152,7 @@ impl GameAccelApp {
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("game_accel_floating_pill"),
             egui::ViewportBuilder::default()
-                .with_title("GameAccel 网速悬浮窗")
+                .with_title(FLOATING_CARD_TITLE)
                 .with_decorations(false)
                 .with_always_on_top()
                 .with_taskbar(false)
@@ -166,22 +187,15 @@ impl GameAccelApp {
                         is_dragging = resp.dragged();
 
                         if !locked && resp.drag_started_by(PointerButton::Primary) {
-                            self.floating_menu_open = false;
+                            self.close_floating_menu();
                             vctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                         }
                         if resp.double_clicked_by(PointerButton::Primary) {
-                            self.floating_menu_open = false;
+                            self.close_floating_menu();
                             open_main = true;
                         }
                         if resp.clicked_by(PointerButton::Secondary) {
-                            if let Some((cx, cy)) = win32_cursor_pos() {
-                                open_menu_at = Some((cx, cy));
-                            } else if let Some(outer) = vctx.input(|i| i.viewport().outer_rect) {
-                                open_menu_at = Some((
-                                    (outer.right() * vppp) as f64,
-                                    (outer.bottom() * vppp) as f64,
-                                ));
-                            }
+                            open_menu = Some((vppp, vctx.input(|i| i.viewport().outer_rect)));
                         }
 
                         let painter = ui.painter();
@@ -329,11 +343,22 @@ impl GameAccelApp {
             self.floating_pill_raise_frames = 8;
         }
 
-        if let Some((px, py)) = open_menu_at {
-            self.floating_menu_pos = clamp_popover_position(px, py, MENU_W, MENU_H, ppp);
-            self.floating_menu_just_opened = true;
+        if let Some((card_vppp, card_outer)) = open_menu {
+            let (logical_pos, phys_pos) = compute_card_menu_pos(card_vppp, card_outer);
+            self.floating_menu_pos = logical_pos;
+            self.floating_menu_phys_pos = phys_pos;
             self.floating_menu_ever_focused = false;
-            self.floating_menu_open = true;
+            if self.floating_menu_open
+                && matches!(
+                    self.floating_menu_stage,
+                    PopupStage::VisibleWaitRelease | PopupStage::VisibleArmed
+                )
+            {
+                self.floating_menu_stage = PopupStage::Reveal;
+            } else {
+                self.floating_menu_stage = PopupStage::HiddenSetup;
+                self.floating_menu_open = true;
+            }
             ctx.request_repaint();
         }
 
@@ -357,32 +382,83 @@ impl GameAccelApp {
             ConnState::Connecting => "取消连接",
             ConnState::Connected => "断开加速",
         };
+        let menu_pos = self.floating_menu_pos;
+        let menu_phys = self.floating_menu_phys_pos;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("game_accel_floating_card_menu"),
             egui::ViewportBuilder::default()
-                .with_title("GameAccel 悬浮窗菜单")
+                .with_title(FLOATING_MENU_TITLE)
+                .with_visible(false)
                 .with_decorations(false)
+                .with_minimize_button(false)
+                .with_maximize_button(false)
+                .with_close_button(false)
                 .with_always_on_top()
                 .with_taskbar(false)
                 .with_resizable(false)
                 .with_inner_size([MENU_W, MENU_H])
-                .with_position([self.floating_menu_pos.x, self.floating_menu_pos.y]),
+                .with_position([menu_pos.x, menu_pos.y]),
             |vctx, _class| {
                 let vppp = vctx.pixels_per_point().max(1.0);
-                ensure_popup_menu_region(vppp);
-
-                if self.floating_menu_just_opened {
-                    vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.floating_menu_just_opened = false;
-                }
+                let [px, py] = menu_phys.unwrap_or([
+                    (menu_pos.x * vppp).round() as i32,
+                    (menu_pos.y * vppp).round() as i32,
+                ]);
+                let mrect = PopupRect {
+                    x: px,
+                    y: py,
+                    w: (MENU_W * vppp).round() as i32,
+                    h: (MENU_H * vppp).round() as i32,
+                    corner_diam: (MENU_RADIUS * 2.0 * vppp).round().max(10.0) as i32,
+                };
 
                 let focused = vctx.input(|i| i.viewport().focused);
-                if focused == Some(true) {
-                    self.floating_menu_ever_focused = true;
-                } else if self.floating_menu_ever_focused && focused == Some(false) {
-                    close_menu = true;
+                match self.floating_menu_stage {
+                    PopupStage::Closed => {}
+                    PopupStage::HiddenSetup => {
+                        prepare_popup_window(FLOATING_MENU_TITLE, mrect);
+                        self.floating_menu_stage = PopupStage::HiddenPaint;
+                        vctx.request_repaint();
+                        ctx.request_repaint();
+                    }
+                    PopupStage::HiddenPaint => {
+                        self.floating_menu_stage = PopupStage::Reveal;
+                        vctx.request_repaint();
+                        ctx.request_repaint();
+                    }
+                    PopupStage::Reveal => {
+                        reveal_popup_window(FLOATING_MENU_TITLE, mrect, vctx, menu_pos);
+                        self.floating_menu_stage = PopupStage::VisibleWaitRelease;
+                        vctx.request_repaint();
+                        ctx.request_repaint();
+                    }
+                    PopupStage::VisibleWaitRelease => {
+                        if focused == Some(true) {
+                            self.floating_menu_ever_focused = true;
+                        } else if self.floating_menu_ever_focused && focused == Some(false) {
+                            close_menu = true;
+                        }
+                        if !any_mouse_button_down() {
+                            self.floating_menu_stage = PopupStage::VisibleArmed;
+                        } else {
+                            vctx.request_repaint_after(Duration::from_millis(16));
+                        }
+                    }
+                    PopupStage::VisibleArmed => {
+                        if focused == Some(true) {
+                            self.floating_menu_ever_focused = true;
+                        } else if self.floating_menu_ever_focused && focused == Some(false) {
+                            close_menu = true;
+                        }
+                        if is_popup_dismissed(FLOATING_MENU_TITLE, &mut self.floating_menu_ever_focused) {
+                            close_menu = true;
+                        } else if !self.floating_menu_ever_focused {
+                            vctx.request_repaint_after(Duration::from_millis(50));
+                        }
+                    }
                 }
+
                 if vctx
                     .input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
                 {
@@ -450,8 +526,7 @@ impl GameAccelApp {
         );
 
         if close_menu {
-            self.floating_menu_open = false;
-            self.floating_menu_ever_focused = false;
+            self.close_floating_menu();
         }
 
         if let Some(act) = picked {
@@ -657,31 +732,107 @@ fn default_card_pos(ppp: f32) -> Pos2 {
     Pos2::new(960.0, 36.0)
 }
 
-fn win32_cursor_pos() -> Option<(f64, f64)> {
-    #[cfg(target_os = "windows")]
-    {
-        #[repr(C)]
-        struct Point {
-            x: i32,
-            y: i32,
-        }
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn GetCursorPos(lp_point: *mut Point) -> i32;
-        }
-        let mut pt = Point { x: 0, y: 0 };
-        if unsafe { GetCursorPos(&mut pt) } != 0 {
-            return Some((pt.x as f64, pt.y as f64));
-        }
+/// Pure geometry: place a `(menu_w, menu_h)` popup strictly outside `card` `(x, y, w, h)`
+/// with `gap` spacing, clamped inside `work` `(left, top, right, bottom)` inset by `margin`.
+fn place_menu_outside_card(
+    card: [i32; 4],
+    menu_size: [i32; 2],
+    work: [i32; 4],
+    gap: i32,
+    margin: i32,
+) -> [i32; 2] {
+    let [cx, cy, cw, ch] = card;
+    let [mw, mh] = menu_size;
+    let [wl_raw, wt_raw, wr_raw, wb_raw] = work;
+
+    let wl = wl_raw + margin;
+    let wt = wt_raw + margin;
+    let wr = (wr_raw - margin).max(wl + mw);
+    let wb = (wb_raw - margin).max(wt + mh);
+
+    // Clamp only to the work-area edge (not `wb_raw - ch`) so a card placed on top of the
+    // taskbar anchors the menu directly `gap` above the taskbar instead of leaving a phantom
+    // card-height gap.
+    let cl = cx.clamp(wl_raw, (wr_raw - cw).max(wl_raw));
+    let ct = cy.clamp(wt_raw, wb_raw);
+    let cr = cl + cw;
+    let cb = (cy + ch).clamp(wt_raw, wb_raw);
+
+    let centered_x = cl + (cw - mw) / 2;
+    let aligned_x = centered_x.clamp(wl, (wr - mw).max(wl));
+
+    let above_y = ct - gap - mh;
+    let below_y = cb + gap;
+    let fits_above = above_y >= wt;
+    let fits_below = below_y + mh <= wb;
+    let in_lower_half = (ct + cb) > (wt + wb);
+
+    if in_lower_half && fits_above {
+        [aligned_x, above_y]
+    } else if !in_lower_half && fits_below {
+        [aligned_x, below_y]
+    } else if fits_above {
+        [aligned_x, above_y]
+    } else if fits_below {
+        [aligned_x, below_y]
+    } else {
+        // Ultra-short screen fallback: place beside the card so it still never covers it.
+        let side_x = if cl - gap - mw >= wl {
+            cl - gap - mw
+        } else {
+            (cr + gap).min((wr - mw).max(wl))
+        };
+        let side_y = ct.clamp(wt, (wb - mh).max(wt));
+        [side_x, side_y]
     }
-    None
 }
 
-/// Cached HWNDs so we don't `EnumWindows` over every top-level window on each frame.
+/// Anchor the context menu strictly outside the floating card's bounds so the speed readout
+/// remains completely unobstructed while the menu is open.
+fn compute_card_menu_pos(
+    card_vppp: f32,
+    fallback_outer: Option<egui::Rect>,
+) -> (Pos2, Option<[i32; 2]>) {
+    let ppp = card_vppp.max(1.0);
+    #[cfg(target_os = "windows")]
+    {
+        if let Some((hwnd, cx, cy, cw, ch)) = find_own_window_by_size(
+            &CARD_HWND,
+            (CARD_W * ppp).round() as i32,
+            (CARD_H * ppp).round() as i32,
+        ) && let Some((wl, wt, wr, wb)) = monitor_work_rect_for_hwnd(hwnd)
+        {
+            let mw = (MENU_W * ppp).round() as i32;
+            let mh = (MENU_H * ppp).round() as i32;
+            let gap = (8.0 * ppp).round() as i32;
+            let margin = (8.0 * ppp).round() as i32;
+            let [mx, my] = place_menu_outside_card(
+                [cx, cy, cw, ch],
+                [mw, mh],
+                [wl, wt, wr, wb],
+                gap,
+                margin,
+            );
+            return (Pos2::new(mx as f32 / ppp, my as f32 / ppp), Some([mx, my]));
+        }
+    }
+
+    if let Some(outer) = fallback_outer {
+        let x = (outer.center().x - MENU_W * 0.5).max(12.0);
+        let y = if outer.top() > MENU_H + 20.0 {
+            outer.top() - MENU_H - 8.0
+        } else {
+            outer.bottom() + 8.0
+        };
+        (Pos2::new(x, y), None)
+    } else {
+        (Pos2::new(600.0, 200.0), None)
+    }
+}
+
+/// Cached HWND so we don't `EnumWindows` over every top-level window on each frame.
 #[cfg(target_os = "windows")]
 static CARD_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-#[cfg(target_os = "windows")]
-static MENU_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 /// Whether the taskbar guard should keep the card above the taskbar.
 #[cfg(target_os = "windows")]
@@ -815,6 +966,33 @@ fn raise_card_topmost() {
             );
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
+    }
+
+    let mut rc = WinRect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetWindowRect(hwnd, &mut rc) } == 0 {
+        return None;
+    }
+    Some((rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top))
 }
 
 #[cfg(target_os = "windows")]
@@ -953,13 +1131,24 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
             fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
         }
 
-        let Some((hwnd, x, y, w, h)) = find_own_window_by_size(
-            &CARD_HWND,
-            (CARD_W * ppp).round() as i32,
-            (CARD_H * ppp).round() as i32,
-        ) else {
+        // Resolve by title first: it is unique per viewport and does not depend on the window
+        // already having the exact expected pixel size (early frames, DPI transitions and the
+        // rounded `HRGN` region all break a size match). The size probe stays as a fallback and
+        // keeps `CARD_HWND` warm for the other helpers in this module.
+        let exp_w = (CARD_W * ppp).round() as i32;
+        let exp_h = (CARD_H * ppp).round() as i32;
+        let by_title = crate::tray::find_own_window(card_window_title());
+        let found = if by_title != 0 {
+            window_rect(by_title).map(|(x, y, w, h)| (by_title, x, y, w, h))
+        } else {
+            None
+        }
+        .or_else(|| find_own_window_by_size(&CARD_HWND, exp_w, exp_h));
+        let Some((hwnd, x, y, w, h)) = found else {
             return;
         };
+        // Keep the size-based cache pointing at this window for `raise_card_topmost` etc.
+        CARD_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
         if w <= 0 || h <= 0 {
             return;
         }
@@ -970,6 +1159,12 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
             if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != 0 {
                 let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
             }
+
+            // The card is frameless in egui's eyes only: `winit` always creates it with
+            // `WS_CAPTION | WS_SYSMENU`, and the context menu taking focus fires `WM_NCACTIVATE`,
+            // which made the native `— □ ×` buttons flash over the card. Strip the real style
+            // bits (idempotent & no-op once applied) so there is nothing left to composite.
+            crate::tray::strip_native_chrome(hwnd);
 
             const SW_HIDE: i32 = 0;
             const SW_SHOWNOACTIVATE: i32 = 4;
@@ -1061,62 +1256,6 @@ fn ensure_floating_card_window(ppp: f32, always_on_top: bool, fs_hidden: bool, f
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (ppp, always_on_top, fs_hidden, force_raise);
-    }
-}
-
-fn ensure_popup_menu_region(ppp: f32) {
-    #[cfg(target_os = "windows")]
-    {
-        #[repr(C)]
-        struct WinRect {
-            left: i32,
-            top: i32,
-            right: i32,
-            bottom: i32,
-        }
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn GetWindowRgnBox(hwnd: isize, lprc: *mut WinRect) -> i32;
-            fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
-        }
-        #[link(name = "gdi32")]
-        unsafe extern "system" {
-            fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
-        }
-
-        let Some((hwnd, _x, _y, w, h)) = find_own_window_by_size(
-            &MENU_HWND,
-            (MENU_W * ppp).round() as i32,
-            (MENU_H * ppp).round() as i32,
-        ) else {
-            return;
-        };
-        if w <= 0 || h <= 0 {
-            return;
-        }
-        unsafe {
-            let mut rgn_rc = WinRect {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            let rgn_type = GetWindowRgnBox(hwnd, &mut rgn_rc);
-            if rgn_type == 0
-                || (rgn_rc.right - rgn_rc.left - w).abs() > 2
-                || (rgn_rc.bottom - rgn_rc.top - h).abs() > 2
-            {
-                let diam = (MENU_RADIUS * 2.0 * ppp).round().max(10.0) as i32;
-                let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diam, diam);
-                if hrgn != 0 {
-                    let _ = SetWindowRgn(hwnd, hrgn, 1);
-                }
-            }
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = ppp;
     }
 }
 
@@ -1408,7 +1547,7 @@ fn move_floating_card_physical(ppp: f32, x: i32, y: i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::led_activity;
+    use super::{led_activity, place_menu_outside_card};
 
     #[test]
     fn led_activity_scale() {
@@ -1419,5 +1558,45 @@ mod tests {
         assert_eq!(led_activity(10.0 * 1024.0 * 1024.0), 1.0);
         assert_eq!(led_activity(1e12), 1.0);
         assert!(led_activity(10.0 * 1024.0) < led_activity(1024.0 * 1024.0));
+    }
+
+    #[test]
+    fn menu_never_overlaps_floating_card() {
+        let work = [0, 0, 1920, 1040];
+        let menu = [208, 295]; // 125% DPI
+        let card_size = [123, 55];
+        let gap = 10;
+        let margin = 10;
+
+        for (cx, cy) in [
+            (1750, 920), // bottom-right
+            (900, 880),  // bottom-center
+            (20, 900),   // bottom-left
+            (1750, 45),  // top-right
+            (900, 45),   // top-center
+            (900, 500),  // middle
+        ] {
+            let [mx, my] = place_menu_outside_card(
+                [cx, cy, card_size[0], card_size[1]],
+                menu,
+                work,
+                gap,
+                margin,
+            );
+            let separated = mx + menu[0] <= cx
+                || mx >= cx + card_size[0]
+                || my + menu[1] <= cy - gap + 1
+                || my >= cy + card_size[1] + gap - 1;
+            assert!(
+                separated,
+                "menu [{mx}, {my}, {}, {}] overlapped card [{cx}, {cy}, {}, {}]",
+                menu[0], menu[1], card_size[0], card_size[1]
+            );
+        }
+
+        // Card sitting on the bottom taskbar (below work_bottom = 1040): menu should sit
+        // directly `gap` above the taskbar with no phantom extra card-height gap.
+        let [_mx, my_tb] = place_menu_outside_card([1400, 1042, 123, 55], menu, work, gap, margin);
+        assert_eq!(my_tb + menu[1], work[3] - gap);
     }
 }

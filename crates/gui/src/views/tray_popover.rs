@@ -2,7 +2,10 @@ use crate::icons;
 use crate::logger::log_line;
 use crate::storage::{AppConfig, ProxyMode, RouteMode, format_speed, save_config};
 use crate::theme::{FONT_BODY, FONT_SM, FONT_XS, ThemePalette};
-use crate::tray::{apply_win11_rounded_corners, wake_window};
+use crate::tray::{
+    PopupRect, PopupStage, any_mouse_button_down, hide_popup_window, is_popup_dismissed,
+    prepare_popup_window, reveal_popup_window, wake_window,
+};
 use crate::widgets::{
     accent_chip_btn, aligned_row, chip_btn, elide_text, hairline_divider, pill, segmented_control,
 };
@@ -43,7 +46,19 @@ enum PopoverAction {
     ForceQuit,
 }
 
+const TRAY_POPOVER_TITLE: &str = "GameAccel 托盘面板";
+const TRAY_POPOVER_RADIUS: f32 = 10.0;
+
 impl GameAccelApp {
+    pub(crate) fn close_tray_popover(&mut self) {
+        if self.tray_popover_open {
+            hide_popup_window(TRAY_POPOVER_TITLE);
+        }
+        self.tray_popover_open = false;
+        self.tray_popover_stage = PopupStage::Closed;
+        self.tray_popover_ever_focused = false;
+    }
+
     pub(crate) fn render_tray_popover(&mut self, ctx: &egui::Context, p: ThemePalette) {
         if !self.tray_popover_open {
             return;
@@ -52,30 +67,78 @@ impl GameAccelApp {
         let pop_h = desired_popover_height(&self.cfg);
         let mut close_popover = false;
         let mut actions: Vec<PopoverAction> = Vec::new();
+        let pop_pos = self.tray_popover_pos;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("game_accel_tray_popover"),
             egui::ViewportBuilder::default()
-                .with_title("GameAccel 托盘面板")
+                .with_title(TRAY_POPOVER_TITLE)
+                .with_visible(false)
                 .with_decorations(false)
+                .with_minimize_button(false)
+                .with_maximize_button(false)
+                .with_close_button(false)
                 .with_always_on_top()
                 .with_taskbar(false)
                 .with_resizable(false)
                 .with_inner_size([TRAY_POPOVER_W, pop_h])
-                .with_position([self.tray_popover_pos.x, self.tray_popover_pos.y]),
+                .with_position([pop_pos.x, pop_pos.y]),
             |vctx, _class| {
-                if self.tray_popover_just_opened {
-                    apply_win11_rounded_corners();
-                    vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.tray_popover_just_opened = false;
-                }
+                let vppp = vctx.pixels_per_point().max(1.0);
+                let prect = PopupRect {
+                    x: (pop_pos.x * vppp).round() as i32,
+                    y: (pop_pos.y * vppp).round() as i32,
+                    w: (TRAY_POPOVER_W * vppp).round() as i32,
+                    h: (pop_h * vppp).round() as i32,
+                    corner_diam: (TRAY_POPOVER_RADIUS * 2.0 * vppp).round().max(10.0) as i32,
+                };
 
                 let focused = vctx.input(|i| i.viewport().focused);
-                if focused == Some(true) {
-                    self.tray_popover_ever_focused = true;
-                } else if self.tray_popover_ever_focused && focused == Some(false) {
-                    close_popover = true;
+                match self.tray_popover_stage {
+                    PopupStage::Closed => {}
+                    PopupStage::HiddenSetup => {
+                        prepare_popup_window(TRAY_POPOVER_TITLE, prect);
+                        self.tray_popover_stage = PopupStage::HiddenPaint;
+                        vctx.request_repaint();
+                        ctx.request_repaint();
+                    }
+                    PopupStage::HiddenPaint => {
+                        self.tray_popover_stage = PopupStage::Reveal;
+                        vctx.request_repaint();
+                        ctx.request_repaint();
+                    }
+                    PopupStage::Reveal => {
+                        reveal_popup_window(TRAY_POPOVER_TITLE, prect, vctx, pop_pos);
+                        self.tray_popover_stage = PopupStage::VisibleWaitRelease;
+                        vctx.request_repaint();
+                        ctx.request_repaint();
+                    }
+                    PopupStage::VisibleWaitRelease => {
+                        if focused == Some(true) {
+                            self.tray_popover_ever_focused = true;
+                        } else if self.tray_popover_ever_focused && focused == Some(false) {
+                            close_popover = true;
+                        }
+                        if !any_mouse_button_down() {
+                            self.tray_popover_stage = PopupStage::VisibleArmed;
+                        } else {
+                            vctx.request_repaint_after(Duration::from_millis(16));
+                        }
+                    }
+                    PopupStage::VisibleArmed => {
+                        if focused == Some(true) {
+                            self.tray_popover_ever_focused = true;
+                        } else if self.tray_popover_ever_focused && focused == Some(false) {
+                            close_popover = true;
+                        }
+                        if is_popup_dismissed(TRAY_POPOVER_TITLE, &mut self.tray_popover_ever_focused) {
+                            close_popover = true;
+                        } else if !self.tray_popover_ever_focused {
+                            vctx.request_repaint_after(Duration::from_millis(50));
+                        }
+                    }
                 }
+
                 if vctx
                     .input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
                 {
@@ -661,8 +724,7 @@ impl GameAccelApp {
         );
 
         if close_popover {
-            self.tray_popover_open = false;
-            self.tray_popover_ever_focused = false;
+            self.close_tray_popover();
         }
 
         for act in actions {

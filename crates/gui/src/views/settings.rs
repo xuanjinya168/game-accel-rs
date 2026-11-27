@@ -159,7 +159,7 @@ impl GameAccelApp {
                         self.cfg.tray_style = style;
                         save_config(&self.cfg);
                         if style == TrayStyle::Menu {
-                            self.tray_popover_open = false;
+                            self.close_tray_popover();
                         }
                         if let Some(ref tray) = self.tray {
                             tray.set_style(style);

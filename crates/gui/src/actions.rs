@@ -455,7 +455,7 @@ impl GameAccelApp {
                 AsyncEvent::Tray(cmd) => match cmd {
                     TrayCmd::Show => {
                         self.window_hidden_to_tray = false;
-                        self.tray_popover_open = false;
+                        self.close_tray_popover();
                         crate::tray::wake_window(ctx);
                         if self.cfg.show_floating_pill {
                             self.floating_pill_raise_frames = 8;
@@ -467,8 +467,7 @@ impl GameAccelApp {
                     },
                     TrayCmd::TogglePopover(px, py) => {
                         if self.tray_popover_open {
-                            self.tray_popover_open = false;
-                            self.tray_popover_ever_focused = false;
+                            self.close_tray_popover();
                         } else {
                             let ppp = ctx.pixels_per_point().max(1.0);
                             let pop_h =
@@ -480,7 +479,7 @@ impl GameAccelApp {
                                 pop_h,
                                 ppp,
                             );
-                            self.tray_popover_just_opened = true;
+                            self.tray_popover_stage = crate::tray::PopupStage::HiddenSetup;
                             self.tray_popover_ever_focused = false;
                             self.tray_popover_search.clear();
                             self.tray_popover_open = true;
@@ -815,16 +814,17 @@ impl GameAccelApp {
         use crate::widgets::{aligned_row, modal_dialog, primary_btn, soft_btn};
         use eframe::egui::{Align, Layout, RichText};
 
-        let Some(prompt) = self.tun_admin_prompt.as_mut() else {
-            return;
+        let (auto_connect, wake) = {
+            let Some(prompt) = self.tun_admin_prompt.as_mut() else {
+                return;
+            };
+            (prompt.auto_connect, std::mem::take(&mut prompt.wake))
         };
-        if prompt.wake {
-            prompt.wake = false;
+        if wake {
             self.window_hidden_to_tray = false;
-            self.tray_popover_open = false;
+            self.close_tray_popover();
             crate::tray::wake_window(ctx);
         }
-        let auto_connect = prompt.auto_connect;
 
         let mut confirm = false;
         let mut cancel = false;
