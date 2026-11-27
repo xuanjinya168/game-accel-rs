@@ -1,0 +1,1987 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GameAccel v0.3.4 桌面端交互式设计规范（自包含离线预览）</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+
+    /* =======================================================================
+       Norman Strict 1-to-1 Semantic Palette — synced 1:1 with crates/gui/src/theme.rs
+       ======================================================================= */
+    :root {
+      --page-bg: #E5E2DA;
+      --page-card: #FFFFFF;
+      --page-border: #D3CFC4;
+      --page-ink: #1B1A18;
+      --page-muted: #6F6A60;
+    }
+
+    body[data-page-theme="dark"] {
+      --page-bg: #121210;
+      --page-card: #1D1D1B;
+      --page-border: #353430;
+      --page-ink: #F3F1EB;
+      --page-muted: #8B877E;
+    }
+
+    .studio-scope[data-theme="light"] {
+      --c-rail: #EDEAE1;
+      --c-canvas: #F6F4EE;
+      --c-surface: #FFFFFF;
+      --c-well: #EFECE4;
+      --c-hover: #E7E3D8;
+      --c-border: #E7E4DB;
+      --c-border-strong: #D3CFC4;
+
+      --c-ink: #1B1A18;
+      --c-ink-2: #514E48;
+      --c-muted: #6F6A60; /* v0.3.2 WCAG AA >=4.5:1 */
+
+      --c-cta: #D97757;
+      --c-cta-soft: #F9EBE4;
+      --c-cta-ink: #AD4828;
+
+      --c-ok: #157A50;
+      --c-ok-soft: #E2F3EC;
+
+      --c-warn: #B4690E;
+      --c-warn-soft: #FDF1DC;
+
+      --c-err: #C43B37;
+      --c-err-soft: #FCEAE9;
+
+      --c-data: #49637A;
+      --c-data-2: #7FA18E;
+      --c-data-fill: rgba(73, 99, 122, 0.13);
+
+      --c-pill-up: #D97724;
+      --c-pill-down: #269844;
+
+      --c-win-shadow: 0 22px 54px rgba(24, 22, 18, 0.14), 0 4px 14px rgba(24, 22, 18, 0.06);
+      --c-card-shadow: 0 1px 4px rgba(0, 0, 0, 0.03);
+      --c-pop-shadow: 0 10px 28px rgba(24, 22, 18, 0.14), 0 2px 8px rgba(24, 22, 18, 0.06);
+    }
+
+    .studio-scope[data-theme="dark"] {
+      --c-rail: #161615;
+      --c-canvas: #1D1D1B;
+      --c-surface: #262523;
+      --c-well: #181816;
+      --c-hover: #31302C;
+      --c-border: #353430;
+      --c-border-strong: #4A4842;
+
+      --c-ink: #F3F1EB;
+      --c-ink-2: #C4C0B7;
+      --c-muted: #8B877E;
+
+      --c-cta: #D97757;
+      --c-cta-soft: #422B23;
+      --c-cta-ink: #F3A68C;
+
+      --c-ok: #47D195;
+      --c-ok-soft: #1B362B;
+
+      --c-warn: #F4B752;
+      --c-warn-soft: #3B2E18;
+
+      --c-err: #F07975;
+      --c-err-soft: #402020;
+
+      --c-data: #88A6C2;
+      --c-data-2: #68B894;
+      --c-data-fill: rgba(136, 166, 194, 0.16);
+
+      --c-pill-up: #F5A656;
+      --c-pill-down: #5CD680;
+
+      --c-win-shadow: 0 26px 64px rgba(0, 0, 0, 0.62);
+      --c-card-shadow: none;
+      --c-pop-shadow: 0 14px 36px rgba(0, 0, 0, 0.56);
+    }
+
+    body {
+      background: var(--page-bg);
+      color: var(--page-ink);
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+      min-height: 100vh;
+      padding: 18px 16px 36px;
+      transition: background 0.18s ease, color 0.18s ease;
+    }
+
+    button, input { font-family: inherit; }
+    button { border: none; background: transparent; color: inherit; cursor: pointer; padding: 0; }
+    input { outline: none; }
+
+    .mono {
+      font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .truncate {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* ================= PREVIEW CONTROL BAR ================= */
+    .control-bar {
+      max-width: 920px;
+      margin: 0 auto 16px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: var(--page-card);
+      border: 1px solid var(--page-border);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+    }
+    .control-group {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+    .ctrl-btn {
+      height: 26px;
+      padding: 0 10px;
+      border-radius: 6px;
+      border: 1px solid var(--page-border);
+      background: transparent;
+      color: var(--page-muted);
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.14s ease;
+    }
+    .ctrl-btn:hover { color: var(--page-ink); border-color: #D97757; }
+    .ctrl-btn.active {
+      background: #D97757;
+      border-color: #D97757;
+      color: #FFFFFF;
+    }
+    .ctrl-sep { width: 1px; height: 14px; background: var(--page-border); margin: 0 2px; }
+    .ctrl-check {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--page-muted);
+      cursor: pointer;
+    }
+    .ctrl-check input { accent-color: #D97757; }
+
+    /* ================= MAIN STUDIO ROOT ================= */
+    .studio-scope {
+      max-width: 920px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 18px;
+      color: var(--c-ink);
+      user-select: none;
+    }
+
+    .show-slots .slot-lock {
+      outline: 1px dashed rgba(217, 119, 87, 0.78);
+      outline-offset: -1px;
+    }
+
+    /* ================= 840x548 MAIN WINDOW (Win11 Native 8px DWM Corners) ================= */
+    .app-window {
+      width: 840px;
+      height: 548px;
+      border-radius: 8px; /* v0.3.4 Win11 DWMWCP_ROUND */
+      background: var(--c-canvas);
+      border: 1px solid var(--c-border-strong);
+      box-shadow: var(--c-win-shadow);
+      display: flex;
+      overflow: hidden;
+      position: relative;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    /* 68px Ultra-Slim Icon Rail */
+    .icon-rail {
+      width: 68px;
+      height: 100%;
+      padding: 14px 8px;
+      background: var(--c-rail);
+      border-right: 1px solid var(--c-border);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .rail-top { display: flex; flex-direction: column; align-items: center; gap: 18px; width: 100%; }
+    .brand-mark {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: var(--c-cta);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 6px rgba(217, 119, 87, 0.25);
+    }
+    .rail-nav { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; }
+    .rail-btn {
+      width: 52px;
+      height: 46px;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      color: var(--c-muted);
+      font-size: 11px;
+      line-height: 1;
+      transition: background 0.14s ease, color 0.14s ease;
+    }
+    .rail-btn:hover { background: var(--c-hover); color: var(--c-ink); }
+    .rail-btn.active {
+      background: var(--c-surface);
+      color: var(--c-ink);
+      box-shadow: var(--c-card-shadow);
+      border: 1px solid var(--c-border);
+    }
+    .rail-bottom { display: flex; flex-direction: column; align-items: center; gap: 8px; width: 100%; }
+    .rail-divider { width: 28px; height: 1px; background: var(--c-border); }
+
+    /* 772px Right Stage */
+    .stage {
+      flex: 1;
+      min-width: 0;
+      height: 100%;
+      padding: 14px 20px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* 28px Topbar */
+    .topbar {
+      height: 28px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .view-title { font-size: 16px; color: var(--c-ink); letter-spacing: -0.01em; }
+    .port-badge {
+      font-size: 11.5px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      background: var(--c-well);
+      color: var(--c-muted);
+      cursor: pointer;
+    }
+    .port-badge:hover { color: var(--c-ink); }
+    .topbar-right { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
+    .win-btn {
+      width: 26px;
+      height: 26px;
+      border-radius: 7px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--c-ink-2);
+      transition: background 0.12s ease, color 0.12s ease;
+    }
+    .win-btn:hover { background: var(--c-well); color: var(--c-ink); }
+    .win-btn.close:hover { background: var(--c-err-soft); color: var(--c-err); }
+
+    /* Shared Bento Cards, Pills, Chips, Segments */
+    .bento-card {
+      background: var(--c-surface);
+      border: 1px solid var(--c-border);
+      border-radius: 12px;
+      box-shadow: var(--c-card-shadow);
+    }
+    .pill {
+      height: 20px;
+      padding: 0 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+      line-height: 1;
+    }
+    .pill-ok { background: var(--c-ok-soft); color: var(--c-ok); }
+    .pill-warn { background: var(--c-warn-soft); color: var(--c-warn); }
+    .pill-err { background: var(--c-err-soft); color: var(--c-err); }
+    .pill-muted { background: var(--c-well); color: var(--c-muted); }
+    .pill-card { background: var(--c-surface); color: var(--c-ink-2); border: 1px solid var(--c-border); }
+
+    .btn-primary {
+      height: 28px;
+      padding: 0 12px;
+      border-radius: 7px;
+      background: var(--c-cta);
+      color: #FFFFFF;
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      flex-shrink: 0;
+      transition: opacity 0.12s ease;
+    }
+    .btn-primary:hover { opacity: 0.92; }
+
+    /* v0.3.1 crisp chip_btn: bg_card + 1px border_subtle so buttons inside recessed well rows stay clear */
+    .chip-btn {
+      height: 26px;
+      padding: 0 9px;
+      border-radius: 7px;
+      background: var(--c-surface);
+      border: 1px solid var(--c-border);
+      color: var(--c-ink-2);
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      flex-shrink: 0;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    }
+    .chip-btn:hover { background: var(--c-hover); border-color: var(--c-border-strong); color: var(--c-ink); }
+    .chip-btn.danger:hover { background: var(--c-err-soft); border-color: var(--c-err); color: var(--c-err); }
+    .chip-btn.accent {
+      background: var(--c-cta);
+      border-color: var(--c-cta);
+      color: #FFFFFF;
+    }
+    .chip-btn.accent-soft {
+      background: var(--c-cta-soft);
+      border-color: transparent;
+      color: var(--c-cta-ink);
+    }
+
+    .seg {
+      height: 28px;
+      padding: 2.5px;
+      border-radius: 8px;
+      background: var(--c-well);
+      display: grid;
+      gap: 2px;
+    }
+    .seg button {
+      border-radius: 6px;
+      font-size: 12px;
+      color: var(--c-muted);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.12s ease, color 0.12s ease;
+    }
+    .seg button.active {
+      background: var(--c-surface);
+      color: var(--c-ink);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+    }
+    .studio-scope[data-theme="dark"] .seg button.active { box-shadow: none; }
+
+    .styled-input {
+      height: 28px;
+      padding: 0 9px;
+      border-radius: 7px;
+      background: var(--c-surface);
+      border: 1px solid var(--c-border-strong);
+      color: var(--c-ink);
+      font-size: 12px;
+    }
+    .styled-input::placeholder { color: var(--c-muted); }
+    .styled-input:focus { border-color: var(--c-cta); }
+
+    .pill-switch {
+      width: 34px;
+      height: 19px;
+      border-radius: 999px;
+      background: var(--c-border-strong);
+      position: relative;
+      cursor: pointer;
+      transition: background 0.16s ease;
+      flex-shrink: 0;
+    }
+    .pill-switch[data-on="true"] { background: var(--c-ok); }
+    .pill-switch::after {
+      content: "";
+      width: 14.5px;
+      height: 14.5px;
+      border-radius: 50%;
+      background: #FFFFFF;
+      position: absolute;
+      top: 2.25px;
+      left: 2.5px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+      transition: transform 0.16s ease;
+    }
+    .pill-switch[data-on="true"]::after { transform: translateX(14.5px); }
+
+    .hairline { height: 1px; background: var(--c-border); width: 100%; flex-shrink: 0; }
+
+    .scroll { overflow-y: auto; }
+    .scroll::-webkit-scrollbar { width: 4px; height: 4px; }
+    .scroll::-webkit-scrollbar-thumb { background: rgba(135, 131, 122, 0.30); border-radius: 99px; }
+
+    .page { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 12px; }
+    .hidden { display: none !important; }
+
+    /* ================= PAGE 1: COCKPIT ================= */
+    .hero-deck {
+      height: 114px;
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-shrink: 0;
+      transition: border-color 0.15s ease;
+    }
+    .hero-runway { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 5px; }
+    .hero-eyebrow { height: 22px; display: flex; align-items: center; gap: 8px; }
+    .state-dot { width: 6.5px; height: 6.5px; border-radius: 50%; flex-shrink: 0; }
+    .hero-title { font-size: 18px; line-height: 1.3; margin: 0; color: var(--c-ink); }
+    .hero-desc { font-size: 12px; margin: 0; color: var(--c-ink-2); }
+    .hero-action-slot { width: 144px; flex-shrink: 0; display: flex; justify-content: flex-end; }
+    .hero-action-btn {
+      width: 138px;
+      height: 44px;
+      border-radius: 10px;
+      font-size: 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      transition: all 0.15s ease;
+    }
+
+    .bento-split {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 7fr 5fr;
+      gap: 12px;
+    }
+    .telemetry-card {
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .metric-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--c-border);
+      flex-shrink: 0;
+    }
+    .metric-cell { min-width: 0; padding-left: 10px; border-left: 1px solid var(--c-border); }
+    .metric-cell:first-child { padding-left: 0; border-left: none; }
+    .metric-lbl { font-size: 11.5px; color: var(--c-muted); }
+    .metric-val { font-size: 16.5px; margin-top: 2px; color: var(--c-ink); }
+    .chart-header {
+      height: 26px;
+      margin: 10px 0 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .chart-wrap { flex: 1; min-height: 0; position: relative; }
+    .chart-wrap canvas { width: 100%; height: 100%; display: block; }
+
+    .right-stack { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+    .mode-card { padding: 13px 14px; display: flex; flex-direction: column; gap: 9px; flex-shrink: 0; }
+    .mode-row { height: 28px; display: flex; align-items: center; gap: 10px; }
+    .mode-lbl { font-size: 12px; color: var(--c-ink-2); flex-shrink: 0; }
+    .mode-row .seg { flex: 1; grid-template-columns: repeat(3, 1fr); }
+
+    .quick-card {
+      padding: 13px 14px;
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .quick-head {
+      height: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .quick-list { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 4px; padding-right: 2px; }
+    .quick-row {
+      height: 33px;
+      padding: 0 9px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      cursor: pointer;
+      transition: background 0.12s ease;
+    }
+    .quick-row:hover { background: var(--c-hover); }
+    .quick-row.selected { background: var(--c-well); }
+    .quick-rtt { width: 54px; text-align: right; font-size: 11.5px; flex-shrink: 0; }
+
+    /* ================= PAGE 2: NODES ================= */
+    .toolbar-row { height: 30px; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+    .toolbar-left { display: flex; align-items: center; gap: 6px; }
+    .node-row-card {
+      padding: 11px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      cursor: pointer;
+    }
+
+    /* ================= PAGE 3: LOGS ================= */
+    .log-box {
+      flex: 1;
+      min-height: 0;
+      padding: 14px 16px;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    /* ================= PAGE 4: SETTINGS ================= */
+    .set-group-title { font-size: 11px; color: var(--c-muted); margin-bottom: 5px; }
+    .set-card { padding: 4px 16px; }
+    .set-row {
+      min-height: 40px;
+      padding: 4px 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .set-row-sub {
+      min-height: 36px;
+      padding: 2px 0 6px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    /* ================= PAGE 5: ADMIN OPS (v0.3.1 3-Tab Parity) ================= */
+    .admin-srv-bar {
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .admin-kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .admin-kpi {
+      padding: 11px 13px;
+      min-height: 78px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .admin-subbar {
+      height: 30px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .admin-link-row {
+      background: var(--c-well);
+      border: 1px solid var(--c-border);
+      border-radius: 10px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      position: relative;
+    }
+    .quota-track { width: 84px; height: 5px; border-radius: 3px; background: var(--c-border); overflow: hidden; }
+    .quota-fill { height: 100%; border-radius: 3px; background: var(--c-cta); }
+
+    .more-popover {
+      position: absolute;
+      right: 14px;
+      top: 48px;
+      width: 132px;
+      padding: 5px;
+      border-radius: 9px;
+      background: var(--c-surface);
+      border: 1px solid var(--c-border-strong);
+      box-shadow: var(--c-pop-shadow);
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .pop-item {
+      height: 26px;
+      padding: 0 9px;
+      border-radius: 6px;
+      font-size: 12px;
+      color: var(--c-ink);
+      text-align: left;
+      display: flex;
+      align-items: center;
+    }
+    .pop-item:hover { background: var(--c-hover); }
+    .pop-item.danger { color: var(--c-ink-2); }
+    .pop-item.danger:hover { background: var(--c-err-soft); color: var(--c-err); }
+
+    /* 7-column fixed-slot access log table */
+    .alog-grid {
+      display: grid;
+      grid-template-columns: 82px 74px 50px minmax(110px, 1fr) 92px 98px 42px;
+      gap: 8px;
+      align-items: center;
+    }
+    .alog-head { font-size: 11px; color: var(--c-muted); padding: 4px 4px; }
+    .alog-row {
+      min-height: 34px;
+      padding: 3px 4px;
+      border-radius: 6px;
+      font-size: 11.5px;
+    }
+    .alog-row:hover { background: var(--c-well); }
+
+    .admin-settings-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .field-lbl { font-size: 11px; color: var(--c-muted); margin-bottom: 4px; display: block; }
+
+    /* ================= COMPANION SURFACES SHOWCASE (Floating Pill + Menu + Tray Popover) ================= */
+    .companions-grid {
+      width: 840px;
+      display: grid;
+      grid-template-columns: 1fr 356px;
+      gap: 14px;
+    }
+    .showcase-panel {
+      background: var(--c-surface);
+      border: 1px solid var(--c-border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .showcase-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--c-ink-2);
+    }
+
+    /* Simulated Windows 11 Taskbar stage for Floating Pill + Anchored Context Menu */
+    .taskbar-stage {
+      flex: 1;
+      min-height: 310px;
+      border-radius: 10px;
+      background: linear-gradient(180deg, var(--c-canvas) 0%, var(--c-well) 82%, rgba(28,27,25,0.12) 82%, rgba(28,27,25,0.18) 100%);
+      border: 1px solid var(--c-border);
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-end;
+      padding-bottom: 10px;
+      overflow: hidden;
+    }
+    .studio-scope[data-theme="dark"] .taskbar-stage {
+      background: linear-gradient(180deg, #161615 0%, #1D1D1B 82%, #111110 82%, #0C0C0B 100%);
+    }
+    .taskbar-hint {
+      position: absolute;
+      top: 10px;
+      left: 12px;
+      font-size: 11px;
+      color: var(--c-muted);
+    }
+
+    /* 166x236 Floating Card Context Menu (Win11 8px corners, anchored 8px strictly above card) */
+    .pill-menu {
+      width: 166px;
+      padding: 7px 6px;
+      border-radius: 8px;
+      background: var(--c-surface);
+      border: 1px solid var(--c-border-strong);
+      box-shadow: var(--c-pop-shadow);
+      margin-bottom: 8px; /* exact 8pt gap above floating card */
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      transition: opacity 0.12s ease, transform 0.12s ease;
+    }
+    .pill-menu.closed { opacity: 0; pointer-events: none; transform: translateY(4px); }
+    .pill-menu-row {
+      height: 28px;
+      padding: 0 8px 0 26px;
+      border-radius: 6px;
+      font-size: 12px;
+      color: var(--c-ink);
+      display: flex;
+      align-items: center;
+      position: relative;
+      text-align: left;
+    }
+    .pill-menu-row:hover { background: var(--c-hover); }
+    .pill-menu-row.danger { color: var(--c-ink-2); }
+    .pill-menu-row.danger:hover { background: var(--c-err-soft); color: var(--c-err); }
+    .pill-check {
+      position: absolute;
+      left: 9px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--c-pill-up);
+    }
+
+    /* 98x44 Desktop Floating Speed Pill (Win11 8px corners) */
+    .speed-pill {
+      width: 98px;
+      height: 44px;
+      border-radius: 8px;
+      background: var(--c-surface);
+      border: 1px solid var(--c-border-strong);
+      box-shadow: var(--c-pop-shadow);
+      display: flex;
+      align-items: center;
+      padding: 0 8px 0 10px;
+      gap: 7px;
+      cursor: context-menu;
+    }
+    .pill-led-box { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .pill-speeds { display: flex; flex-direction: column; gap: 2px; font-size: 11.5px; line-height: 1.1; }
+    .pill-up { color: var(--c-pill-up); display: flex; align-items: center; gap: 3px; }
+    .pill-down { color: var(--c-pill-down); display: flex; align-items: center; gap: 3px; }
+
+    /* 328px System Tray Popover (Win11 8px corners) */
+    .tray-popover {
+      width: 324px;
+      border-radius: 8px;
+      background: var(--c-surface);
+      border: 1px solid var(--c-border-strong);
+      box-shadow: var(--c-pop-shadow);
+      padding: 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .tray-status-card {
+      background: var(--c-well);
+      border: 1px solid var(--c-border);
+      border-radius: 9px;
+      padding: 10px 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    /* Summary Spec Strip */
+    .spec-strip {
+      width: 840px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: var(--page-card);
+      border: 1px solid var(--page-border);
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--page-muted);
+    }
+    .spec-strip strong { color: var(--page-ink); display: block; margin-bottom: 3px; font-weight: 600; }
+    .spec-strip code {
+      font-family: Consolas, ui-monospace, monospace;
+      font-size: 11px;
+      padding: 1px 4px;
+      border-radius: 4px;
+      background: rgba(128, 128, 128, 0.12);
+      color: var(--page-ink);
+    }
+
+    /* Toast Overlay inside main window */
+    .toast-pill {
+      position: absolute;
+      bottom: 16px;
+      left: calc(68px + (772px / 2));
+      transform: translateX(-50%);
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: var(--c-ink);
+      color: var(--c-surface);
+      font-size: 12px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.18s ease;
+      z-index: 40;
+    }
+    .toast-pill.show { opacity: 0.94; }
+  </style>
+</head>
+<body data-page-theme="light">
+
+  <!-- ==================== PREVIEW STUDIO CONTROL BAR ==================== -->
+  <div class="control-bar">
+    <div class="control-group">
+      <strong style="font-weight:600;">状态模拟：</strong>
+      <button onclick="setPhase('connected')" id="btnPhConn" class="ctrl-btn active">已加速</button>
+      <button onclick="setPhase('connecting')" id="btnPhWait" class="ctrl-btn">重连倒计时</button>
+      <button onclick="setPhase('disconnected')" id="btnPhDisc" class="ctrl-btn">待机</button>
+    </div>
+
+    <div class="control-group">
+      <button onclick="toggleStress()" id="btnStress" class="ctrl-btn">压力测试：正常文案</button>
+      <label class="ctrl-check">
+        <input type="checkbox" onchange="document.getElementById('studioRoot').classList.toggle('show-slots', this.checked)" />
+        <span>显示防挤压定宽槽</span>
+      </label>
+      <span class="ctrl-sep"></span>
+      <button onclick="toggleTheme()" id="btnTheme" class="ctrl-btn">浅色 (暖宣纸)</button>
+    </div>
+  </div>
+
+  <!-- ==================== STUDIO SCOPE ==================== -->
+  <div id="studioRoot" class="studio-scope" data-theme="light">
+
+    <!-- ==================== 1. MAIN WINDOW (840 x 548, Win11 8px DWM Corners) ==================== -->
+    <div class="app-window">
+
+      <!-- 68px Ultra-Slim Icon Rail -->
+      <aside class="icon-rail">
+        <div class="rail-top">
+          <div class="brand-mark" title="GameAccel v0.3.4">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <polygon points="13.5,3 5.5,13 12.5,13" fill="#FFFFFF"/>
+              <polygon points="10.5,21 18.5,11 11.5,11" fill="#FFFFFF"/>
+            </svg>
+          </div>
+
+          <nav class="rail-nav">
+            <button onclick="setNav('cockpit')" data-nav="cockpit" class="rail-btn active">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <path d="M5.5 17.5a8 8 0 1 1 13 0"/><path d="M12 13l4-3.5"/><circle cx="12" cy="13" r="1.5" fill="currentColor"/>
+              </svg>
+              <span>加速</span>
+            </button>
+
+            <button onclick="setNav('nodes')" data-nav="nodes" class="rail-btn">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                <circle cx="12" cy="12" r="8"/><line x1="4" y1="12" x2="20" y2="12"/><ellipse cx="12" cy="12" rx="3.8" ry="8"/>
+              </svg>
+              <span>线路</span>
+            </button>
+
+            <button onclick="setNav('logs')" data-nav="logs" class="rail-btn">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3.5" y="5" width="17" height="14" rx="2.5"/><polyline points="8,10 10.5,12 8,14"/><line x1="12.5" y1="14" x2="16" y2="14"/>
+              </svg>
+              <span>日志</span>
+            </button>
+
+            <button onclick="setNav('settings')" data-nav="settings" class="rail-btn">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+                <line x1="5" y1="9" x2="19" y2="9"/><circle cx="9.5" cy="9" r="2.1" fill="currentColor"/>
+                <line x1="5" y1="15" x2="19" y2="15"/><circle cx="14.5" cy="15" r="2.1" fill="currentColor"/>
+              </svg>
+              <span>设置</span>
+            </button>
+          </nav>
+        </div>
+
+        <div class="rail-bottom" id="railOpsWrap">
+          <div class="rail-divider"></div>
+          <button onclick="setNav('ops')" data-nav="ops" class="rail-btn" style="height:44px;" title="远程服务端运维">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+              <rect x="4" y="5" width="16" height="5.5" rx="1.8"/><rect x="4" y="13.5" width="16" height="5.5" rx="1.8"/>
+              <circle cx="7.5" cy="7.75" r="1" fill="currentColor"/><circle cx="7.5" cy="16.25" r="1" fill="currentColor"/>
+            </svg>
+            <span>运维</span>
+          </button>
+        </div>
+      </aside>
+
+      <!-- 772px Right Stage -->
+      <div class="stage">
+        <!-- 28px Topbar (with Minimize / Maximize / Close) -->
+        <header class="topbar">
+          <div class="topbar-left">
+            <span id="viewTitle" class="view-title">加速驾驶舱</span>
+            <span id="portBadge" class="port-badge mono slot-lock" onclick="toast('已复制代理地址 127.0.0.1:2080')">127.0.0.1:2080</span>
+          </div>
+          <div class="topbar-right">
+            <button onclick="toggleTheme()" class="win-btn" title="切换浅色 / 深色主题">
+              <svg id="themeIcon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+              </svg>
+            </button>
+            <button class="win-btn" title="最小化">
+              <svg width="11" height="11" viewBox="0 0 12 12"><line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" stroke-width="1.3"/></svg>
+            </button>
+            <button class="win-btn" title="最大化（Win11 自动切回直角）" onclick="toast('最大化时 Win11 DWM 自动切回直角并隐藏外框')">
+              <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><rect x="2" y="2" width="8" height="8" stroke="currentColor" stroke-width="1.3"/></svg>
+            </button>
+            <button class="win-btn close" title="最小化到托盘">
+              <svg width="11" height="11" viewBox="0 0 12 12"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.3"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <!-- ==================== PAGE 1: COCKPIT ==================== -->
+        <main id="page-cockpit" class="page">
+          <!-- Hero Command Deck -->
+          <section id="heroDeck" class="bento-card hero-deck">
+            <div class="hero-runway">
+              <div class="hero-eyebrow">
+                <span id="heroStateBadge" class="pill pill-ok">
+                  <span id="heroStateDot" class="state-dot"></span>
+                  <span id="heroStateText">隧道保护中</span>
+                </span>
+                <span id="heroTimer" class="mono slot-lock" style="font-size:12px;color:var(--c-muted);">00:18:42</span>
+                <span id="heroProtoBadge" class="pill pill-muted mono">GACL · 双通道</span>
+              </div>
+              <h2 id="heroNodeTitle" class="hero-title truncate">默认主力节点 (www.goldpeak.top)</h2>
+              <p id="heroFeedbackLine" class="hero-desc truncate">已接管全局虚拟网卡 (Wintun) · 大陆网站直连，海外与游戏流量走加速隧道</p>
+            </div>
+            <div class="hero-action-slot slot-lock">
+              <button id="heroActionBtn" onclick="toggleConnect()" class="hero-action-btn">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
+                </svg>
+                <span id="heroActionLabel">断开连接</span>
+              </button>
+            </div>
+          </section>
+
+          <!-- Bottom Asymmetric 7:5 Bento Split -->
+          <div class="bento-split">
+            <!-- Left Telemetry Bento -->
+            <section class="bento-card telemetry-card">
+              <div class="metric-strip">
+                <div class="metric-cell slot-lock">
+                  <div class="metric-lbl">游戏延迟</div>
+                  <div id="mRtt" class="metric-val mono truncate">26 ms</div>
+                </div>
+                <div class="metric-cell slot-lock">
+                  <div class="metric-lbl">网络抖动</div>
+                  <div id="mJitter" class="metric-val mono truncate">±0.4 ms</div>
+                </div>
+                <div class="metric-cell slot-lock">
+                  <div class="metric-lbl">丢包双发</div>
+                  <div id="mLoss" class="metric-val mono truncate">0.0%</div>
+                </div>
+                <div class="metric-cell slot-lock">
+                  <div class="metric-lbl">活跃并发</div>
+                  <div id="mConns" class="metric-val mono truncate">21</div>
+                </div>
+              </div>
+
+              <div class="chart-header">
+                <div id="chartSeg" class="seg" style="width:146px;height:25px;grid-template-columns:1fr 1fr;">
+                  <button onclick="setChart('traffic')" data-c="traffic" class="active">实时吞吐</button>
+                  <button onclick="setChart('rtt')" data-c="rtt">延迟曲线</button>
+                </div>
+                <div class="mono slot-lock" style="font-size:11.5px;display:flex;gap:10px;color:var(--c-ink-2);">
+                  <span id="cDown">↓ 14.8 MB/s</span>
+                  <span id="cUp" style="color:var(--c-muted);">↑ 1.24 MB/s</span>
+                </div>
+              </div>
+
+              <div class="chart-wrap">
+                <canvas id="bentoCanvas"></canvas>
+              </div>
+            </section>
+
+            <!-- Right Stack -->
+            <div class="right-stack">
+              <section class="bento-card mode-card">
+                <div class="mode-row">
+                  <span class="mode-lbl">接管</span>
+                  <div id="segTakeover" class="seg">
+                    <button onclick="setTakeover('tun')" data-v="tun" class="active">游戏 TUN</button>
+                    <button onclick="setTakeover('sys')" data-v="sys">系统代理</button>
+                    <button onclick="setTakeover('port')" data-v="port">仅端口</button>
+                  </div>
+                </div>
+                <div class="mode-row">
+                  <span class="mode-lbl">分流</span>
+                  <div id="segRoute" class="seg">
+                    <button onclick="setRoute('rule')" data-v="rule" class="active">大陆直连</button>
+                    <button onclick="setRoute('global')" data-v="global">全局代理</button>
+                    <button onclick="setRoute('direct')" data-v="direct">纯直连</button>
+                  </div>
+                </div>
+              </section>
+
+              <section class="bento-card quick-card">
+                <div class="quick-head">
+                  <span style="font-size:12px;color:var(--c-ink-2);">快捷换线</span>
+                  <div style="display:flex;align-items:center;gap:10px;font-size:11.5px;">
+                    <button onclick="toast('正在批量探测全部线路延迟…')" style="color:var(--c-muted);">测速</button>
+                    <button onclick="setNav('nodes')" style="color:var(--c-cta-ink);">全部线路 ›</button>
+                  </div>
+                </div>
+                <div id="quickNodesBox" class="quick-list scroll"></div>
+              </section>
+            </div>
+          </div>
+        </main>
+
+        <!-- ==================== PAGE 2: NODES ==================== -->
+        <main id="page-nodes" class="page hidden">
+          <div class="toolbar-row">
+            <div class="toolbar-left">
+              <button class="btn-primary" onclick="toast('打开新建节点弹窗')">+ 新建节点</button>
+              <button class="chip-btn" onclick="toast('打开导入 gacl:// / hysteria2:// 弹窗')">导入链接</button>
+              <button class="chip-btn" onclick="toast('打开订阅管理弹窗')">订阅管理</button>
+              <button class="chip-btn" onclick="toast('已开始全部线路延迟测速')">全部测速</button>
+            </div>
+            <button class="chip-btn" onclick="toast('已导出全部节点分享链接')">导出全部</button>
+          </div>
+          <div id="fullNodesBox" class="scroll" style="flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding-right:2px;"></div>
+        </main>
+
+        <!-- ==================== PAGE 3: LOGS ==================== -->
+        <main id="page-logs" class="page hidden">
+          <div class="toolbar-row">
+            <div class="toolbar-left">
+              <button id="lfAll" class="chip-btn accent" onclick="setLogFilter('all')">全部</button>
+              <button id="lfOk" class="chip-btn" onclick="setLogFilter('ok')">连接</button>
+              <button id="lfErr" class="chip-btn" onclick="setLogFilter('err')">异常</button>
+              <input id="logSearch" class="styled-input" style="width:200px;" placeholder="搜索日志…" oninput="renderLogs()" />
+            </div>
+            <div class="toolbar-left">
+              <button class="chip-btn" onclick="toast('已复制运行日志')">复制</button>
+              <button class="chip-btn danger" onclick="toast('已清空运行日志')">清空</button>
+            </div>
+          </div>
+          <div id="fullLogsBox" class="bento-card log-box scroll mono"></div>
+        </main>
+
+        <!-- ==================== PAGE 4: SETTINGS ==================== -->
+        <main id="page-settings" class="page hidden scroll" style="padding-right:2px;gap:10px;">
+          <div>
+            <div class="set-group-title">网络与权限</div>
+            <div class="bento-card set-card">
+              <div class="set-row">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span style="font-size:13px;">本地混合端口</span>
+                  <span class="pill pill-muted mono">HTTP / SOCKS5</span>
+                </div>
+                <input class="styled-input mono" style="width:148px;" value="127.0.0.1:2080" />
+              </div>
+              <div class="hairline"></div>
+              <div class="set-row">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span style="font-size:13px;">运行权限</span>
+                  <span style="font-size:12px;color:var(--c-ok);">已获管理员权限（支持 TUN 全局网卡）</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <div class="set-group-title">外观与交互</div>
+            <div class="bento-card set-card">
+              <div class="set-row">
+                <span style="font-size:13px;">界面主题</span>
+                <div id="setThemeSeg" class="seg" style="width:124px;grid-template-columns:1fr 1fr;">
+                  <button onclick="setTheme('light')" data-v="light" class="active">浅色</button>
+                  <button onclick="setTheme('dark')" data-v="dark">深色</button>
+                </div>
+              </div>
+              <div class="hairline"></div>
+              <div class="set-row">
+                <span style="font-size:13px;">托盘右键菜单</span>
+                <div id="setTraySeg" class="seg" style="width:148px;grid-template-columns:1fr 1fr;">
+                  <button onclick="setTrayStyle('panel')" data-v="panel" class="active">悬浮面板</button>
+                  <button onclick="setTrayStyle('menu')" data-v="menu">原生菜单</button>
+                </div>
+              </div>
+              <div class="hairline"></div>
+              <div class="set-row">
+                <span style="font-size:13px;">桌面网速悬浮窗</span>
+                <div id="swPill" class="pill-switch" data-on="true" onclick="togglePillSwitch()"></div>
+              </div>
+              <div id="pillLightRow" class="set-row-sub">
+                <span style="font-size:12px;color:var(--c-ink-2);">└ 悬浮窗呼吸灯效</span>
+                <div id="setLightSeg" class="seg" style="width:228px;height:26px;grid-template-columns:repeat(4,1fr);">
+                  <button onclick="setPillLight('glow')" data-v="glow" class="active">柔光</button>
+                  <button onclick="setPillLight('ripple')" data-v="ripple">波纹</button>
+                  <button onclick="setPillLight('orbit')" data-v="orbit">星轨</button>
+                  <button onclick="setPillLight('bars')" data-v="bars">律动</button>
+                </div>
+              </div>
+              <div class="hairline"></div>
+              <div class="set-row">
+                <span style="font-size:13px;">显示服务端管理</span>
+                <div id="swAdmin" class="pill-switch" data-on="true" onclick="toggleAdminEntry()"></div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <div class="set-group-title">更新与数据</div>
+            <div class="bento-card set-card">
+              <div class="set-row">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span style="font-size:13px;">当前版本 v0.3.4</span>
+                  <span style="font-size:12px;color:var(--c-muted);">已是最新</span>
+                </div>
+                <div style="display:flex;gap:6px;">
+                  <button class="chip-btn" onclick="toast('正在检查 GitHub Releases 最新版本…')">检查更新</button>
+                  <button class="chip-btn" onclick="toast('已打开配置与日志目录')">打开配置目录</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+
+        <!-- ==================== PAGE 5: ADMIN OPS (v0.3.1 Full 3-Tab Parity) ==================== -->
+        <main id="page-ops" class="page hidden scroll" style="padding-right:2px;gap:8px;">
+          <!-- 1. Server Selector Bar -->
+          <div class="bento-card admin-srv-bar">
+            <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1;">
+              <button class="chip-btn accent">当前加密隧道服务端</button>
+              <span class="pill pill-ok">加密隧道</span>
+              <span class="mono truncate" style="font-size:11px;color:var(--c-muted);">http://panel.gacl.local</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+              <button class="chip-btn" onclick="toast('编辑服务端连接配置')">编辑</button>
+              <button class="chip-btn" onclick="toast('添加远程运维服务端')">+ 添加</button>
+              <button class="chip-btn" onclick="toast('已刷新服务端概览与日志')">刷新</button>
+              <button class="chip-btn danger" onclick="toast('已退出当前运维会话')">退出</button>
+            </div>
+          </div>
+
+          <!-- 2. 4 Equal-Height KPI Cards -->
+          <div class="admin-kpi-grid">
+            <div class="bento-card admin-kpi">
+              <div style="display:flex;align-items:center;justify-content:space-between;">
+                <span style="font-size:11px;color:var(--c-muted);">监听节点</span>
+                <span class="pill pill-warn" style="height:17px;font-size:10px;">自签</span>
+              </div>
+              <div class="mono" style="font-size:17px;">UDP :443</div>
+              <div class="truncate" style="font-size:11px;color:var(--c-muted);" title="89.208.248.53 · www.goldpeak.top">89.208.248.53 · www.goldpeak.top</div>
+            </div>
+            <div class="bento-card admin-kpi">
+              <span style="font-size:11px;color:var(--c-muted);">在线连接</span>
+              <div class="mono" style="font-size:17px;">3</div>
+              <div style="font-size:11px;color:var(--c-muted);">已运行 1天 15小时</div>
+            </div>
+            <div class="bento-card admin-kpi">
+              <span style="font-size:11px;color:var(--c-muted);">累计流量</span>
+              <div class="mono" style="font-size:17px;">9.93 GB</div>
+              <div class="mono truncate" style="font-size:11px;color:var(--c-muted);">↑1.32 GB · ↓8.61 GB</div>
+            </div>
+            <div class="bento-card admin-kpi">
+              <span style="font-size:11px;color:var(--c-muted);">分享链接</span>
+              <div class="mono" style="font-size:17px;">2 / 2</div>
+              <div style="font-size:11px;color:var(--c-muted);">启用 / 总数</div>
+            </div>
+          </div>
+
+          <!-- 3. Sub-Tab Bar (`分享链接 | 访问日志 | 节点与安全`) -->
+          <div class="admin-subbar">
+            <div id="adminSubSeg" class="seg" style="width:268px;height:30px;grid-template-columns:repeat(3,1fr);">
+              <button onclick="setAdminTab('links')" data-v="links" class="active">分享链接</button>
+              <button onclick="setAdminTab('logs')" data-v="logs">访问日志</button>
+              <button onclick="setAdminTab('settings')" data-v="settings">节点与安全</button>
+            </div>
+            <div id="adminRightActions" style="display:flex;align-items:center;gap:6px;"></div>
+          </div>
+
+          <!-- Sub-Tab A: Links -->
+          <div id="admin-tab-links" class="bento-card" style="padding:12px 14px;display:flex;flex-direction:column;gap:8px;">
+            <div id="adminLinksBox" style="display:flex;flex-direction:column;gap:7px;"></div>
+          </div>
+
+          <!-- Sub-Tab B: Access Logs -->
+          <div id="admin-tab-logs" class="bento-card hidden" style="padding:12px 14px;display:flex;flex-direction:column;gap:8px;">
+            <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
+              <button class="chip-btn" onclick="toast('切换用户链接筛选')">
+                <span>全部链接</span>
+                <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="3,4.5 6,7.5 9,4.5"/></svg>
+              </button>
+              <div id="adminProtoChips" style="display:flex;gap:4px;"></div>
+              <input id="adminLogSearch" class="styled-input" style="flex:1;min-width:110px;max-width:175px;height:26px;" placeholder="搜索域名 / IP…" oninput="renderAdminLogs()" />
+              <span id="adminLogCount" class="mono" style="margin-left:auto;font-size:11px;color:var(--c-muted);">4 / 4 条</span>
+            </div>
+            <div class="hairline"></div>
+            <div class="alog-grid alog-head">
+              <span>时间</span><span>用户链接</span><span>协议</span><span>主域名 / 目标地址</span><span>来源 IP</span><span>流量 · 耗时</span><span>状态</span>
+            </div>
+            <div class="hairline"></div>
+            <div id="adminLogsRows" style="display:flex;flex-direction:column;gap:3px;"></div>
+          </div>
+
+          <!-- Sub-Tab C: Node & Security Settings -->
+          <div id="admin-tab-settings" class="admin-settings-grid hidden">
+            <div class="bento-card" style="padding:14px 16px;display:flex;flex-direction:column;gap:9px;">
+              <div>
+                <div style="font-size:14px;">节点对外信息</div>
+                <div style="font-size:11px;color:var(--c-muted);margin-top:2px;">控制生成分享链接与订阅 URL 时嵌入的公网地址及证书策略</div>
+              </div>
+              <div>
+                <label class="field-lbl">公网 IP 或域名</label>
+                <input class="styled-input mono" style="width:100%;" value="www.goldpeak.top" />
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                <div>
+                  <label class="field-lbl">QUIC UDP 端口</label>
+                  <input class="styled-input mono" style="width:100%;" value="443" />
+                </div>
+                <div>
+                  <label class="field-lbl">TLS 域名 (SNI)</label>
+                  <input class="styled-input mono" style="width:100%;" value="www.goldpeak.top" />
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;margin-top:2px;">
+                <div class="pill-switch" data-on="true" onclick="this.dataset.on=this.dataset.on==='true'?'false':'true'"></div>
+                <span style="font-size:12px;">允许跳过证书校验（自签证书）</span>
+              </div>
+              <div style="display:flex;gap:6px;margin-top:4px;">
+                <button class="btn-primary" onclick="toast('节点对外设置已保存')">保存设置</button>
+                <button class="chip-btn" onclick="toast('已还原为服务端当前配置')">还原</button>
+              </div>
+            </div>
+
+            <div class="bento-card" style="padding:14px 16px;display:flex;flex-direction:column;gap:9px;">
+              <div>
+                <div style="font-size:14px;">修改管理密码</div>
+                <div style="font-size:11px;color:var(--c-muted);margin-top:2px;">更新后所有已登录的管理会话将立即失效并要求重新登录</div>
+              </div>
+              <div>
+                <label class="field-lbl">原密码</label>
+                <input type="password" class="styled-input" style="width:100%;" placeholder="输入当前后台密码" />
+              </div>
+              <div>
+                <label class="field-lbl">新密码（至少 6 位）</label>
+                <input type="password" class="styled-input" style="width:100%;" placeholder="输入新管理密码" />
+              </div>
+              <div style="margin-top:auto;padding-top:12px;">
+                <button class="btn-primary" onclick="toast('管理密码已更新，请重新登录')">更新密码</button>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+
+      <!-- Toast Feedback -->
+      <div id="toastPill" class="toast-pill"></div>
+    </div>
+
+    <!-- ==================== 2. COMPANION WINDOWS SHOWCASE (Floating Pill + Menu + Tray Popover) ==================== -->
+    <div class="companions-grid">
+      <!-- Left: 98x44 Desktop Speed Pill + 166x236 Anchored Context Menu -->
+      <div class="showcase-panel">
+        <div class="showcase-head">
+          <span>桌面网速悬浮窗（98×44）与外框锚定右键菜单（166×236）</span>
+          <button class="chip-btn" style="height:24px;font-size:11px;" onclick="togglePillMenu()">显示 / 隐藏右键菜单</button>
+        </div>
+
+        <div class="taskbar-stage" oncontextmenu="event.preventDefault(); togglePillMenu();">
+          <span class="taskbar-hint">Win11 8px 原生圆角 · 右键下方悬浮窗切换菜单（严格避开悬浮窗 + 任务栏 8pt 间距）</span>
+
+          <!-- 166x236 Context Menu -->
+          <div id="pillContextMenu" class="pill-menu">
+            <button class="pill-menu-row" onclick="togglePillOpt('topmost')">
+              <span class="pill-check" id="chk-topmost">✓</span>窗口置顶显示
+            </button>
+            <button class="pill-menu-row" onclick="togglePillOpt('edgeHide')">
+              <span class="pill-check" id="chk-edgeHide" style="visibility:hidden;">✓</span>贴边自动隐藏
+            </button>
+            <button class="pill-menu-row" onclick="togglePillOpt('fsHide')">
+              <span class="pill-check" id="chk-fsHide">✓</span>全屏时自动隐藏
+            </button>
+            <button class="pill-menu-row" onclick="togglePillOpt('locked')">
+              <span class="pill-check" id="chk-locked" style="visibility:hidden;">✓</span>锁定悬浮窗位置
+            </button>
+            <div class="hairline" style="margin:3px 0;"></div>
+            <button class="pill-menu-row" id="pillMenuConn" onclick="toggleConnect()">断开加速</button>
+            <button class="pill-menu-row" onclick="setNav('cockpit'); toast('已唤醒主窗口加速驾驶舱')">查看流量详情</button>
+            <button class="pill-menu-row danger" onclick="toast('已隐藏桌面网速悬浮窗')">关闭流量悬浮窗</button>
+          </div>
+
+          <!-- 98x44 Floating Speed Card -->
+          <div class="speed-pill" title="右键弹出菜单 · 左键拖拽 · 双击唤起主窗口" onclick="togglePillMenu()">
+            <div class="pill-led-box">
+              <canvas id="pillLedCanvas" width="28" height="28" style="width:14px;height:14px;"></canvas>
+            </div>
+            <div class="pill-speeds mono">
+              <div class="pill-up"><span>↑</span><span id="pillUpTxt">1.2 MB/s</span></div>
+              <div class="pill-down"><span>↓</span><span id="pillDownTxt">14.8 MB/s</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: 328px System Tray Popover -->
+      <div class="showcase-panel" style="align-items:center;">
+        <div class="showcase-head" style="width:100%;">
+          <span>系统托盘快捷面板（328px）</span>
+          <span class="pill pill-muted">Win11 8px</span>
+        </div>
+
+        <div class="tray-popover">
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <div style="display:flex;align-items:center;gap:7px;">
+              <div class="brand-mark" style="width:22px;height:22px;border-radius:6px;">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
+                  <polygon points="13.5,3 5.5,13 12.5,13" fill="#FFFFFF"/>
+                  <polygon points="10.5,21 18.5,11 11.5,11" fill="#FFFFFF"/>
+                </svg>
+              </div>
+              <span style="font-size:13px;">GameAccel</span>
+              <span id="trayStatusDot" class="state-dot" style="background:var(--c-ok);"></span>
+            </div>
+            <div style="display:flex;gap:5px;">
+              <button class="chip-btn" style="height:23px;font-size:11px;" onclick="togglePillMenu()">悬浮窗</button>
+              <button class="chip-btn" style="height:23px;font-size:11px;" onclick="toast('唤起主窗口')">主界面</button>
+            </div>
+          </div>
+
+          <div class="tray-status-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+              <div style="min-width:0;">
+                <div id="trayNodeName" class="truncate" style="font-size:12.5px;">默认主力节点 (www.goldpeak.top)</div>
+                <div id="trayMeta" class="mono" style="font-size:11px;color:var(--c-muted);margin-top:2px;">26 ms · ↓14.8 MB/s · ↑1.2 MB/s</div>
+              </div>
+              <button id="trayConnBtn" class="chip-btn" onclick="toggleConnect()">断开</button>
+            </div>
+          </div>
+
+          <div id="trayTakeSeg" class="seg" style="height:26px;grid-template-columns:repeat(3,1fr);">
+            <button onclick="setTakeover('tun')" data-v="tun" class="active">游戏 TUN</button>
+            <button onclick="setTakeover('sys')" data-v="sys">系统代理</button>
+            <button onclick="setTakeover('port')" data-v="port">仅端口</button>
+          </div>
+          <div id="trayRouteSeg" class="seg" style="height:26px;grid-template-columns:repeat(3,1fr);">
+            <button onclick="setRoute('rule')" data-v="rule" class="active">大陆直连</button>
+            <button onclick="setRoute('global')" data-v="global">全局代理</button>
+            <button onclick="setRoute('direct')" data-v="direct">纯直连</button>
+          </div>
+
+          <div class="hairline"></div>
+          <div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--c-muted);">
+            <span class="mono">127.0.0.1:2080</span>
+            <button class="chip-btn danger" style="height:23px;font-size:11px;" onclick="toast('彻底退出并清理 TUN / 系统代理')">彻底退出</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== 3. DESIGN & ENGINEERING SPEC STRIP ==================== -->
+    <div class="spec-strip">
+      <div>
+        <strong>1. Win11 原生 DWM 8px 圆角（v0.3.4）</strong>
+        主窗口、悬浮窗、右键菜单与托盘面板在 Win11 上统一使用 <code>DWMWCP_ROUND</code> 硬件抗锯齿圆角与原生投影，主窗口外框色 <code>DWMWA_BORDER_COLOR</code> 跟随浅/深色主题自动同步。
+      </div>
+      <div>
+        <strong>2. 运维面板三页签完全对齐（v0.3.1）</strong>
+        桌面端「服务端运维」覆盖 Web 面板全部能力：<code>分享链接 | 访问日志 | 节点与安全</code>，浅灰行内按钮采用白底描边增强对比度，下拉箭头全矢量绘制防缺字。
+      </div>
+      <div>
+        <strong>3. 防闪烁与零遮挡弹窗（v0.3.2–v0.3.3）</strong>
+        无边框小窗挂接 <code>chromeless_wndproc</code> 拦截 <code>WM_NCACTIVATE</code> / <code>WM_NCUAHDRAWCAPTION</code>，右键菜单以悬浮窗完整外框为锚点，停靠任务栏时紧贴上方 <code>8pt</code> 弹出。
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const st = {
+      theme: 'light',
+      nav: 'cockpit',
+      phase: 'connected',
+      takeover: 'tun',
+      route: 'rule',
+      chart: 'traffic',
+      stress: false,
+      activeId: 'n1',
+      logFilter: 'all',
+      trayStyle: 'panel',
+      pillLight: 'glow',
+      pillMenuOpen: true,
+      pillOpts: { topmost: true, edgeHide: false, fsHide: true, locked: false },
+      adminTab: 'links',
+      adminLogsEnabled: true,
+      adminProto: '',
+      openMoreLinkId: null,
+      normalNodes: [
+        { id: 'n1', name: '默认主力节点 (www.goldpeak.top)', proto: 'GACL', server: '89.208.248.53:443', rtt: '26 ms', fast: true },
+        { id: 'n2', name: '东京 IIJ 游戏专线 02', proto: 'GACL', server: 'jp-02.goldpeak.top:443', rtt: '46 ms', fast: true },
+        { id: 'n3', name: '新加坡 CN2 低延迟', proto: 'GACL', server: 'sg-01.goldpeak.top:443', rtt: '59 ms', fast: true },
+        { id: 'n4', name: '洛杉矶 GIA 备用节点', proto: 'HY2',  server: 'us-01.goldpeak.top:443', rtt: '142 ms', fast: false },
+      ],
+      stressNodes: [
+        { id: 'n1', name: '【极端超长名称压力测试】深港 IPLC 跨境内网专线-BGP-Anycast-旗舰电竞低延迟节点 #001 (hk-super-long-edge.goldpeak.example.com)', proto: 'GACL', server: 'hk-super-long-edge-gateway-01.goldpeak-network.example.com:65535', rtt: '998 ms', fast: false },
+        { id: 'n2', name: '【极端超长名称压力测试】东京品川 KDDI/IIJ 混合双栈直连高防游戏节点 #002-Ultra-Long-Suffix', proto: 'GACL', server: '2001:0db8:85a3:0000:0000:8a2e:0370:7334:8443', rtt: '1240 ms', fast: false },
+        { id: 'n3', name: '法兰克福 DE-CIX 骨干网边界溢出与省略号对齐稳定性测试节点', proto: 'HY2', server: 'eu-central-frankfurt-99.example.org:8443', rtt: '超时', fast: false },
+      ],
+      adminLinks: [
+        { id: 'l1', name: '默认主力节点 (www.goldpeak.top)', status: 'active', gameDup: true, online: 3, used: '9.93 GB', limit: '不限', pct: 0, exp: '长期有效', hasHy2: true },
+        { id: 'l2', name: '队友开黑专线 · 限量配额', status: 'active', gameDup: false, online: 0, used: '38.4 GB', limit: '100 GB', pct: 38.4, exp: '2026-12-31', hasHy2: true },
+      ],
+      adminLogs: [
+        { time: '11-27 13:34:18', user: '默认主力节点', proto: 'UDP', domain: 'riotgames.com', target: '104.160.142.3:5291', ip: '183.14.92.11', io: '↑482 KB ↓2.9 MB', dur: '18.4s', status: 'ok' },
+        { time: '11-27 13:34:05', user: '默认主力节点', proto: 'HTTPS', domain: 'github.com', target: 'github.com:443', ip: '183.14.92.11', io: '↑14 KB ↓312 KB', dur: '420ms', status: 'ok' },
+        { time: '11-27 13:33:51', user: '队友开黑专线', proto: 'TCP', domain: 'steampowered.com', target: 'store.steampowered.com:443', ip: '119.123.44.8', io: '↑8 KB ↓1.1 MB', dur: '1.2s', status: 'ok' },
+        { time: '11-27 13:32:10', user: '系统审计', proto: 'PANEL', domain: '/api/settings/node', target: 'admin login ok', ip: '127.0.0.1', io: '↑0 B ↓0 B', dur: '3ms', status: 'ok' },
+      ],
+      rxHist: [8.5, 11.2, 10.4, 13.8, 16.5, 19.2, 15.6, 14.0, 17.4, 21.0, 18.2, 15.0, 14.2, 16.1, 15.4, 14.8],
+      txHist: [1.0, 1.3, 1.1, 1.6, 1.9, 2.2, 1.5, 1.3, 1.8, 2.3, 1.9, 1.4, 1.2, 1.5, 1.3, 1.24],
+      rttHist: [26, 27, 25, 26, 28, 27, 26, 25, 26, 27, 26, 25, 26, 27, 26, 26],
+    };
+
+    let toastTimer = null;
+    function toast(msg) {
+      const el = document.getElementById('toastPill');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+    }
+
+    function currentNodes() { return st.stress ? st.stressNodes : st.normalNodes; }
+
+    function setTheme(t) {
+      st.theme = t;
+      document.getElementById('studioRoot').setAttribute('data-theme', t);
+      document.body.setAttribute('data-page-theme', t);
+      document.getElementById('btnTheme').textContent = t === 'light' ? '浅色 (暖宣纸)' : '深色 (曜石黑)';
+      renderAll();
+    }
+    function toggleTheme() { setTheme(st.theme === 'light' ? 'dark' : 'light'); }
+
+    function toggleStress() {
+      st.stress = !st.stress;
+      const btn = document.getElementById('btnStress');
+      btn.textContent = st.stress ? '压力测试：超长文案+极限数值' : '压力测试：正常文案';
+      btn.classList.toggle('active', st.stress);
+      renderAll();
+    }
+
+    function setNav(n) {
+      st.nav = n;
+      const titles = { cockpit: '加速驾驶舱', nodes: '线路与订阅', logs: '诊断日志', settings: '偏好设置', ops: '服务端运维' };
+      document.getElementById('viewTitle').textContent = titles[n];
+      ['cockpit', 'nodes', 'logs', 'settings', 'ops'].forEach(k => {
+        document.getElementById('page-' + k).classList.toggle('hidden', k !== n);
+      });
+      renderAll();
+    }
+
+    function setPhase(p) { st.phase = p; renderAll(); }
+    function toggleConnect() {
+      st.phase = st.phase === 'connected' ? 'disconnected' : 'connected';
+      toast(st.phase === 'connected' ? '已建立 QUIC 双通道加密连接' : '已断开加速连接');
+      renderAll();
+    }
+    function setTakeover(v) { st.takeover = v; renderAll(); }
+    function setRoute(v) { st.route = v; renderAll(); }
+    function setChart(c) { st.chart = c; renderAll(); }
+    function pickNode(id) { st.activeId = id; renderAll(); }
+    function setLogFilter(f) { st.logFilter = f; renderLogs(); }
+    function setTrayStyle(v) { st.trayStyle = v; renderAll(); toast(v === 'panel' ? '已切换为托盘悬浮面板' : '已切换为系统原生菜单'); }
+    function setPillLight(v) { st.pillLight = v; renderAll(); }
+    function togglePillSwitch() {
+      const sw = document.getElementById('swPill');
+      const on = sw.dataset.on !== 'true';
+      sw.dataset.on = String(on);
+      document.getElementById('pillLightRow').classList.toggle('hidden', !on);
+      toast(on ? '已开启桌面网速悬浮窗' : '已隐藏桌面网速悬浮窗');
+    }
+    function toggleAdminEntry() {
+      const sw = document.getElementById('swAdmin');
+      const on = sw.dataset.on !== 'true';
+      sw.dataset.on = String(on);
+      document.getElementById('railOpsWrap').classList.toggle('hidden', !on);
+      if (!on && st.nav === 'ops') setNav('settings');
+    }
+    function togglePillMenu() {
+      st.pillMenuOpen = !st.pillMenuOpen;
+      document.getElementById('pillContextMenu').classList.toggle('closed', !st.pillMenuOpen);
+    }
+    function togglePillOpt(key) {
+      st.pillOpts[key] = !st.pillOpts[key];
+      document.getElementById('chk-' + key).style.visibility = st.pillOpts[key] ? 'visible' : 'hidden';
+    }
+    function setAdminTab(tab) {
+      st.adminTab = tab;
+      st.openMoreLinkId = null;
+      renderAdmin();
+    }
+    function toggleAdminMore(id) {
+      st.openMoreLinkId = st.openMoreLinkId === id ? null : id;
+      renderAdmin();
+    }
+    function setAdminProto(p) { st.adminProto = p; renderAdminLogs(); }
+
+    function paintSeg(id, val) {
+      const box = document.getElementById(id);
+      if (!box) return;
+      box.querySelectorAll('button').forEach(b => {
+        const key = b.dataset.v || b.dataset.c;
+        b.classList.toggle('active', key === val);
+      });
+    }
+
+    function renderLogs() {
+      const nodes = currentNodes();
+      const active = nodes.find(x => x.id === st.activeId) || nodes[0];
+      [['all', 'lfAll'], ['ok', 'lfOk'], ['err', 'lfErr']].forEach(([k, id]) => {
+        document.getElementById(id).className = st.logFilter === k ? 'chip-btn accent' : 'chip-btn';
+      });
+      const q = (document.getElementById('logSearch').value || '').trim().toLowerCase();
+      const entries = [
+        { ts: '[13:34:01]', kind: 'ok', text: `双通道已连接并认证成功 [${active.proto}] (${active.server}，游戏 UDP 通道初始 RTT ${active.rtt})` },
+        { ts: '[13:34:01]', kind: 'info', text: `分流模式：${st.route.toUpperCase()}（直连域名 110250 条 / 代理域名 27272 条 / 国内 IP 段 6605 条）` },
+        { ts: '[13:34:01]', kind: 'ok', text: 'TUN 虚拟网卡已启动 (GameAccel 10.0.88.2/24, MTU 1120, 智能分流已启用)' },
+        { ts: '[13:34:01]', kind: 'info', text: '本地聚合代理 (HTTP + SOCKS5) 已监听 127.0.0.1:2080' },
+        { ts: '[13:34:19]', kind: 'err', text: '模拟抖动告警：UDP 短暂丢包 3.2%，已自动激活游戏包自适应双发补偿' },
+      ].filter(e => {
+        if (st.logFilter === 'ok' && e.kind !== 'ok') return false;
+        if (st.logFilter === 'err' && e.kind !== 'err') return false;
+        if (q && !(e.ts + ' ' + e.text).toLowerCase().includes(q)) return false;
+        return true;
+      });
+      document.getElementById('fullLogsBox').innerHTML = entries.map(e => {
+        const col = e.kind === 'ok' ? 'var(--c-ok)' : (e.kind === 'err' ? 'var(--c-err)' : 'var(--c-ink-2)');
+        return `<div><span style="color:var(--c-muted);">${e.ts}</span> <span style="color:${col};">${e.text}</span></div>`;
+      }).join('') || `<div style="color:var(--c-muted);text-align:center;padding:30px 0;">暂无匹配日志</div>`;
+    }
+
+    function renderAdminLogs() {
+      const protos = [['', '全部'], ['HTTPS', 'HTTPS'], ['UDP', 'UDP'], ['TCP', 'TCP'], ['AUTH', '拦截'], ['PANEL', '审计']];
+      document.getElementById('adminProtoChips').innerHTML = protos.map(([v, lbl]) => `
+        <button class="chip-btn ${st.adminProto === v ? 'accent' : ''}" style="height:26px;padding:0 8px;font-size:11.5px;" onclick="setAdminProto('${v}')">${lbl}</button>
+      `).join('');
+
+      const q = (document.getElementById('adminLogSearch').value || '').trim().toLowerCase();
+      const rows = st.adminLogs.filter(r => {
+        if (st.adminProto && r.proto !== st.adminProto) return false;
+        if (q && !(r.domain + ' ' + r.target + ' ' + r.ip + ' ' + r.user).toLowerCase().includes(q)) return false;
+        return true;
+      });
+      document.getElementById('adminLogCount').textContent = `${rows.length} / ${st.adminLogs.length} 条`;
+
+      document.getElementById('adminLogsRows').innerHTML = rows.map(r => {
+        const pCls = r.proto === 'HTTPS' ? 'pill-ok' : (r.proto === 'UDP' ? 'pill-warn' : 'pill-muted');
+        return `
+          <div class="alog-grid alog-row">
+            <span class="mono truncate" style="font-size:11px;color:var(--c-muted);">${r.time}</span>
+            <span class="truncate">${r.user}</span>
+            <span class="pill ${pCls} mono" style="height:18px;font-size:10.5px;justify-self:start;">${r.proto}</span>
+            <div style="min-width:0;">
+              <div class="truncate" style="font-size:12px;">${r.domain}</div>
+              <div class="mono truncate" style="font-size:10.5px;color:var(--c-muted);">${r.target}</div>
+            </div>
+            <span class="mono truncate" style="font-size:11px;color:var(--c-ink-2);">${r.ip}</span>
+            <div style="min-width:0;">
+              <div class="mono truncate" style="font-size:10.5px;color:var(--c-ink-2);">${r.io}</div>
+              <div class="mono" style="font-size:10.5px;color:var(--c-muted);">${r.dur}</div>
+            </div>
+            <span class="pill pill-ok" style="height:18px;font-size:10.5px;justify-self:start;">正常</span>
+          </div>`;
+      }).join('') || `<div style="text-align:center;padding:24px 0;font-size:12px;color:var(--c-muted);">暂无匹配的访问记录</div>`;
+    }
+
+    function renderAdmin() {
+      paintSeg('adminSubSeg', st.adminTab);
+      ['links', 'logs', 'settings'].forEach(k => {
+        document.getElementById('admin-tab-' + k).classList.toggle('hidden', k !== st.adminTab);
+      });
+
+      const actBox = document.getElementById('adminRightActions');
+      if (st.adminTab === 'links') {
+        actBox.innerHTML = `<button class="btn-primary" onclick="toast('打开新建分享链接弹窗')">+ 新建链接</button>`;
+      } else if (st.adminTab === 'logs') {
+        actBox.innerHTML = `
+          <button class="chip-btn ${st.adminLogsEnabled ? 'accent-soft' : ''}" onclick="st.adminLogsEnabled=!st.adminLogsEnabled;renderAdmin();toast(st.adminLogsEnabled?'已恢复访问日志记录':'已暂停访问日志记录')">
+            ${st.adminLogsEnabled ? '● 记录中' : '○ 已暂停'}
+          </button>
+          <button class="chip-btn danger" onclick="toast('再次点击确认清空全部访问日志')">清空日志</button>`;
+      } else {
+        actBox.innerHTML = '';
+      }
+
+      document.getElementById('adminLinksBox').innerHTML = st.adminLinks.map(l => {
+        const isOpen = st.openMoreLinkId === l.id;
+        return `
+          <div class="admin-link-row">
+            <div style="min-width:0;flex:1;display:flex;flex-direction:column;gap:4px;">
+              <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+                <span class="truncate" style="font-size:13px;">${l.name}</span>
+                <span class="pill pill-ok">启用中</span>
+                ${l.gameDup ? `<span class="pill pill-card">双发</span>` : ''}
+                ${l.online > 0 ? `<span class="pill pill-ok">在线 ${l.online}</span>` : ''}
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <span class="mono" style="font-size:11px;color:var(--c-muted);">${l.used} / ${l.limit} · ${l.exp}</span>
+                ${l.pct > 0 ? `<div class="quota-track"><div class="quota-fill" style="width:${l.pct}%;"></div></div>` : ''}
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+              <button class="chip-btn accent" onclick="toast('已复制 gacl:// 分享链接')">复制 gacl://</button>
+              <button class="chip-btn" onclick="toast('已复制 hysteria2:// 链接')">hy2://</button>
+              <button class="chip-btn" onclick="toast('已复制订阅 URL')">订阅</button>
+              <button class="chip-btn" onclick="toggleAdminMore('${l.id}')">
+                <span>更多</span>
+                <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="transform:rotate(${isOpen ? 180 : 0}deg);transition:transform 0.12s;">
+                  <polyline points="3,4.5 6,7.5 9,4.5"/>
+                </svg>
+              </button>
+            </div>
+            ${isOpen ? `
+              <div class="more-popover">
+                <button class="pop-item" onclick="toggleAdminMore('${l.id}');toast('编辑配额与到期时间')">编辑配额</button>
+                <button class="pop-item" onclick="toggleAdminMore('${l.id}');toast('已切换链接启停状态')">禁用链接</button>
+                <button class="pop-item" onclick="toggleAdminMore('${l.id}');toast('已清零流量统计')">清零流量</button>
+                <div class="hairline" style="margin:2px 0;"></div>
+                <button class="pop-item" onclick="toggleAdminMore('${l.id}');toast('再次点击确认重置密钥')">重置密钥</button>
+                <button class="pop-item danger" onclick="toggleAdminMore('${l.id}');toast('再次点击确认删除链接')">删除链接</button>
+              </div>` : ''}
+          </div>`;
+      }).join('');
+
+      renderAdminLogs();
+    }
+
+    function renderAll() {
+      const nodes = currentNodes();
+      const active = nodes.find(x => x.id === st.activeId) || nodes[0];
+
+      document.querySelectorAll('.rail-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.nav === st.nav);
+      });
+      [['connected', 'btnPhConn'], ['connecting', 'btnPhWait'], ['disconnected', 'btnPhDisc']].forEach(([k, id]) => {
+        document.getElementById(id).classList.toggle('active', st.phase === k);
+      });
+
+      document.getElementById('portBadge').textContent = st.stress ? '127.0.0.1:65535' : '127.0.0.1:2080';
+
+      // Hero Deck
+      const deck = document.getElementById('heroDeck');
+      const badge = document.getElementById('heroStateBadge');
+      const dot = document.getElementById('heroStateDot');
+      const sTxt = document.getElementById('heroStateText');
+      const timer = document.getElementById('heroTimer');
+      const actBtn = document.getElementById('heroActionBtn');
+      const actLbl = document.getElementById('heroActionLabel');
+      const fb = document.getElementById('heroFeedbackLine');
+
+      document.getElementById('heroNodeTitle').textContent = active.name;
+      document.getElementById('heroNodeTitle').title = active.name;
+      document.getElementById('heroProtoBadge').textContent = `${active.proto} · 双通道`;
+
+      const takeDesc = {
+        tun: '已接管全局虚拟网卡 (Wintun)',
+        sys: '已接管 Windows 系统代理',
+        port: '仅监听本地混合端口（未修改系统设置）'
+      }[st.takeover];
+      const routeDesc = {
+        rule: '大陆网站直连，海外与游戏流量走加速隧道',
+        global: '全部连接均通过加密隧道转发',
+        direct: '全部流量直连本地物理网卡（用于延迟对比）'
+      }[st.route];
+
+      if (st.phase === 'connected') {
+        deck.style.borderColor = 'rgba(21, 122, 80, 0.36)';
+        badge.className = 'pill pill-ok';
+        dot.style.background = 'var(--c-ok)';
+        sTxt.textContent = '隧道保护中';
+        timer.textContent = st.stress ? '999:59:59' : '00:18:42';
+        timer.classList.remove('hidden');
+        fb.textContent = `${takeDesc} · ${routeDesc}`;
+        actBtn.style.background = 'var(--c-well)';
+        actBtn.style.border = '1px solid var(--c-border-strong)';
+        actBtn.style.color = 'var(--c-ink)';
+        actLbl.textContent = '断开连接';
+        document.getElementById('pillMenuConn').textContent = '断开加速';
+        document.getElementById('trayConnBtn').textContent = '断开';
+        document.getElementById('trayStatusDot').style.background = 'var(--c-ok)';
+      } else if (st.phase === 'connecting') {
+        deck.style.borderColor = 'rgba(180, 105, 14, 0.45)';
+        badge.className = 'pill pill-warn';
+        dot.style.background = 'var(--c-warn)';
+        sTxt.textContent = st.stress ? '重连中 #12 (15s)' : '重连中 #2 (3s)';
+        timer.classList.add('hidden');
+        fb.textContent = '正在与目标节点协商 1-RTT QUIC 双通道加密连接…';
+        actBtn.style.background = 'var(--c-warn-soft)';
+        actBtn.style.border = '1px solid var(--c-warn)';
+        actBtn.style.color = 'var(--c-warn)';
+        actLbl.textContent = '取消连接';
+        document.getElementById('pillMenuConn').textContent = '取消连接';
+        document.getElementById('trayConnBtn').textContent = '取消';
+        document.getElementById('trayStatusDot').style.background = 'var(--c-warn)';
+      } else {
+        deck.style.borderColor = 'var(--c-border)';
+        badge.className = 'pill pill-muted';
+        dot.style.background = 'var(--c-muted)';
+        sTxt.textContent = '待机就绪';
+        timer.classList.add('hidden');
+        fb.textContent = `开启后将接管「${takeDesc.replace('已接管', '')}」 · ${routeDesc}`;
+        actBtn.style.background = 'var(--c-cta)';
+        actBtn.style.border = '1px solid var(--c-cta)';
+        actBtn.style.color = '#FFFFFF';
+        actLbl.textContent = '开启加速';
+        document.getElementById('pillMenuConn').textContent = '开启加速';
+        document.getElementById('trayConnBtn').textContent = '开启';
+        document.getElementById('trayStatusDot').style.background = 'var(--c-muted)';
+      }
+
+      // Metrics & Floating Pill Speeds
+      const mRtt = document.getElementById('mRtt');
+      const mJit = document.getElementById('mJitter');
+      const mLoss = document.getElementById('mLoss');
+      const mConns = document.getElementById('mConns');
+      if (st.phase === 'connected') {
+        mRtt.textContent = active.rtt;
+        mRtt.style.color = active.fast ? 'var(--c-ok)' : 'var(--c-warn)';
+        mJit.textContent = st.stress ? '±128.4 ms' : '±0.4 ms';
+        mJit.style.color = st.stress ? 'var(--c-warn)' : 'var(--c-ink)';
+        mLoss.textContent = st.stress ? '14.2% 双发' : '0.0%';
+        mLoss.style.color = st.stress ? 'var(--c-warn)' : 'var(--c-ink)';
+        mConns.textContent = st.stress ? '2,496' : '21';
+        mConns.style.color = 'var(--c-ink)';
+        document.getElementById('cDown').textContent = st.stress ? '↓ 984.6 MB/s' : '↓ 14.8 MB/s';
+        document.getElementById('cUp').textContent = st.stress ? '↑ 126.4 MB/s' : '↑ 1.24 MB/s';
+        document.getElementById('pillUpTxt').textContent = st.stress ? '126 MB/s' : '1.2 MB/s';
+        document.getElementById('pillDownTxt').textContent = st.stress ? '985 MB/s' : '14.8 MB/s';
+        document.getElementById('trayMeta').textContent = `${active.rtt} · ↓14.8 MB/s · ↑1.2 MB/s`;
+      } else {
+        [mRtt, mJit, mLoss].forEach(el => { el.textContent = '--'; el.style.color = 'var(--c-muted)'; });
+        mConns.textContent = '0';
+        mConns.style.color = 'var(--c-muted)';
+        document.getElementById('cDown').textContent = '↓ 0 B/s';
+        document.getElementById('cUp').textContent = '↑ 0 B/s';
+        document.getElementById('pillUpTxt').textContent = '0.0 KB/s';
+        document.getElementById('pillDownTxt').textContent = '0.0 KB/s';
+        document.getElementById('trayMeta').textContent = '未连接 · 待机就绪';
+      }
+      document.getElementById('trayNodeName').textContent = active.name;
+
+      paintSeg('segTakeover', st.takeover);
+      paintSeg('segRoute', st.route);
+      paintSeg('trayTakeSeg', st.takeover);
+      paintSeg('trayRouteSeg', st.route);
+      paintSeg('chartSeg', st.chart);
+      paintSeg('setThemeSeg', st.theme);
+      paintSeg('setTraySeg', st.trayStyle);
+      paintSeg('setLightSeg', st.pillLight);
+
+      // Quick Nodes
+      document.getElementById('quickNodesBox').innerHTML = nodes.map(n => {
+        const sel = n.id === st.activeId;
+        const rttCol = n.rtt === '超时' ? 'var(--c-err)' : (n.fast ? 'var(--c-ok)' : 'var(--c-warn)');
+        return `
+          <div onclick="pickNode('${n.id}')" title="${n.name}\n${n.server}" class="quick-row ${sel ? 'selected' : ''}">
+            <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1;">
+              <span class="state-dot" style="background:${sel ? (st.phase === 'connected' ? 'var(--c-ok)' : 'var(--c-cta)') : 'var(--c-border-strong)'};"></span>
+              <span class="truncate" style="font-size:12.5px;">${n.name}</span>
+            </div>
+            <span class="quick-rtt mono slot-lock" style="color:${rttCol};">${n.rtt}</span>
+          </div>`;
+      }).join('');
+
+      // Full Nodes Page
+      document.getElementById('fullNodesBox').innerHTML = nodes.map(n => {
+        const sel = n.id === st.activeId;
+        const rttCol = n.rtt === '超时' ? 'var(--c-err)' : (n.fast ? 'var(--c-ok)' : 'var(--c-warn)');
+        return `
+          <div onclick="pickNode('${n.id}')" class="bento-card node-row-card" style="border-color:${sel ? 'var(--c-ok)' : 'var(--c-border)'};">
+            <div style="min-width:0;flex:1;">
+              <div style="display:flex;align-items:center;gap:7px;min-width:0;">
+                <span class="state-dot" style="background:${sel ? 'var(--c-ok)' : 'var(--c-border-strong)'};"></span>
+                <span class="truncate" style="font-size:13.5px;">${n.name}</span>
+                <span class="pill pill-muted mono" style="height:18px;font-size:10.5px;">${n.proto}</span>
+              </div>
+              <div class="mono truncate" style="font-size:11.5px;color:var(--c-muted);padding-left:14px;margin-top:3px;">${n.server}</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;" class="slot-lock" onclick="event.stopPropagation()">
+              <span class="mono" style="width:54px;text-align:right;font-size:12px;color:${rttCol};margin-right:4px;">${n.rtt}</span>
+              <button class="chip-btn" onclick="toast('正在测速 ${n.server}')">测速</button>
+              <button class="chip-btn" onclick="toast('已复制节点分享链接')">分享</button>
+              <button class="chip-btn" onclick="toast('编辑节点配置')">编辑</button>
+            </div>
+          </div>`;
+      }).join('');
+
+      renderLogs();
+      renderAdmin();
+      requestAnimationFrame(drawBentoChart);
+    }
+
+    function drawBentoChart() {
+      const c = document.getElementById('bentoCanvas');
+      if (!c || st.nav !== 'cockpit') return;
+      const rect = c.parentElement.getBoundingClientRect();
+      if (rect.width < 10 || rect.height < 10) return;
+      const dpr = window.devicePixelRatio || 1;
+      c.width = rect.width * dpr;
+      c.height = rect.height * dpr;
+      const ctx = c.getContext('2d');
+      ctx.scale(dpr, dpr);
+      const w = rect.width, h = rect.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const cs = getComputedStyle(document.getElementById('studioRoot'));
+      const muted = cs.getPropertyValue('--c-muted').trim();
+      const border = cs.getPropertyValue('--c-border').trim();
+      const dataCol = cs.getPropertyValue('--c-data').trim();
+      const data2Col = cs.getPropertyValue('--c-data-2').trim();
+      const dataFill = cs.getPropertyValue('--c-data-fill').trim();
+
+      if (st.phase !== 'connected') {
+        ctx.fillStyle = muted;
+        ctx.font = '12px "Microsoft YaHei", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('开启加速后展示实时吞吐曲线', w / 2, h / 2);
+        return;
+      }
+
+      const padL = 48, padR = 8, padT = 8, padB = 10;
+      const cw = w - padL - padR, ch = h - padT - padB;
+      const series = st.chart === 'traffic' ? st.rxHist : st.rttHist;
+      const maxVal = st.chart === 'traffic' ? 24 : 50;
+
+      ctx.strokeStyle = border;
+      ctx.lineWidth = 1;
+      ctx.fillStyle = muted;
+      ctx.font = '10.5px Consolas, monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      for (let i = 0; i <= 2; i++) {
+        const y = padT + (ch / 2) * i;
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+        const v = maxVal * (1 - i / 2);
+        ctx.fillText(st.chart === 'traffic' ? `${v.toFixed(0)} MB/s` : `${v.toFixed(0)} ms`, padL - 6, y);
+      }
+
+      const pts = series.map((v, idx) => [
+        padL + (cw / (series.length - 1)) * idx,
+        padT + ch * (1 - Math.min(v, maxVal) / maxVal)
+      ]);
+      ctx.beginPath();
+      pts.forEach(([x, y], i) => i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
+      ctx.lineTo(pts[pts.length - 1][0], padT + ch);
+      ctx.lineTo(pts[0][0], padT + ch);
+      ctx.closePath();
+      ctx.fillStyle = dataFill;
+      ctx.fill();
+
+      ctx.beginPath();
+      pts.forEach(([x, y], i) => i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
+      ctx.strokeStyle = dataCol;
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+
+      if (st.chart === 'traffic') {
+        const txPts = st.txHist.map((v, idx) => [
+          padL + (cw / (st.txHist.length - 1)) * idx,
+          padT + ch * (1 - Math.min(v, maxVal) / maxVal)
+        ]);
+        ctx.beginPath();
+        txPts.forEach(([x, y], i) => i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
+        ctx.strokeStyle = data2Col;
+        ctx.lineWidth = 1.3;
+        ctx.stroke();
+      }
+
+      const last = pts[pts.length - 1];
+      ctx.beginPath(); ctx.arc(last[0], last[1], 3.2, 0, Math.PI * 2);
+      ctx.fillStyle = dataCol; ctx.fill();
+    }
+
+    // Animated Floating Pill Breathing LED (4 exact styles: Glow / Ripple / Orbit / Bars)
+    function animatePillLed(ts) {
+      const c = document.getElementById('pillLedCanvas');
+      if (c) {
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, 28, 28);
+        const cx = 14, cy = 14;
+        const cs = getComputedStyle(document.getElementById('studioRoot'));
+        const col = st.phase === 'disconnected'
+          ? cs.getPropertyValue('--c-border-strong').trim()
+          : (st.phase === 'connecting' ? cs.getPropertyValue('--c-pill-up').trim() : cs.getPropertyValue('--c-pill-down').trim());
+        const phase = ((ts / (st.phase === 'connecting' ? 1150 : 1900)) % 1);
+
+        if (st.phase === 'disconnected') {
+          ctx.fillStyle = col;
+          ctx.beginPath(); ctx.arc(cx, cy, 5.2, 0, Math.PI * 2); ctx.fill();
+        } else if (st.pillLight === 'glow') {
+          const r = 9.5 + 3.0 * (1 - Math.cos(phase * Math.PI * 2));
+          ctx.fillStyle = col;
+          ctx.globalAlpha = 0.22;
+          ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.beginPath(); ctx.arc(cx, cy, 5.2, 0, Math.PI * 2); ctx.fill();
+        } else if (st.pillLight === 'ripple') {
+          ctx.strokeStyle = col;
+          ctx.lineWidth = 1.8;
+          ctx.globalAlpha = 0.72 * Math.sin(Math.PI * phase);
+          ctx.beginPath(); ctx.arc(cx, cy, 6 + 7.5 * phase, 0, Math.PI * 2); ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = col;
+          ctx.beginPath(); ctx.arc(cx, cy, 5.2, 0, Math.PI * 2); ctx.fill();
+        } else if (st.pillLight === 'orbit') {
+          ctx.strokeStyle = col;
+          ctx.globalAlpha = 0.22;
+          ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(cx, cy, 10.5, 0, Math.PI * 2); ctx.stroke();
+          ctx.globalAlpha = 1;
+          const a = phase * Math.PI * 2;
+          ctx.lineWidth = 3;
+          ctx.beginPath(); ctx.arc(cx, cy, 10.5, a, a + 1.6); ctx.stroke();
+          ctx.fillStyle = col;
+          ctx.beginPath(); ctx.arc(cx, cy, 3.4, 0, Math.PI * 2); ctx.fill();
+        } else {
+          ctx.fillStyle = col;
+          for (let i = 0; i < 3; i++) {
+            const wave = 0.5 * (1 + Math.sin(phase * Math.PI * 2 + i * 1.4));
+            const h = 6 + 12 * wave;
+            ctx.fillRect(cx + (i - 1) * 7.5 - 2.2, cy - h / 2, 4.4, h);
+          }
+        }
+      }
+      requestAnimationFrame(animatePillLed);
+    }
+
+    window.addEventListener('resize', drawBentoChart);
+    renderAll();
+    requestAnimationFrame(animatePillLed);
+  </script>
+</body>
+</html>
