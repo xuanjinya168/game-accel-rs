@@ -158,9 +158,24 @@ impl GameAccelApp {
 
                         // 1. Header bar (26px locked height, redundant × close button removed)
                         aligned_row(ui, 26.0, |ui| {
-                            let (logo_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                            icons::draw_brand_logo(ui.painter(), logo_rect, p);
+                            let (logo_rect, logo_resp) =
+                                ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                            if logo_resp.clicked() {
+                                self.brand_logo_pulse = 1.0;
+                                vctx.request_repaint();
+                            }
+                            let logo_hover =
+                                vctx.animate_bool_responsive(logo_resp.id, logo_resp.hovered());
+                            icons::draw_brand_logo(
+                                ui.painter(),
+                                logo_rect,
+                                p,
+                                icons::BrandLogoVisual {
+                                    fill_t: self.brand_logo_fill_t,
+                                    pulse: self.brand_logo_pulse,
+                                    hover: logo_hover,
+                                },
+                            );
                             ui.add_space(2.0);
                             ui.label(
                                 RichText::new("GameAccel")

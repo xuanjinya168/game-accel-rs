@@ -197,6 +197,11 @@ pub(crate) struct GameAccelApp {
     pub(crate) floating_pill_led_k: f32,
     pub(crate) floating_pill_led_phase: f64,
     pub(crate) floating_pill_led_last: f64,
+    /// Brand lightning mark hollow-to-solid transition state (`0.0` idle wireframe .. `1.0` solid).
+    pub(crate) brand_logo_fill_t: f32,
+    pub(crate) brand_logo_pulse: f32,
+    pub(crate) brand_logo_last_state: ConnState,
+    pub(crate) brand_logo_last_time: f64,
     /// GitHub Releases based auto-updater.
     pub(crate) updater: updater::Updater,
     /// Version we've already toasted about, so the "new version" toast shows once.
@@ -304,6 +309,10 @@ impl GameAccelApp {
             floating_pill_led_k: 0.0,
             floating_pill_led_phase: 0.0,
             floating_pill_led_last: 0.0,
+            brand_logo_fill_t: 0.0,
+            brand_logo_pulse: 0.0,
+            brand_logo_last_state: ConnState::Disconnected,
+            brand_logo_last_time: 0.0,
             updater: updater::Updater::default(),
             update_notified: None,
             tun_admin_prompt: None,
@@ -330,6 +339,55 @@ impl GameAccelApp {
             });
         }
         app
+    }
+
+    fn step_brand_logo_anim(&mut self, ctx: &egui::Context, visible: bool) {
+        let now = ctx.input(|i| i.time);
+        let dt = if self.brand_logo_last_time > 0.0 {
+            (now - self.brand_logo_last_time).clamp(0.0, 0.05) as f32
+        } else {
+            0.016
+        };
+        self.brand_logo_last_time = now;
+
+        if self.state != self.brand_logo_last_state {
+            if self.state == ConnState::Connected && visible {
+                self.brand_logo_pulse = 1.0;
+            }
+            self.brand_logo_last_state = self.state;
+        }
+
+        let target_fill = match self.state {
+            ConnState::Disconnected => 0.0,
+            ConnState::Connected => 1.0,
+            ConnState::Connecting => 0.46 + 0.22 * (now as f32 * 5.2).sin(),
+        };
+
+        if !visible {
+            self.brand_logo_fill_t = if self.state == ConnState::Connected {
+                1.0
+            } else {
+                0.0
+            };
+            self.brand_logo_pulse = 0.0;
+            return;
+        }
+
+        let lerp_k = (dt * 11.0).min(1.0);
+        self.brand_logo_fill_t += (target_fill - self.brand_logo_fill_t) * lerp_k;
+        if self.state != ConnState::Connecting
+            && (target_fill - self.brand_logo_fill_t).abs() < 0.003
+        {
+            self.brand_logo_fill_t = target_fill;
+        }
+        self.brand_logo_pulse = (self.brand_logo_pulse - dt * 2.4).max(0.0);
+
+        let animating = self.state == ConnState::Connecting
+            || (target_fill - self.brand_logo_fill_t).abs() > 0.002
+            || self.brand_logo_pulse > 0.002;
+        if animating {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 
     fn render_toast_overlay(
@@ -507,7 +565,9 @@ impl eframe::App for GameAccelApp {
                 .outer_rect
                 .is_some_and(|r| r.min.x < -8000.0 || r.min.y < -8000.0)
         });
-        if !(is_minimized || main_offscreen) {
+        let main_visible = !(is_minimized || main_offscreen);
+        self.step_brand_logo_anim(ctx, main_visible || self.tray_popover_open);
+        if main_visible {
             // Frameless rounded window container with single crisp 1px outer border (zero double-stroke)
             egui::CentralPanel::default()
                 .frame(Frame::NONE)

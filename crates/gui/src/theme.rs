@@ -142,11 +142,27 @@ impl ThemePalette {
     }
 }
 
-/// Shared normalized brand lightning geometry (2 convex triangles in [-1, 1] space).
-pub const BRAND_BOLT_UPPER: [(f32, f32); 3] = [(0.16, -0.66), (-0.54, 0.08), (0.08, 0.08)];
-pub const BRAND_BOLT_LOWER: [(f32, f32); 3] = [(-0.16, 0.66), (0.54, -0.08), (-0.08, -0.08)];
+/// Shared normalized sleek brand lightning geometry in `[-1, 1]` space.
+/// `BRAND_BOLT_UPPER ∪ BRAND_BOLT_LOWER` has the exact 6-vertex boundary `BRAND_BOLT_OUTLINE`;
+/// `BRAND_BOLT_BRIDGE` covers their interior diagonal seam against AA feathering.
+pub const BRAND_BOLT_UPPER: [(f32, f32); 3] = [(0.14, -0.68), (-0.50, 0.07), (0.00, 0.07)];
+pub const BRAND_BOLT_LOWER: [(f32, f32); 3] = [(-0.14, 0.68), (0.50, -0.07), (0.00, -0.07)];
+pub const BRAND_BOLT_BRIDGE: [(f32, f32); 4] = [
+    (-0.07, -0.055),
+    (0.07, -0.055),
+    (0.07, 0.055),
+    (-0.07, 0.055),
+];
+pub const BRAND_BOLT_OUTLINE: [(f32, f32); 6] = [
+    (0.14, -0.68),
+    (-0.50, 0.07),
+    (-0.0261, 0.07),
+    (-0.14, 0.68),
+    (0.50, -0.07),
+    (0.0261, -0.07),
+];
 
-fn point_in_triangle(px: f32, py: f32, tri: [(f32, f32); 3]) -> bool {
+pub(crate) fn point_in_triangle(px: f32, py: f32, tri: [(f32, f32); 3]) -> bool {
     let (x1, y1) = tri[0];
     let (x2, y2) = tri[1];
     let (x3, y3) = tri[2];
@@ -158,11 +174,13 @@ fn point_in_triangle(px: f32, py: f32, tri: [(f32, f32); 3]) -> bool {
     !(has_neg && has_pos)
 }
 
-/// Generate a 32x32 anti-aliased RGBA taskbar/tray icon matching `icons::draw_brand_logo` identically.
+/// Generate a 32x32 anti-aliased RGBA taskbar/tray icon matching `icons::draw_brand_logo`
+/// (top-lit terracotta gradient `#E38667 -> #CC6848` + crisp inner highlight + sleek solid bolt).
 pub fn build_app_icon() -> egui::IconData {
     let size = 32usize;
     let mut rgba = vec![0u8; size * size * 4];
-    let bg = [217.0_f32, 119.0, 87.0];
+    let bg_top = [227.0_f32, 134.0, 103.0]; // #E38667
+    let bg_bot = [204.0_f32, 104.0, 72.0]; // #CC6848
     let fg = [255.0_f32, 255.0, 255.0];
 
     let half = size as f32 * 0.5;
@@ -188,7 +206,29 @@ pub fn build_app_icon() -> egui::IconData {
                         let ny = (fy - half) / half;
                         let in_bolt = point_in_triangle(nx, ny, BRAND_BOLT_UPPER)
                             || point_in_triangle(nx, ny, BRAND_BOLT_LOWER);
-                        let col = if in_bolt { fg } else { bg };
+                        let col = if in_bolt {
+                            fg
+                        } else {
+                            let ty = (fy / size as f32).clamp(0.0, 1.0);
+                            let mut c = [
+                                bg_top[0] + (bg_bot[0] - bg_top[0]) * ty,
+                                bg_top[1] + (bg_bot[1] - bg_top[1]) * ty,
+                                bg_top[2] + (bg_bot[2] - bg_top[2]) * ty,
+                            ];
+                            // Subtle 1px inner rim highlight matching `draw_brand_logo`
+                            let edge_dist = if dx > 0.0 && dy > 0.0 {
+                                corner_r - dist
+                            } else {
+                                (half - (fx - half).abs()).min(half - (fy - half).abs())
+                            };
+                            if edge_dist <= 1.05 {
+                                let rim = 0.20 * (1.0 - 0.35 * ty);
+                                c[0] += (255.0 - c[0]) * rim;
+                                c[1] += (255.0 - c[1]) * rim;
+                                c[2] += (255.0 - c[2]) * rim;
+                            }
+                            c
+                        };
                         r_acc += col[0];
                         g_acc += col[1];
                         b_acc += col[2];

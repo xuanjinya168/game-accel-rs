@@ -32,9 +32,28 @@ impl GameAccelApp {
         if brand_resp.drag_started_by(PointerButton::Primary) {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
+        if brand_resp.clicked() {
+            self.brand_logo_pulse = 1.0;
+            ctx.request_repaint();
+        }
+        let hover_t = ctx.animate_bool_responsive(brand_resp.id, brand_resp.hovered());
         let logo_rect = egui::Rect::from_center_size(brand_slot.center(), Vec2::splat(36.0));
-        icons::draw_brand_logo(ui.painter(), logo_rect, p);
-        brand_resp.on_hover_text(format!("GameAccel {APP_VERSION}"));
+        icons::draw_brand_logo(
+            ui.painter(),
+            logo_rect,
+            p,
+            icons::BrandLogoVisual {
+                fill_t: self.brand_logo_fill_t,
+                pulse: self.brand_logo_pulse,
+                hover: hover_t,
+            },
+        );
+        let status_hint = match self.state {
+            ConnState::Connected => "隧道保护中",
+            ConnState::Connecting => "连接协商中",
+            ConnState::Disconnected => "待机就绪",
+        };
+        brand_resp.on_hover_text(format!("GameAccel {APP_VERSION} · {status_hint}"));
 
         ui.add_space(12.0);
 

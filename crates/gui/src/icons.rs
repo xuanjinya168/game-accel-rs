@@ -1,30 +1,188 @@
-use crate::theme::{BRAND_BOLT_LOWER, BRAND_BOLT_UPPER, ThemePalette};
-use eframe::egui::{Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, Vec2};
-use std::f32::consts::TAU;
+use crate::theme::{
+    BRAND_BOLT_BRIDGE, BRAND_BOLT_LOWER, BRAND_BOLT_OUTLINE, BRAND_BOLT_UPPER, ThemePalette,
+};
+use eframe::egui::{Color32, CornerRadius, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
-/// Draw the 32x32 Terracotta rounded brand mark with a two-triangle vector lightning bolt
-/// matching `theme::build_app_icon()` pixel-for-pixel.
-pub fn draw_brand_logo(painter: &Painter, rect: Rect, p: ThemePalette) {
-    let radius = (rect.width() * 0.25).round() as u8;
-    painter.rect_filled(rect, CornerRadius::same(radius), p.accent);
+/// Visual state for the hollow-to-solid animated terracotta brand mark.
+#[derive(Debug, Clone, Copy)]
+pub struct BrandLogoVisual {
+    /// Bottom-up solid fill ratio (`0.0` = idle wireframe, `1.0` = active solid bolt).
+    pub fill_t: f32,
+    /// Decaying `1.0 -> 0.0` ripple & pop impulse fired when entering `Connected` or clicked.
+    pub pulse: f32,
+    /// Smooth `0.0 -> 1.0` hover lift ratio.
+    pub hover: f32,
+}
+
+/// Clip a convex polygon to the half-plane `y >= y_cut` (bottom-up rising liquid fill).
+fn clip_polygon_below_y(poly: &[Pos2], y_cut: f32) -> Vec<Pos2> {
+    if poly.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Pos2> = Vec::with_capacity(poly.len() + 1);
+    let push_dedup = |dst: &mut Vec<Pos2>, pt: Pos2| {
+        if dst.last().is_none_or(|prev| prev.distance_sq(pt) > 1e-6) {
+            dst.push(pt);
+        }
+    };
+    let n = poly.len();
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        let a_in = a.y >= y_cut;
+        let b_in = b.y >= y_cut;
+        if a_in && b_in {
+            push_dedup(&mut out, b);
+        } else if a_in && !b_in {
+            let denom = b.y - a.y;
+            if denom.abs() > 1e-6 {
+                let t = ((y_cut - a.y) / denom).clamp(0.0, 1.0);
+                push_dedup(&mut out, Pos2::new(a.x + (b.x - a.x) * t, y_cut));
+            }
+        } else if !a_in && b_in {
+            let denom = b.y - a.y;
+            if denom.abs() > 1e-6 {
+                let t = ((y_cut - a.y) / denom).clamp(0.0, 1.0);
+                push_dedup(&mut out, Pos2::new(a.x + (b.x - a.x) * t, y_cut));
+            }
+            push_dedup(&mut out, b);
+        }
+    }
+    if out.len() > 1
+        && let (Some(&first), Some(&last)) = (out.first(), out.last())
+        && first.distance_sq(last) <= 1e-6
+    {
+        out.pop();
+    }
+    out
+}
+
+fn draw_terracotta_squircle(
+    painter: &Painter,
+    rect: Rect,
+    radius: f32,
+    highlight_alpha: u8,
+    p: ThemePalette,
+) {
+    let r_u8 = radius.round() as u8;
+    // Anti-aliased solid base keeps outer rounded edges butter-smooth.
+    painter.rect_filled(rect, CornerRadius::same(r_u8), p.accent);
+
+    // Subtle top-lit terracotta gradient (#E38667 -> #CC6848) inset 0.5px inside the AA rim.
+    let inner = rect.shrink(0.5);
+    let r_in = (radius - 0.5).max(1.0).min(inner.width() * 0.5);
+    let top_col = Color32::from_rgb(227, 134, 103);
+    let bot_col = Color32::from_rgb(204, 104, 72);
+    let lerp_col = |y: f32| -> Color32 {
+        let t = ((y - inner.top()) / inner.height().max(1.0)).clamp(0.0, 1.0);
+        Color32::from_rgb(
+            (top_col.r() as f32 + (bot_col.r() as f32 - top_col.r() as f32) * t).round() as u8,
+            (top_col.g() as f32 + (bot_col.g() as f32 - top_col.g() as f32) * t).round() as u8,
+            (top_col.b() as f32 + (bot_col.b() as f32 - top_col.b() as f32) * t).round() as u8,
+        )
+    };
+
+    const SEG: usize = 6;
+    let corners = [
+        (Pos2::new(inner.right() - r_in, inner.top() + r_in), -FRAC_PI_2, 0.0),
+        (Pos2::new(inner.right() - r_in, inner.bottom() - r_in), 0.0, FRAC_PI_2),
+        (Pos2::new(inner.left() + r_in, inner.bottom() - r_in), FRAC_PI_2, PI),
+        (Pos2::new(inner.left() + r_in, inner.top() + r_in), PI, 1.5 * PI),
+    ];
+    let mut perimeter = Vec::with_capacity(corners.len() * (SEG + 1));
+    for (cc, a0, a1) in corners {
+        for i in 0..=SEG {
+            let a = a0 + (a1 - a0) * (i as f32 / SEG as f32);
+            perimeter.push(Pos2::new(cc.x + a.cos() * r_in, cc.y + a.sin() * r_in));
+        }
+    }
+
+    let mut mesh = Mesh::default();
+    let c = inner.center();
+    mesh.colored_vertex(c, lerp_col(c.y));
+    for &pt in &perimeter {
+        mesh.colored_vertex(pt, lerp_col(pt.y));
+    }
+    let n = perimeter.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    painter.add(Shape::mesh(mesh));
+
+    // Crisp 1px inner top-lit rim highlight.
+    painter.rect_stroke(
+        inner,
+        CornerRadius::same(r_in.round() as u8),
+        Stroke::new(1.0_f32, Color32::from_white_alpha(highlight_alpha)),
+        eframe::egui::StrokeKind::Inside,
+    );
+}
+
+/// Draw the Terracotta rounded brand mark with hollow-to-solid sleek lightning animation:
+/// idle = crisp white wireframe, connecting = gentle charging surge, connected = solid white fill
+/// with an outward terracotta pulse ripple on activation.
+pub fn draw_brand_logo(painter: &Painter, rect: Rect, p: ThemePalette, visual: BrandLogoVisual) {
+    let sz = rect.width();
+    let radius = sz * 0.25;
+    let fill_t = visual.fill_t.clamp(0.0, 1.0);
+    let pulse = visual.pulse.clamp(0.0, 1.0);
+    let hover = visual.hover.clamp(0.0, 1.0);
+
+    // Outward terracotta pulse ripple on activation / tactile click
+    if pulse > 0.01 {
+        let ex = (1.0 - pulse) * (sz * 0.185);
+        let ring_rect = rect.expand(ex);
+        let ring_r = (radius + ex * 0.6).round() as u8;
+        let alpha = (pulse * 0.65 * 255.0).round().clamp(0.0, 255.0) as u8;
+        painter.rect_stroke(
+            ring_rect,
+            CornerRadius::same(ring_r),
+            Stroke::new(
+                (sz * 0.044).clamp(1.2, 1.7),
+                Color32::from_rgba_unmultiplied(p.accent.r(), p.accent.g(), p.accent.b(), alpha),
+            ),
+            eframe::egui::StrokeKind::Middle,
+        );
+    }
+
+    let highlight_alpha = ((0.22 + hover * 0.16 + pulse * 0.22) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    draw_terracotta_squircle(painter, rect, radius, highlight_alpha, p);
 
     let c = rect.center();
-    let half = rect.width() * 0.5;
-    let map_tri = |tri: [(f32, f32); 3]| -> Vec<Pos2> {
-        tri.iter()
-            .map(|&(nx, ny)| Pos2::new(c.x + nx * half, c.y + ny * half))
+    let half = sz * 0.5;
+    let scale = 1.0 + hover * 0.04 + (pulse * PI).sin() * 0.06;
+    let map_pts = |pts: &[(f32, f32)]| -> Vec<Pos2> {
+        pts.iter()
+            .map(|&(nx, ny)| Pos2::new(c.x + nx * half * scale, c.y + ny * half * scale))
             .collect()
     };
 
-    painter.add(Shape::convex_polygon(
-        map_tri(BRAND_BOLT_UPPER),
-        Color32::WHITE,
-        Stroke::NONE,
-    ));
-    painter.add(Shape::convex_polygon(
-        map_tri(BRAND_BOLT_LOWER),
-        Color32::WHITE,
-        Stroke::NONE,
+    // Bottom-up rising solid white fill controlled by `fill_t`
+    if fill_t > 0.02 {
+        let y_top = c.y - 0.68 * half * scale;
+        let y_bot = c.y + 0.68 * half * scale;
+        let y_cut = y_bot - (y_bot - y_top) * fill_t;
+
+        for piece in [
+            BRAND_BOLT_UPPER.as_slice(),
+            BRAND_BOLT_LOWER.as_slice(),
+            BRAND_BOLT_BRIDGE.as_slice(),
+        ] {
+            let clipped = clip_polygon_below_y(&map_pts(piece), y_cut);
+            if clipped.len() >= 3 {
+                painter.add(Shape::convex_polygon(clipped, Color32::WHITE, Stroke::NONE));
+            }
+        }
+    }
+
+    // Always-crisp white wireframe outline (defines idle silhouette & keeps active stroke sharp)
+    let stroke_w = (sz * 0.044).clamp(1.15, 2.2);
+    painter.add(Shape::closed_line(
+        map_pts(&BRAND_BOLT_OUTLINE),
+        Stroke::new(stroke_w, Color32::from_white_alpha(238)),
     ));
 }
 
@@ -342,4 +500,36 @@ pub fn pill_toggle(
     );
     painter.circle_filled(knob, r, Color32::WHITE);
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::point_in_triangle;
+
+    #[test]
+    fn bolt_bridge_stays_strictly_inside_lightning_union() {
+        for &(x, y) in &BRAND_BOLT_BRIDGE {
+            assert!(
+                point_in_triangle(x, y, BRAND_BOLT_UPPER)
+                    || point_in_triangle(x, y, BRAND_BOLT_LOWER),
+                "bridge corner ({x}, {y}) escaped lightning silhouette"
+            );
+        }
+    }
+
+    #[test]
+    fn clip_polygon_below_y_handles_empty_partial_and_full_fill() {
+        let tri = vec![
+            Pos2::new(0.0, 0.0),
+            Pos2::new(10.0, 10.0),
+            Pos2::new(-10.0, 10.0),
+        ];
+        assert!(clip_polygon_below_y(&tri, 12.0).is_empty());
+        assert_eq!(clip_polygon_below_y(&tri, -2.0).len(), 3);
+
+        let mid = clip_polygon_below_y(&tri, 5.0);
+        assert_eq!(mid.len(), 4);
+        assert!(mid.iter().all(|p| p.y >= 5.0 - 1e-4));
+    }
 }
