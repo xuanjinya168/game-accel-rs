@@ -18,7 +18,7 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-const NAT_IDLE_TIMEOUT_SECS: u64 = 60;
+const NAT_IDLE_TIMEOUT_SECS: u64 = 180;
 const NAT_SOCKET_BUFFER: usize = 2 * 1024 * 1024;
 
 pub(crate) fn bind_nat_socket() -> std::io::Result<(std::net::UdpSocket, bool)> {

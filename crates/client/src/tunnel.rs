@@ -48,12 +48,27 @@ impl Tunnels {
         self.secondary.as_ref()
     }
 
+    pub fn is_primary(&self, tunnel: &Arc<TunnelSession>) -> bool {
+        Arc::ptr_eq(&self.primary, tunnel)
+    }
+
     /// Tunnel that should carry `route`. `Direct` yields `None`; a missing domestic lane also
     /// yields `None`, so callers never send domestic traffic through the foreign node.
     pub fn for_route(&self, route: Route) -> Option<&Arc<TunnelSession>> {
         match route {
             Route::Primary => Some(&self.primary),
             Route::Secondary => self.secondary.as_ref(),
+            Route::Direct => None,
+        }
+    }
+
+    /// Same as [`Self::for_route`], except a dead secondary (domestic) UDP lane immediately
+    /// returns `None` so callers degrade domestic UDP to DIRECT without waiting for the async
+    /// watchdog to flip `DomesticEgressCell`.
+    pub fn for_route_live_udp(&self, route: Route) -> Option<&Arc<TunnelSession>> {
+        match route {
+            Route::Primary => Some(&self.primary),
+            Route::Secondary => self.secondary.as_ref().filter(|s| !s.is_udp_closed()),
             Route::Direct => None,
         }
     }
@@ -80,6 +95,10 @@ impl TunnelSession {
 
     pub fn game_dup_enabled(&self) -> bool {
         self.game_dup
+    }
+
+    pub fn is_udp_closed(&self) -> bool {
+        self.udp_conn.close_reason().is_some()
     }
 
     /// Shared duplicate-send pacer of this tunnel's UDP lane (used by the health sampler).

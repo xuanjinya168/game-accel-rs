@@ -1,5 +1,6 @@
 use crate::relay::{ClientStats, TUN_FLOW_MIN};
 use crate::rules::{DOMESTIC_DNS, DnsRoute, Route, Router};
+use crate::tun_pkt::{TunIngressPacket, TunIngressParser, build_udp_ip_packets};
 use crate::tunnel::{TunnelSession, Tunnels};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -20,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-const TUN_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
+const TUN_UDP_IDLE_TIMEOUT_SECS: u64 = 180;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -31,7 +32,26 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const TUN_NAME: &str = "GameAccel";
 const TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 88, 2);
 const TUN_GW: Ipv4Addr = Ipv4Addr::new(10, 0, 88, 1);
+const TUN_BROADCAST: Ipv4Addr = Ipv4Addr::new(10, 0, 88, 255);
 const TUN_PREFIX: u8 = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TunnelSlot {
+    Primary,
+    Secondary,
+}
+
+type TunUdpMap = Arc<DashMap<(SocketAddr, TunnelSlot), Arc<TunUdpSession>>>;
+type DirectUdpMap = Arc<DashMap<(SocketAddr, Option<SocketAddr>), Arc<TunDirectUdpSession>>>;
+
+async fn await_opt<T>(
+    opt: &mut Option<JoinHandle<T>>,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    match opt {
+        Some(h) => h.await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Check whether the current process has Administrator privileges on Windows.
 pub fn is_elevated() -> bool {
@@ -409,51 +429,102 @@ pub async fn run_tun_mode(
 
     let dev = Arc::new(dev);
 
-    let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
+    // Use `netstack-smoltcp` solely for user-space TCP; UDP is parsed/reassembled directly in
+    // `tun_pkt` so IPv4-fragmented packets (e.g. from Hyper-V VMs or QUIC > TUN_MTU) can never
+    // terminate `netstack-smoltcp`'s UDP stream and silently black-hole the TUN adapter.
+    let (stack, runner, _udp_socket, tcp_listener) = StackBuilder::default()
         .enable_tcp(true)
-        .enable_udp(true)
+        .enable_udp(false)
         .mtu(TUN_MTU as usize)
         .build()
         .context("初始化用户态 TCP/IP 协议栈失败")?;
 
-    let runner_task = runner.map(tokio::spawn);
+    let mut runner_task = runner.map(tokio::spawn);
     let (mut stack_sink, mut stack_stream) = stack.split();
 
+    let (udp_in_tx, mut udp_in_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr)>(2048);
+    let (udp_egress_tx, mut udp_egress_rx) = mpsc::channel::<Vec<u8>>(2048);
+
     let dev_in = dev.clone();
-    let tun_to_stack = tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
+    let mut tun_to_stack = Some(tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        let mut parser = TunIngressParser::new(TUN_BROADCAST);
+        let mut udp_dropped: u64 = 0;
         loop {
             match dev_in.recv(&mut buf).await {
-                Ok(n) if n > 0 => {
-                    if stack_sink.send(buf[..n].to_vec()).await.is_err() {
-                        break;
+                Ok(n) if n > 0 => match parser.parse(&buf[..n]) {
+                    TunIngressPacket::Udp { payload, src, dst } => {
+                        match udp_in_tx.try_send((payload, src, dst)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                udp_dropped += 1;
+                                if udp_dropped == 1 || udp_dropped.is_multiple_of(500) {
+                                    warn!(
+                                        "TUN UDP ingress queue full, dropped {udp_dropped} packets so far"
+                                    );
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                warn!("TUN UDP ingress channel closed, stopping TUN reader");
+                                break;
+                            }
+                        }
                     }
-                }
+                    TunIngressPacket::Tcp(pkt) => {
+                        if let Err(e) = stack_sink.send(pkt).await {
+                            if e.kind() == std::io::ErrorKind::InvalidInput {
+                                debug!("ignoring invalid TCP IP packet from TUN: {e}");
+                                continue;
+                            }
+                            warn!("TUN TCP stack sink closed: {e}");
+                            break;
+                        }
+                    }
+                    TunIngressPacket::Drop => {}
+                },
                 Ok(_) => continue,
                 Err(e) => {
-                    debug!("tun recv ended: {}", e);
+                    warn!("tun recv ended: {e}");
                     break;
                 }
             }
         }
-    });
+    }));
 
+    // Single serialized Wintun writer serving both game UDP replies (prioritized) and TCP stack output.
     let dev_out = dev.clone();
-    let stack_to_tun = tokio::spawn(async move {
-        while let Some(pkt) = stack_stream.next().await {
-            match pkt {
-                Ok(frame) => {
+    let mut stack_to_tun = Some(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                udp_pkt = udp_egress_rx.recv() => {
+                    let Some(frame) = udp_pkt else {
+                        break;
+                    };
                     if let Err(e) = dev_out.send(&frame).await {
-                        debug!("tun send error: {}", e);
+                        debug!("tun udp send error: {e}");
                     }
                 }
-                Err(e) => {
-                    debug!("netstack stream error: {}", e);
-                    break;
+                tcp_pkt = stack_stream.next() => {
+                    match tcp_pkt {
+                        Some(Ok(frame)) => {
+                            if let Err(e) = dev_out.send(&frame).await {
+                                debug!("tun tcp send error: {e}");
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!("netstack stream error: {e}");
+                            break;
+                        }
+                        None => {
+                            warn!("netstack stream closed");
+                            break;
+                        }
+                    }
                 }
             }
         }
-    });
+    }));
 
     let tcp_task = if let Some(mut listener) = tcp_listener {
         let tunnels_tcp = tunnels.clone();
@@ -475,9 +546,8 @@ pub async fn run_tun_mode(
         None
     };
 
-    let tun_flow_ids: Arc<DashMap<SocketAddr, Arc<TunUdpSession>>> = Arc::new(DashMap::new());
-    let direct_flow_ids: Arc<DashMap<SocketAddr, Arc<TunDirectUdpSession>>> =
-        Arc::new(DashMap::new());
+    let tun_flow_ids: TunUdpMap = Arc::new(DashMap::new());
+    let direct_flow_ids: DirectUdpMap = Arc::new(DashMap::new());
     let next_tun_flow = Arc::new(AtomicU16::new(TUN_FLOW_MIN));
 
     let reaper_flows = tun_flow_ids.clone();
@@ -498,215 +568,274 @@ pub async fn run_tun_mode(
         }
     });
 
-    let (udp_tx_task, udp_rx_task) = if let Some(udp_sock) = udp_socket {
-        let (mut udp_read, mut udp_write) = udp_sock.split();
-        let (out_tx, mut out_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr, bool)>(1024);
+    let (out_tx, mut out_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr, bool)>(1024);
 
-        let tunnels_udp = tunnels.clone();
-        let stats_tx = stats.clone();
-        let flow_map = tun_flow_ids.clone();
-        let direct_map = direct_flow_ids.clone();
-        let next_flow = next_tun_flow.clone();
-        let router_udp = router.clone();
-        let out_tx_tunnel = out_tx.clone();
+    let tunnels_udp = tunnels.clone();
+    let stats_tx = stats.clone();
+    let flow_map = tun_flow_ids.clone();
+    let direct_map = direct_flow_ids.clone();
+    let next_flow = next_tun_flow.clone();
+    let router_udp = router.clone();
+    let out_tx_tunnel = out_tx.clone();
 
-        let tx_task = tokio::spawn(async move {
-            while let Some((payload, local_src, remote_dst)) = udp_read.next().await {
-                let now = now_secs();
+    let mut udp_tx_task = Some(tokio::spawn(async move {
+        while let Some((payload, local_src, remote_dst)) = udp_in_rx.recv().await {
+            let now = now_secs();
 
-                // DNS: domestic names go to AliDNS directly; foreign queries ride the primary
-                // tunnel. Everything else asks the router for its egress bucket.
-                let (route, direct_target): (Route, Option<(SocketAddr, Option<SocketAddr>)>) =
-                    if remote_dst.port() == 53 && remote_dst.is_ipv4() {
-                        match router_udp.decide_dns_query(&payload) {
-                            DnsRoute::Domestic => {
-                                (Route::Direct, Some((DOMESTIC_DNS, Some(remote_dst))))
-                            }
-                            DnsRoute::Direct => (Route::Direct, Some((remote_dst, None))),
-                            DnsRoute::Proxy => (Route::Primary, None),
+            // DNS: domestic names go to AliDNS directly; foreign queries ride the primary
+            // tunnel. Everything else asks the router for its egress bucket.
+            let (route, direct_target): (Route, Option<(SocketAddr, Option<SocketAddr>)>) =
+                if remote_dst.port() == 53 && remote_dst.is_ipv4() {
+                    match router_udp.decide_dns_query(&payload) {
+                        DnsRoute::Domestic => {
+                            (Route::Direct, Some((DOMESTIC_DNS, Some(remote_dst))))
                         }
-                    } else if remote_dst.is_ipv4() {
-                        let route = router_udp.decide_ip_sync(remote_dst.ip());
-                        let direct = (route == Route::Direct
-                            || tunnels_udp.for_route(route).is_none())
-                        .then_some((remote_dst, None));
-                        (route, direct)
-                    } else {
-                        (Route::Primary, None)
+                        DnsRoute::Direct => (Route::Direct, Some((remote_dst, None))),
+                        DnsRoute::Proxy => (Route::Primary, None),
+                    }
+                } else if remote_dst.is_ipv4() {
+                    let route = router_udp.decide_ip_sync(remote_dst.ip());
+                    let direct = (route == Route::Direct
+                        || tunnels_udp.for_route_live_udp(route).is_none())
+                    .then_some((remote_dst, None));
+                    (route, direct)
+                } else {
+                    (Route::Primary, None)
+                };
+
+            if let Some((actual_dst, spoof_reply_src)) = direct_target {
+                let direct_key = (local_src, spoof_reply_src);
+                let d_session = if let Some(existing) = direct_map.get(&direct_key) {
+                    existing.last_active.store(now, Ordering::Relaxed);
+                    existing.clone()
+                } else {
+                    let sock = match router_udp.dialer.bind_udp_v4() {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            warn!("TUN bind direct UDP failed: {e}");
+                            continue;
+                        }
+                    };
+                    let last_active = Arc::new(AtomicU64::new(now));
+                    let last_active_rx = last_active.clone();
+                    let sock_rx = sock.clone();
+                    let out_tx_direct = out_tx.clone();
+                    let router_rx = router_udp.clone();
+                    let rx_handle = tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        loop {
+                            let Ok((n, src)) = sock_rx.recv_from(&mut buf).await else {
+                                break;
+                            };
+                            last_active_rx.store(now_secs(), Ordering::Relaxed);
+                            let data = buf[..n].to_vec();
+                            if src.port() == 53 {
+                                router_rx.record_dns_answer(&data);
+                            }
+                            let reply_src = match spoof_reply_src {
+                                Some(orig) if src == actual_dst => orig,
+                                _ => SocketAddr::new(src.ip().to_canonical(), src.port()),
+                            };
+                            if out_tx_direct
+                                .send((data, reply_src, local_src, false))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                    let session = Arc::new(TunDirectUdpSession {
+                        socket: sock,
+                        last_active,
+                        rx_task: rx_handle,
+                    });
+                    direct_map.insert(direct_key, session.clone());
+                    session
+                };
+
+                if let Err(e) = d_session.socket.send_to(&payload, actual_dst).await {
+                    debug!("tun direct udp send to {actual_dst} failed: {e}");
+                }
+                continue;
+            }
+
+            // Tunnelled UDP path: pick the egress tunnel for this datagram's route.
+            let Some(tunnel_udp) = tunnels_udp.for_route_live_udp(route) else {
+                warn!("TUN UDP route {route:?} has no tunnel, dropping packet from {local_src}");
+                continue;
+            };
+            let slot = if tunnels_udp.is_primary(tunnel_udp) {
+                TunnelSlot::Primary
+            } else {
+                TunnelSlot::Secondary
+            };
+            let flow_key = (local_src, slot);
+
+            let session = match flow_map.get(&flow_key).map(|e| e.clone()) {
+                Some(existing) if Arc::ptr_eq(&existing.tunnel, tunnel_udp) => {
+                    existing.last_active.store(now, Ordering::Relaxed);
+                    existing
+                }
+                stale => {
+                    if stale.is_some() {
+                        flow_map.remove(&flow_key);
+                    }
+                    drop(stale);
+                    let (f_tx, mut f_rx) = mpsc::channel::<UdpFrame>(256);
+                    let Some(fid) = tunnel_udp.reserve_tun_flow(&next_flow, f_tx) else {
+                        warn!("TUN UDP flow_id space exhausted, dropping packet from {local_src}");
+                        continue;
                     };
 
-                if let Some((actual_dst, spoof_reply_src)) = direct_target {
-                    let d_session = if let Some(existing) = direct_map.get(&local_src) {
-                        existing.last_active.store(now, Ordering::Relaxed);
-                        existing.clone()
-                    } else {
-                        let sock = match router_udp.dialer.bind_udp_v4() {
-                            Ok(s) => Arc::new(s),
-                            Err(e) => {
-                                warn!("TUN bind direct UDP failed: {e}");
+                    let last_active = Arc::new(AtomicU64::new(now));
+                    let last_active_rx = last_active.clone();
+                    let out_tx_clone = out_tx_tunnel.clone();
+                    let router_hint = router_udp.clone();
+                    let dedup_rx = tunnel_udp.should_dedup_rx();
+                    let rx_handle = tokio::spawn(async move {
+                        let mut dedup = DedupWindow::new();
+                        while let Some(frame) = f_rx.recv().await {
+                            if dedup_rx && !dedup.check_and_insert(frame.seq) {
                                 continue;
                             }
-                        };
-                        let last_active = Arc::new(AtomicU64::new(now));
-                        let last_active_rx = last_active.clone();
-                        let sock_rx = sock.clone();
-                        let out_tx_direct = out_tx.clone();
-                        let router_rx = router_udp.clone();
-                        let rx_handle = tokio::spawn(async move {
-                            let mut buf = vec![0u8; 2048];
-                            loop {
-                                let Ok((n, src)) = sock_rx.recv_from(&mut buf).await else {
-                                    break;
-                                };
-                                last_active_rx.store(now_secs(), Ordering::Relaxed);
-                                let data = buf[..n].to_vec();
-                                if src.port() == 53 {
-                                    router_rx.record_dns_answer(&data);
+                            last_active_rx.store(now_secs(), Ordering::Relaxed);
+                            if let TargetAddr::Ip(remote_src) = frame.addr {
+                                if remote_src.port() == 53 {
+                                    router_hint.record_dns_answer(&frame.payload);
                                 }
-                                let reply_src = match spoof_reply_src {
-                                    Some(orig) if src == actual_dst => orig,
-                                    _ => SocketAddr::new(src.ip().to_canonical(), src.port()),
-                                };
-                                if out_tx_direct
-                                    .send((data, reply_src, local_src, false))
+                                if out_tx_clone
+                                    .send((frame.payload.to_vec(), remote_src, local_src, true))
                                     .await
                                     .is_err()
                                 {
                                     break;
                                 }
                             }
-                        });
-                        let session = Arc::new(TunDirectUdpSession {
-                            socket: sock,
-                            last_active,
-                            rx_task: rx_handle,
-                        });
-                        direct_map.insert(local_src, session.clone());
-                        session
-                    };
-
-                    if let Err(e) = d_session.socket.send_to(&payload, actual_dst).await {
-                        debug!("tun direct udp send to {actual_dst} failed: {e}");
-                    }
-                    continue;
-                }
-
-                // Tunnelled UDP path: pick the egress tunnel for this datagram's route.
-                let Some(tunnel_udp) = tunnels_udp.for_route(route) else {
-                    warn!(
-                        "TUN UDP route {route:?} has no tunnel, dropping packet from {local_src}"
-                    );
-                    continue;
-                };
-
-                let session = match flow_map.get(&local_src).map(|e| e.clone()) {
-                    Some(existing) if Arc::ptr_eq(&existing.tunnel, tunnel_udp) => {
-                        existing.last_active.store(now, Ordering::Relaxed);
-                        existing
-                    }
-                    stale => {
-                        if stale.is_some() {
-                            // Egress policy switched mid-session (e.g. domestic lane died):
-                            // release the old flow and reserve one on the new tunnel.
-                            flow_map.remove(&local_src);
                         }
-                        drop(stale);
-                        let (f_tx, mut f_rx) = mpsc::channel::<UdpFrame>(256);
-                        let Some(fid) = tunnel_udp.reserve_tun_flow(&next_flow, f_tx) else {
-                            warn!(
-                                "TUN UDP flow_id space exhausted, dropping packet from {local_src}"
-                            );
-                            continue;
-                        };
+                    });
 
-                        let last_active = Arc::new(AtomicU64::new(now));
-                        let last_active_rx = last_active.clone();
-                        let out_tx_clone = out_tx_tunnel.clone();
-                        let router_hint = router_udp.clone();
-                        let dedup_rx = tunnel_udp.should_dedup_rx();
-                        let rx_handle = tokio::spawn(async move {
-                            let mut dedup = DedupWindow::new();
-                            while let Some(frame) = f_rx.recv().await {
-                                if dedup_rx && !dedup.check_and_insert(frame.seq) {
-                                    continue;
-                                }
-                                last_active_rx.store(now_secs(), Ordering::Relaxed);
-                                if let TargetAddr::Ip(remote_src) = frame.addr {
-                                    if remote_src.port() == 53 {
-                                        router_hint.record_dns_answer(&frame.payload);
-                                    }
-                                    if out_tx_clone
-                                        .send((frame.payload.to_vec(), remote_src, local_src, true))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                        });
+                    stats_tx.active_udp.fetch_add(1, Ordering::Relaxed);
+                    let session = Arc::new(TunUdpSession {
+                        flow_id: fid,
+                        tunnel: tunnel_udp.clone(),
+                        tx_seq: AtomicU16::new(0),
+                        last_active,
+                        rx_task: rx_handle,
+                        stats: stats_tx.clone(),
+                    });
+                    flow_map.insert(flow_key, session.clone());
+                    session
+                }
+            };
 
-                        stats_tx.active_udp.fetch_add(1, Ordering::Relaxed);
-                        let session = Arc::new(TunUdpSession {
-                            flow_id: fid,
-                            tunnel: tunnel_udp.clone(),
-                            tx_seq: AtomicU16::new(0),
-                            last_active,
-                            rx_task: rx_handle,
-                            stats: stats_tx.clone(),
-                        });
-                        flow_map.insert(local_src, session.clone());
-                        session
-                    }
-                };
+            let seq = session.tx_seq.fetch_add(1, Ordering::Relaxed);
+            let payload_len = payload.len();
+            let payload_bytes = Bytes::from(payload);
 
-                let seq = session.tx_seq.fetch_add(1, Ordering::Relaxed);
-                let payload_len = payload.len();
-                let payload_bytes = Bytes::from(payload);
+            let is_game_pkt = session.tunnel.game_dup_enabled()
+                && payload_len < 200
+                && remote_dst.port() != 53
+                && remote_dst.port() != 443;
 
-                let is_game_pkt = session.tunnel.game_dup_enabled()
-                    && payload_len < 200
-                    && remote_dst.port() != 53
-                    && remote_dst.port() != 443;
-
-                if !session.tunnel.send_udp(
-                    session.flow_id,
-                    seq,
-                    is_game_pkt,
-                    TargetAddr::Ip(remote_dst),
-                    payload_bytes,
-                ) {
+            if !session.tunnel.send_udp(
+                session.flow_id,
+                seq,
+                is_game_pkt,
+                TargetAddr::Ip(remote_dst),
+                payload_bytes,
+            ) {
+                flow_map.remove(&flow_key);
+                if slot == TunnelSlot::Primary {
+                    warn!("TUN UDP primary tunnel closed, stopping TUN UDP tx loop");
                     break;
                 }
-                stats_tx
-                    .tx_bytes
-                    .fetch_add(payload_len as u64, Ordering::Relaxed);
+                // Secondary (domestic) lane died mid-session: drop only this secondary flow so
+                // subsequent packets fall back to DIRECT without killing the TUN data plane.
+                warn!(
+                    "TUN UDP secondary tunnel closed for {local_src}; releasing flow to fall back direct"
+                );
+                continue;
             }
-        });
+            stats_tx
+                .tx_bytes
+                .fetch_add(payload_len as u64, Ordering::Relaxed);
+        }
+    }));
 
-        let stats_rx = stats.clone();
-        let rx_task = tokio::spawn(async move {
-            while let Some((data, remote_src, local_dst, count_rx)) = out_rx.recv().await {
-                let len = data.len() as u64;
-                if let Err(e) = udp_write.send((data, remote_src, local_dst)).await {
-                    warn!("tun udp write error: {}", e);
-                } else if count_rx {
-                    stats_rx.rx_bytes.fetch_add(len, Ordering::Relaxed);
+    let stats_rx = stats.clone();
+    let mut udp_rx_task = Some(tokio::spawn(async move {
+        let next_ip_id = AtomicU16::new(1);
+        while let Some((data, remote_src, local_dst, count_rx)) = out_rx.recv().await {
+            let len = data.len() as u64;
+            let pkts = build_udp_ip_packets(
+                &data,
+                remote_src,
+                local_dst,
+                TUN_MTU as usize,
+                &next_ip_id,
+            );
+            let mut sent_ok = !pkts.is_empty();
+            for pkt in pkts {
+                if udp_egress_tx.send(pkt).await.is_err() {
+                    sent_ok = false;
+                    break;
                 }
             }
-        });
-
-        (Some(tx_task), Some(rx_task))
-    } else {
-        (None, None)
-    };
-
-    loop {
-        if *shutdown_rx.borrow() {
-            break;
+            if !sent_ok {
+                if udp_egress_tx.is_closed() {
+                    warn!("TUN UDP egress channel closed");
+                    break;
+                }
+                continue;
+            }
+            if count_rx {
+                stats_rx.rx_bytes.fetch_add(len, Ordering::Relaxed);
+            }
         }
-        if shutdown_rx.changed().await.is_err() {
-            break;
+    }));
+
+    let mut fatal_reason: Option<String> = None;
+    tokio::select! {
+        _ = async {
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        } => {}
+        res = await_opt(&mut tun_to_stack) => {
+            tun_to_stack = None;
+            if !*shutdown_rx.borrow() {
+                fatal_reason = Some(format!("TUN 读包任务异常退出 ({res:?})"));
+            }
+        }
+        res = await_opt(&mut stack_to_tun) => {
+            stack_to_tun = None;
+            if !*shutdown_rx.borrow() {
+                fatal_reason = Some(format!("TUN 写包任务异常退出 ({res:?})"));
+            }
+        }
+        res = await_opt(&mut udp_tx_task) => {
+            udp_tx_task = None;
+            if !*shutdown_rx.borrow() {
+                fatal_reason = Some(format!("TUN UDP 上行任务异常退出 ({res:?})"));
+            }
+        }
+        res = await_opt(&mut udp_rx_task) => {
+            udp_rx_task = None;
+            if !*shutdown_rx.borrow() {
+                fatal_reason = Some(format!("TUN UDP 下行任务异常退出 ({res:?})"));
+            }
+        }
+        res = await_opt(&mut runner_task) => {
+            runner_task = None;
+            if !*shutdown_rx.borrow() {
+                fatal_reason = Some(format!("TUN TCP 协议栈异常退出 ({res:?})"));
+            }
         }
     }
 
@@ -714,27 +843,31 @@ pub async fn run_tun_mode(
     // right here (triggering tun-rs's interrupt event & `WintunCloseAdapter`) before we
     // release the process-wide session lock.
     reaper_task.abort();
-    tun_to_stack.abort();
-    stack_to_tun.abort();
+    if let Some(t) = tun_to_stack.take() {
+        t.abort();
+        let _ = t.await;
+    }
+    if let Some(t) = stack_to_tun.take() {
+        t.abort();
+        let _ = t.await;
+    }
     if let Some(t) = tcp_task {
         t.abort();
         let _ = t.await;
     }
-    if let Some(t) = udp_tx_task {
+    if let Some(t) = udp_tx_task.take() {
         t.abort();
         let _ = t.await;
     }
-    if let Some(t) = udp_rx_task {
+    if let Some(t) = udp_rx_task.take() {
         t.abort();
         let _ = t.await;
     }
-    if let Some(t) = runner_task {
+    if let Some(t) = runner_task.take() {
         t.abort();
         let _ = t.await;
     }
     let _ = reaper_task.await;
-    let _ = tun_to_stack.await;
-    let _ = stack_to_tun.await;
 
     tun_flow_ids.clear();
     direct_flow_ids.clear();
@@ -751,6 +884,9 @@ pub async fn run_tun_mode(
         }
     }
     emit("TUN 虚拟网卡与系统路由已安全还原".to_string());
+    if let Some(reason) = fatal_reason {
+        bail!("{reason}");
+    }
     Ok(())
 }
 

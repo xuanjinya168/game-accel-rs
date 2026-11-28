@@ -8,6 +8,7 @@ pub mod rules;
 pub mod socks5;
 pub mod telemetry;
 pub mod tun_mode;
+pub(crate) mod tun_pkt;
 pub mod tunnel;
 
 pub use error::{ConnectError, classify};
@@ -127,6 +128,7 @@ pub async fn run_client_with_shutdown(
     // Internal shutdown flag raised by the caller's signal or by the QUIC connection dying,
     // so every data-plane task observes one consistent stop condition.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let ext_shutdown_check = ext_shutdown_rx.clone();
     let _ext_shutdown_guard = {
         let tx = shutdown_tx.clone();
         AbortOnDrop(tokio::spawn(async move {
@@ -369,6 +371,7 @@ pub async fn run_client_with_shutdown(
         let tun_stats = stats.clone();
         let tun_log_tx = log_tx.clone();
         let tun_shutdown = shutdown_rx.clone();
+        let tun_shutdown_tx = shutdown_tx.clone();
         let tun_router = router.clone();
         let tun_err_tx = log_tx.clone();
         Some(tokio::spawn(async move {
@@ -382,10 +385,13 @@ pub async fn run_client_with_shutdown(
             )
             .await;
             if let Err(e) = &res {
-                info!("TUN 模式异常: {e:#}");
+                warn!("TUN 模式异常: {e:#}");
                 if let Some(tx) = &tun_err_tx {
                     let _ = tx.send(format!("TUN 模式异常: {e:#}"));
                 }
+                // Tear down the whole session instead of leaving a half-dead zombie where
+                // the GUI stays green while TUN traffic is black-holed.
+                let _ = tun_shutdown_tx.send(true);
             }
             res
         }))
@@ -393,7 +399,7 @@ pub async fn run_client_with_shutdown(
         None
     };
 
-    let res = run_mixed_proxy_server(
+    let mut res = run_mixed_proxy_server(
         opts.listen,
         tunnels.clone(),
         stats.clone(),
@@ -407,9 +413,13 @@ pub async fn run_client_with_shutdown(
     // otherwise a failed mixed-proxy bind would block here forever.
     let _ = shutdown_tx.send(true);
 
-    // Errors were already reported by the TUN task itself; this only awaits cleanup.
-    if let Some(handle) = tun_handle {
-        let _ = handle.await;
+    // Await TUN cleanup and surface any fatal TUN error so the caller/GUI can auto-reconnect.
+    if let Some(handle) = tun_handle
+        && let Ok(Err(tun_err)) = handle.await
+        && res.is_ok()
+        && !*ext_shutdown_check.borrow()
+    {
+        res = Err(tun_err);
     }
 
     rtt_task.abort();

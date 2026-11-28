@@ -32,7 +32,7 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
-const HY2_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
+const HY2_UDP_IDLE_TIMEOUT_SECS: u64 = 180;
 
 struct PrefixedReader<R> {
     prefix: [u8; 4],
@@ -202,26 +202,41 @@ pub(crate) async fn handle_hy2_connection(
     res
 }
 
+fn hy2_datagram_needs_dns(raw: &[u8]) -> bool {
+    let Ok(msg) = decode_hy2_udp_message(raw) else {
+        return false;
+    };
+    matches!(parse_hy2_addr(&msg.addr), Ok(TargetAddr::Domain(..)))
+}
+
 async fn run_hy2_session(conn: quinn::Connection, ctx: Arc<StreamContext>) -> Result<()> {
     let udp_nat = Arc::new(Hy2UdpManager::new(conn.clone(), ctx.clone()));
     let dgram_conn = conn.clone();
     let dgram_nat = udp_nat.clone();
+    // IP-targeted (game) UDP datagrams are handled inline to preserve fragment order and avoid
+    // per-packet task spawn / permit drops; only domain targets offload DNS onto `resolve_slots`.
     let resolve_slots = Arc::new(tokio::sync::Semaphore::new(32));
     let dgram_task = tokio::spawn(async move {
         while let Ok(data) = dgram_conn.read_datagram().await {
-            let nat = dgram_nat.clone();
-            match resolve_slots.clone().try_acquire_owned() {
-                Ok(permit) => {
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if let Err(e) = nat.handle_datagram(data).await {
-                            debug!("hy2 udp datagram error: {:#}", e);
-                        }
-                    });
+            if hy2_datagram_needs_dns(&data) {
+                let nat = dgram_nat.clone();
+                match resolve_slots.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(e) = nat.handle_datagram(data).await {
+                                debug!("hy2 udp datagram error: {:#}", e);
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        debug!(
+                            "dropping domain-targeted hy2 udp datagram: dns resolve queue full"
+                        );
+                    }
                 }
-                Err(_) => {
-                    debug!("dropping hy2 udp datagram: dispatch queue full");
-                }
+            } else if let Err(e) = dgram_nat.handle_datagram(data).await {
+                debug!("hy2 udp datagram error: {:#}", e);
             }
         }
     });
@@ -505,7 +520,7 @@ impl Hy2UdpManager {
 
         let rx_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
-            while let Ok((n, src_addr)) = rx_sock.recv_from(&mut buf).await {
+            'recv: while let Ok((n, src_addr)) = rx_sock.recv_from(&mut buf).await {
                 rx_last.store(now_secs(), Ordering::Relaxed);
                 rx_counters.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 let src_addr = SocketAddr::new(src_addr.ip().to_canonical(), src_addr.port());
@@ -515,8 +530,8 @@ impl Hy2UdpManager {
                 for pkt in
                     encode_hy2_udp_datagrams(session_id, pid, &addr_str, &buf[..n], max_dgram)
                 {
-                    if rx_conn.send_datagram(pkt).is_err() {
-                        break;
+                    if !protocol::pacer::send_datagram_checked(&rx_conn, pkt) {
+                        break 'recv;
                     }
                 }
             }
